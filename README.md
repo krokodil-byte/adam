@@ -1,4 +1,4 @@
-# ADAMAH Chat Universal Bundle
+# ADAM Chat Universal Bundle
 
 Single GitHub release for Windows and Linux.
 
