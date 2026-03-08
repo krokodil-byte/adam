@@ -49,10 +49,25 @@ class GGUFTokenizer:
         if self._vocab:
             special_ids = set(self._specials.values()) if self._specials else set()
             parts = []
+            byte_buf = bytearray()
+
+            def flush_bytes():
+                nonlocal byte_buf
+                if byte_buf:
+                    parts.append(byte_buf.decode('utf-8', errors='replace'))
+                    byte_buf = bytearray()
+
             for i in ids:
                 if i in special_ids: continue  # skip all type-3 tokens (<bos>, <eos>, <end_of_turn>, …)
                 if 0 <= i < len(self._vocab):
-                    parts.append(self._vocab[i].replace('▁', ' '))
+                    tok = self._vocab[i]
+                    m = re.fullmatch(r'<0x([0-9A-Fa-f]{2})>', tok or '')
+                    if m:
+                        byte_buf.append(int(m.group(1), 16))
+                    else:
+                        flush_bytes()
+                        parts.append(tok.replace('▁', ' '))
+            flush_bytes()
             return ''.join(parts)
         return bytes(i for i in ids if 0 <= i < 256).decode('utf-8', errors='replace')
 

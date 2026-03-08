@@ -201,15 +201,60 @@ def print_help():
   {CYAN}/quit{RESET}    — Exit
 """)
 
-def apply_chat_template(text: str, arch: str) -> str:
-    """Wrap user message in the model's expected prompt format."""
+def _token_text(tokenizer, token_id: int) -> str:
+    vocab = getattr(tokenizer, "_vocab", None)
+    if vocab and 0 <= token_id < len(vocab):
+        return vocab[token_id]
+    return ""
+
+
+def _render_gguf_chat_template(chat_template: str, tokenizer, messages) -> str | None:
+    try:
+        import jinja2
+    except Exception:
+        return None
+
+    env = jinja2.Environment(
+        undefined=jinja2.StrictUndefined,
+        trim_blocks=False,
+        lstrip_blocks=False,
+    )
+    env.globals["raise_exception"] = (
+        lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
+    )
+    try:
+        return env.from_string(chat_template).render(
+            messages=messages,
+            add_generation_prompt=True,
+            bos_token=_token_text(tokenizer, tokenizer.bos_id),
+            eos_token=_token_text(tokenizer, tokenizer.eos_id),
+        )
+    except Exception:
+        return None
+
+
+def apply_chat_template(text: str, arch: str, chat_template: str | None = None,
+                        tokenizer=None, system_prompt: str | None = None) -> str:
+    """Wrap a user message in the model's expected prompt format."""
+    if chat_template and tokenizer is not None:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": text})
+        rendered = _render_gguf_chat_template(chat_template, tokenizer, messages)
+        if rendered is not None:
+            return rendered
+
     a = arch.lower()
     if a in ('gemma', 'gemma2', 'gemma3'):
         return f"<start_of_turn>user\n{text}<end_of_turn>\n<start_of_turn>model\n"
     elif a in ('llama', 'llama2', 'llama3'):
-        # Llama-3 / TinyLlama-Chat style
-        return (f"<|system|>\nYou are a helpful, respectful and honest assistant."
-                f"<|user|>\n{text}<|assistant|>\n")
+        # Prefer a user-only fallback. Most modern llama-family instruct models
+        # ship an explicit GGUF chat template, and forcing a system prompt here
+        # degrades smaller variants such as TinyLlama.
+        if system_prompt:
+            return f"<|system|>\n{system_prompt}</s>\n<|user|>\n{text}</s>\n<|assistant|>\n"
+        return f"<|user|>\n{text}</s>\n<|assistant|>\n"
     elif a in ('mistral', 'mixtral'):
         return f"[INST] {text} [/INST]"
     elif a in ('qwen2', 'qwen'):
@@ -220,6 +265,17 @@ def apply_chat_template(text: str, arch: str) -> str:
     else:
         # Fallback: generic instruct format that works for many base models
         return f"### Instruction:\n{text}\n\n### Response:\n"
+
+
+def prepare_chat_prompt(text: str, arch: str, tokenizer, chat_template: str | None = None,
+                        system_prompt: str | None = None):
+    prompt = apply_chat_template(
+        text, arch, chat_template=chat_template, tokenizer=tokenizer,
+        system_prompt=system_prompt,
+    )
+    bos_token = _token_text(tokenizer, tokenizer.bos_id)
+    add_bos = not (bos_token and prompt.startswith(bos_token))
+    return prompt, add_bos
 
 
 def chat_loop(engine, tokenizer, cfg, GenConfig):
@@ -307,8 +363,10 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
             continue
 
         # Apply chat template then encode
-        templated = apply_chat_template(prompt, cfg.arch)
-        tokens = tokenizer.encode(templated)
+        templated, add_bos = prepare_chat_prompt(
+            prompt, cfg.arch, tokenizer, chat_template=getattr(cfg, "chat_template", None)
+        )
+        tokens = tokenizer.encode(templated, add_bos=add_bos)
         t0 = time.perf_counter()
 
         try:
