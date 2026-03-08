@@ -1,4 +1,4 @@
-# ADAM (Universal Chat Bundle)
+# ADAM v.1.0.0 (Universal Chat Bundle)
 
 Single GitHub release for Windows and Linux.
 
