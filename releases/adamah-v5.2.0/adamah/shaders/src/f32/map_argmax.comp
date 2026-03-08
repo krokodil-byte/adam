@@ -1,0 +1,55 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint n_locs;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer { float map_data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer DstLocs { uint locs_dst[]; };
+
+shared float s_vals[256];
+shared uint s_idxs[256];
+
+bool better(float cand_val, uint cand_idx, float best_val, uint best_idx) {
+    if (best_idx == 0xffffffffu) return true;
+    if (cand_idx == 0xffffffffu) return false;
+    return (cand_val > best_val) || ((cand_val == best_val) && (cand_idx < best_idx));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    float best_val = -3.402823466e+38;
+    uint best_idx = 0xffffffffu;
+
+    for (uint i = tid; i < pc.n_locs; i += 256u) {
+        float cand_val = map_data[locs_src[i]];
+        if (isnan(cand_val)) cand_val = -3.402823466e+38;
+        if (better(cand_val, i, best_val, best_idx)) {
+            best_val = cand_val;
+            best_idx = i;
+        }
+    }
+
+    s_vals[tid] = best_val;
+    s_idxs[tid] = best_idx;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            float cand_val = s_vals[tid + stride];
+            uint cand_idx = s_idxs[tid + stride];
+            if (better(cand_val, cand_idx, s_vals[tid], s_idxs[tid])) {
+                s_vals[tid] = cand_val;
+                s_idxs[tid] = cand_idx;
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        map_data[locs_dst[0]] = float((s_idxs[0] == 0xffffffffu) ? 0u : s_idxs[0]);
+    }
+}

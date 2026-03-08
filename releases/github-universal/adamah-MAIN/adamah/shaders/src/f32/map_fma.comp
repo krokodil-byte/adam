@@ -1,0 +1,21 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PushConstants {
+    uint n_locs; uint pack_size; 
+} pc;
+layout(set = 0, binding = 0) buffer MapBuffer { float map_data[]; };
+layout(set = 0, binding = 1) buffer LocsA   { uint locs_a[]; };
+layout(set = 0, binding = 2) buffer LocsB   { uint locs_b[]; };
+layout(set = 0, binding = 3) buffer LocsC   { uint locs_c[]; };
+layout(set = 0, binding = 4) buffer LocsDst { uint locs_dst[]; };
+
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint li = tid / pc.pack_size, ei = tid % pc.pack_size;
+    if (li >= pc.n_locs) return;
+    float a = map_data[locs_a[li]*pc.pack_size+ei];
+    float b = map_data[locs_b[li]*pc.pack_size+ei];
+    float c = map_data[locs_c[li]*pc.pack_size+ei];
+    map_data[locs_dst[li]*pc.pack_size+ei] = a * b + c;
+}

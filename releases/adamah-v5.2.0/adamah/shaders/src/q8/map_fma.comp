@@ -1,0 +1,41 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PushConstants {
+    uint n_locs; uint pack_size; uint group_size;
+} pc;
+layout(set = 0, binding = 0) buffer MapBuffer { uint map_data[]; };
+layout(set = 0, binding = 1) buffer LocsA   { uint locs_a[]; };
+layout(set = 0, binding = 2) buffer LocsB   { uint locs_b[]; };
+layout(set = 0, binding = 3) buffer LocsC   { uint locs_c[]; };
+layout(set = 0, binding = 4) buffer LocsDst { uint locs_dst[]; };
+
+layout(set = 0, binding = 5) buffer ScaleMap { float scale_data[]; };
+layout(set = 0, binding = 6) buffer ZPMap { float zp_data[]; };
+
+float load_q8(uint idx) {
+    uint word_idx = idx / 4u;
+    uint sub_idx  = idx % 4u;
+    uint raw = (map_data[word_idx] >> (sub_idx * 8u)) & 0xFFu;
+    uint group = idx / pc.group_size;
+    return float(raw) * scale_data[group] + zp_data[group];
+}
+void store_q8(uint idx, float val) {
+    uint group = idx / pc.group_size;
+    float qf = (val - zp_data[group]) / max(scale_data[group], 1e-10);
+    uint qi = uint(clamp(round(qf), 0.0, 255.0));
+    uint word_idx = idx / 4u;
+    uint sub_idx  = idx % 4u;
+    uint shift = sub_idx * 8u;
+    atomicAnd(map_data[word_idx], ~(0xFFu << shift));
+    atomicOr(map_data[word_idx], (uint(qi) & 0xFFu) << shift);
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint li = tid / pc.pack_size, ei = tid % pc.pack_size;
+    if (li >= pc.n_locs) return;
+    float a = load_q8(locs_a[li]*pc.pack_size+ei);
+    float b = load_q8(locs_b[li]*pc.pack_size+ei);
+    float c = load_q8(locs_c[li]*pc.pack_size+ei);
+    store_q8(locs_dst[li]*pc.pack_size+ei, a * b + c);
+}

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.gguf
+*.zip
+.venv/
+.claude/
+*.egg-info/
+releases/github-universal/.git/
+releases/adamah-v5.2.0/.git/

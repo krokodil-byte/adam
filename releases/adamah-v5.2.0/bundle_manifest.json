@@ -1,0 +1,20 @@
+{
+  "bundle": "adamah-v5.2.0",
+  "version": "5.2.0",
+  "package": "adamah",
+  "install": "pip install .",
+  "files": {
+    "root": [
+      "README.md",
+      "setup.py",
+      "pyproject.toml",
+      "LICENSE"
+    ],
+    "package": [
+      "__init__.py",
+      "uucis.py",
+      "adamah.c",
+      "shaders"
+    ]
+  }
+}

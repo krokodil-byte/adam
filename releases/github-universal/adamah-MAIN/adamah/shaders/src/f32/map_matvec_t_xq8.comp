@@ -1,0 +1,54 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform PushConstants {
+    uint K;
+    uint N;
+    uint group_size;
+} pc;
+
+layout(set = 0, binding = 0) buffer ActBuffer  { float map_act[]; };
+layout(set = 0, binding = 1) buffer WtBuffer   { uint  map_wt[];  };
+layout(set = 0, binding = 2) buffer LocsA      { uint  locs_a[];  };
+layout(set = 0, binding = 3) buffer LocsB      { uint  locs_b[];  };
+layout(set = 0, binding = 4) buffer LocsC      { uint  locs_c[];  };
+layout(set = 0, binding = 5) buffer QParams    { float qparams[]; };
+
+shared float partial[128];
+
+float load_q8(uint idx) {
+    uint word_idx = idx / 4u;
+    uint sub_idx  = idx % 4u;
+    uint raw_uint = (map_wt[word_idx] >> (sub_idx * 8u)) & 0xFFu;
+    uint group = idx / pc.group_size;
+    return float(raw_uint) * qparams[group * 2u] + qparams[group * 2u + 1u];
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.N) return;
+
+    uint lid = gl_LocalInvocationID.x;
+    uint a_base = locs_a[0];
+    uint b_base = locs_b[0];
+    uint c_base = locs_c[0];
+    float sum = 0.0;
+    uint row_base = b_base + row * pc.K;
+    for (uint k = lid; k < pc.K; k += 128u) {
+        sum += map_act[a_base + k] * load_q8(row_base + k);
+    }
+
+    partial[lid] = sum;
+    barrier();
+
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        map_act[c_base + row] = partial[0];
+    }
+}

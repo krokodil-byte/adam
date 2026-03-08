@@ -1,0 +1,60 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PushConstants {
+    uint op_code; uint n_locs; uint pack_size; uint group_size;
+} pc;
+layout(set = 0, binding = 0) buffer MapBuffer { uint map_data[]; };
+layout(set = 0, binding = 1) buffer LocsA     { uint locs_a[]; };
+layout(set = 0, binding = 2) buffer LocsB     { uint locs_b[]; };
+layout(set = 0, binding = 3) buffer LocsDst   { uint locs_dst[]; };
+layout(set = 0, binding = 4) buffer ScaleMap  { float scale_data[]; };
+layout(set = 0, binding = 5) buffer ZPMap     { float zp_data[]; };
+
+float load_q8(uint idx) {
+    uint word_idx = idx / 4u;
+    uint sub_idx  = idx % 4u;
+    uint raw = (map_data[word_idx] >> (sub_idx * 8u)) & 0xFFu;
+    float ival = float(raw);
+    uint group = idx / pc.group_size;
+    float scale = scale_data[group];
+    float zp    = zp_data[group];
+    return ival * scale + zp;
+}
+
+void store_q8(uint idx, float val) {
+    uint group = idx / pc.group_size;
+    float scale = scale_data[group];
+    float zp    = zp_data[group];
+    float qf = (val - zp) / max(scale, 1e-10);
+    uint qi = uint(clamp(round(qf), 0.0, 255.0));
+    uint word_idx = idx / 4u;
+    uint sub_idx  = idx % 4u;
+    uint shift = sub_idx * 8u;
+    atomicAnd(map_data[word_idx], ~(0xFFu << shift));
+    atomicOr(map_data[word_idx], (uint(qi) & 0xFFu) << shift);
+}
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint li = tid / pc.pack_size, ei = tid % pc.pack_size;
+    if (li >= pc.n_locs) return;
+    float a = load_q8(locs_a[li]*pc.pack_size+ei);
+    float b = load_q8(locs_b[li]*pc.pack_size+ei);
+    float r;
+    switch (pc.op_code) {
+        case 0u: r=a+b; break; case 1u: r=a-b; break;
+        case 2u: r=a*b; break; case 3u: r=a/b; break;
+        case 4u: r=pow(a,b); break; case 5u: r=min(a,b); break;
+        case 6u: r=max(a,b); break; case 7u: r=mod(a,b); break;
+        case 8u: r=(a==b)?1.0:0.0; break; case 9u: r=(a!=b)?1.0:0.0; break;
+        case 10u: r=(a<b)?1.0:0.0; break; case 11u: r=(a<=b)?1.0:0.0; break;
+        case 12u: r=(a>b)?1.0:0.0; break; case 13u: r=(a>=b)?1.0:0.0; break;
+        case 14u: r=((a!=0.0)&&(b!=0.0))?1.0:0.0; break;
+        case 15u: r=((a!=0.0)||(b!=0.0))?1.0:0.0; break;
+        case 16u: r=((a!=0.0)!=(b!=0.0))?1.0:0.0; break;
+        case 17u: r=atan(a,b); break;
+        case 18u: r=step(a,b); break;
+        case 19u: r=smoothstep(a,b,0.5); break;
+        default: r=a; break;
+    }
+    store_q8(locs_dst[li]*pc.pack_size+ei, r);
+}

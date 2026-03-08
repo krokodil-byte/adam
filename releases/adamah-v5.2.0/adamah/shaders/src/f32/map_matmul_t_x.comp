@@ -1,0 +1,31 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(push_constant) uniform PushConstants {
+    uint M; uint K; uint N; uint n_ops;
+} pc;
+// Dual-map: activations in map_act, weights in map_wt
+layout(set = 0, binding = 0) buffer ActBuffer { float map_act[]; };
+layout(set = 0, binding = 1) buffer WtBuffer  { float map_wt[]; };
+layout(set = 0, binding = 2) buffer LocsA { uint locs_a[]; };
+layout(set = 0, binding = 3) buffer LocsB { uint locs_b[]; };
+layout(set = 0, binding = 4) buffer LocsC { uint locs_c[]; };
+
+// C = A @ B^T
+// A[M,K] from map_act, B[N,K] from map_wt (transposed: each row of B is a column of B^T)
+// C[M,N] written to map_act
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint col = gl_GlobalInvocationID.y;
+    uint op  = gl_GlobalInvocationID.z;
+    if (row >= pc.M || col >= pc.N || op >= pc.n_ops) return;
+    uint a_base = locs_a[op];
+    uint b_base = locs_b[op];
+    uint c_base = locs_c[op];
+    float sum = 0.0;
+    for (uint k = 0u; k < pc.K; k++) {
+        float a_val = map_act[a_base + row * pc.K + k];
+        float b_val = map_wt[b_base + col * pc.K + k];
+        sum += a_val * b_val;
+    }
+    map_act[c_base + row * pc.N + col] = sum;
+}

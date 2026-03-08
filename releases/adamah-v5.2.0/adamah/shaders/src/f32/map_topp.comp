@@ -1,0 +1,95 @@
+#version 450
+layout(local_size_x = 64) in;
+
+const uint TOPK_MAX = 64u;
+const float NEG_INF = -3.402823466e+38;
+
+layout(push_constant) uniform PushConstants {
+    uint n_locs;
+    float temperature;
+    float top_p;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer { float map_data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer DstLocs { uint locs_dst[]; };
+
+shared float s_logits[TOPK_MAX];
+shared float s_probs[TOPK_MAX];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint n = min(pc.n_locs, TOPK_MAX);
+
+    if (tid < TOPK_MAX) {
+        s_logits[tid] = NEG_INF;
+        s_probs[tid] = 0.0;
+    }
+    barrier();
+
+    if (tid < n) {
+        float v = map_data[locs_src[tid]];
+        if (isnan(v) || isinf(v)) v = NEG_INF;
+        s_logits[tid] = v;
+    }
+    barrier();
+
+    if (tid == 0u) {
+        float temp = max(pc.temperature, 1e-6);
+        float keep_p = clamp(pc.top_p, 0.0, 1.0);
+        float max_logit = NEG_INF;
+
+        for (uint i = 0u; i < n; ++i) {
+            if (s_logits[i] > max_logit) max_logit = s_logits[i];
+        }
+
+        if (max_logit == NEG_INF) {
+            for (uint i = 0u; i < n; ++i) {
+                map_data[locs_dst[i]] = 0.0;
+            }
+            return;
+        }
+
+        float sum = 0.0;
+        for (uint i = 0u; i < n; ++i) {
+            if (s_logits[i] == NEG_INF) {
+                s_probs[i] = 0.0;
+                continue;
+            }
+            float p = exp((s_logits[i] - max_logit) / temp);
+            s_probs[i] = p;
+            sum += p;
+        }
+
+        if (sum <= 0.0) {
+            for (uint i = 0u; i < n; ++i) {
+                map_data[locs_dst[i]] = (i == 0u) ? 1.0 : 0.0;
+            }
+            return;
+        }
+
+        for (uint i = 0u; i < n; ++i) {
+            s_probs[i] /= sum;
+        }
+
+        uint keep = 0u;
+        float csum = 0.0;
+        for (uint i = 0u; i < n; ++i) {
+            csum += s_probs[i];
+            keep = i + 1u;
+            if (keep_p >= 0.999999 || csum >= keep_p) break;
+        }
+        if (keep == 0u && n > 0u) keep = 1u;
+
+        float keep_sum = 0.0;
+        for (uint i = 0u; i < keep; ++i) {
+            keep_sum += s_probs[i];
+        }
+        if (keep_sum <= 0.0) keep_sum = 1.0;
+
+        for (uint i = 0u; i < n; ++i) {
+            if (i < keep) map_data[locs_dst[i]] = s_probs[i] / keep_sum;
+            else map_data[locs_dst[i]] = 0.0;
+        }
+    }
+}

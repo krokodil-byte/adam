@@ -1,0 +1,33 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PushConstants {
+    uint n_locs; uint pack_size; 
+} pc;
+layout(set = 0, binding = 0) buffer MapBuffer { uint map_data[]; };
+layout(set = 0, binding = 1) buffer LocsA   { uint locs_a[]; };
+layout(set = 0, binding = 2) buffer LocsB   { uint locs_b[]; };
+layout(set = 0, binding = 3) buffer LocsC   { uint locs_c[]; };
+layout(set = 0, binding = 4) buffer LocsDst { uint locs_dst[]; };
+
+
+float bf16_load(uint idx) {
+    uint w = idx >> 1u; uint s = idx & 1u;
+    return uintBitsToFloat(((map_data[w] >> (s*16u)) & 0xFFFFu) << 16u);
+}
+void bf16_store(uint idx, float val) {
+    uint v16 = (floatBitsToUint(val) + 0x7FFFu + ((floatBitsToUint(val) >> 16u) & 1u)) >> 16u;
+    uint w = idx >> 1u; uint s = idx & 1u;
+    uint shift = s * 16u;
+    atomicAnd(map_data[w], ~(0xFFFFu << shift));
+    atomicOr(map_data[w], (v16 & 0xFFFFu) << shift);
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint li = tid / pc.pack_size, ei = tid % pc.pack_size;
+    if (li >= pc.n_locs) return;
+    float a = bf16_load(locs_a[li]*pc.pack_size+ei);
+    float b = bf16_load(locs_b[li]*pc.pack_size+ei);
+    float c = bf16_load(locs_c[li]*pc.pack_size+ei);
+    bf16_store(locs_dst[li]*pc.pack_size+ei, a * b + c);
+}

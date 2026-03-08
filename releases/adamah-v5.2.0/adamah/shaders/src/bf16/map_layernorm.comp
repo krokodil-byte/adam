@@ -1,0 +1,83 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint n_rows;
+    uint dim;
+    float eps;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer { uint data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer DstLocs { uint locs_dst[]; };
+layout(set = 0, binding = 3) buffer GammaLocs { uint locs_gamma[]; };
+layout(set = 0, binding = 4) buffer BetaLocs { uint locs_beta[]; };
+
+shared float sdata[256];
+
+float bf16_to_f32(uint val16) { return uintBitsToFloat(val16 << 16u); }
+uint f32_to_bf16(float val) {
+    uint bits = floatBitsToUint(val);
+    return (bits + 0x7FFFu + ((bits >> 16u) & 1u)) >> 16u;
+}
+
+float load_bf16(uint idx) {
+    uint w = idx >> 1u; uint s = idx & 1u;
+    return bf16_to_f32((data[w] >> (s * 16u)) & 0xFFFFu);
+}
+
+void store_bf16(uint idx, float val) {
+    uint v16 = f32_to_bf16(val);
+    uint w = idx >> 1u; uint s = idx & 1u;
+    uint shift = s * 16u;
+    atomicAnd(data[w], ~(0xFFFFu << shift));
+    atomicOr(data[w], (v16 & 0xFFFFu) << shift);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row_idx = gl_WorkGroupID.x;
+    if (row_idx >= pc.n_rows) return;
+
+    uint src_base = locs_src[row_idx] * pc.dim;
+    uint dst_base = locs_dst[row_idx] * pc.dim;
+    uint gamma_base = locs_gamma[row_idx];
+    uint beta_base = locs_beta[row_idx];
+
+    // Mean (accumulate in f32)
+    float sum_val = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256u) {
+        sum_val += load_bf16(src_base + i);
+    }
+    sdata[tid] = sum_val;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float mean = sdata[0] / float(pc.dim);
+    barrier();
+
+    // Variance
+    float var_sum = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256u) {
+        float diff = load_bf16(src_base + i) - mean;
+        var_sum += diff * diff;
+    }
+    sdata[tid] = var_sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float inv_std = 1.0 / sqrt(sdata[0] / float(pc.dim) + pc.eps);
+    barrier();
+
+    // Normalize
+    for (uint i = tid; i < pc.dim; i += 256u) {
+        float normalized = (load_bf16(src_base + i) - mean) * inv_std;
+        float gamma = load_bf16(gamma_base + i);
+        float beta = load_bf16(beta_base + i);
+        store_bf16(dst_base + i, normalized * gamma + beta);
+    }
+}

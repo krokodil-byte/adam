@@ -1,0 +1,79 @@
+#version 450
+layout(local_size_x = 128) in;
+
+const uint INVALID_IDX = 0xffffffffu;
+const float NEG_INF = -3.402823466e+38;
+
+layout(push_constant) uniform PushConstants {
+    layout(offset = 0) uint K;
+    layout(offset = 4) uint n_ids;
+    layout(offset = 8) uint group_size;
+    layout(offset = 12) uint n_penalty;
+    layout(offset = 16) float repeat_penalty;
+} pc;
+
+layout(set = 0, binding = 0) buffer ActBuffer       { float map_act[]; };
+layout(set = 0, binding = 1) buffer WtBuffer        { uint  map_wt[];  };
+layout(set = 0, binding = 2) buffer LocsA           { uint  locs_a[];  };
+layout(set = 0, binding = 3) buffer LocsB           { uint  locs_b[];  };
+layout(set = 0, binding = 4) buffer PartialBase     { uint  partial_idx_base[]; };
+layout(set = 0, binding = 5) buffer SelLocs         { uint  sel_locs[]; };
+layout(set = 0, binding = 6) buffer PenaltyIds      { uint  penalty_ids[]; };
+layout(set = 0, binding = 7) buffer IdxDstLocs      { uint  locs_idx_dst[]; };
+layout(set = 0, binding = 8) buffer ValDstLocs      { uint  locs_val_dst[]; };
+layout(set = 0, binding = 9) buffer QParams         { float qparams[]; };
+
+shared float partial[128];
+
+float load_q8(uint idx) {
+    uint word_idx = idx / 4u;
+    uint sub_idx  = idx % 4u;
+    uint raw_uint = (map_wt[word_idx] >> (sub_idx * 8u)) & 0xFFu;
+    uint group = idx / pc.group_size;
+    return float(raw_uint) * qparams[group * 2u] + qparams[group * 2u + 1u];
+}
+
+bool row_is_penalized(uint row_idx) {
+    for (uint i = 0u; i < pc.n_penalty; ++i) {
+        if (penalty_ids[i] == row_idx) return true;
+    }
+    return false;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.n_ids) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint a_base = locs_a[0];
+    uint b_base = locs_b[0];
+    uint partial_base = partial_idx_base[0];
+
+    uint sel_pos = uint(map_act[sel_locs[row]]);
+    uint tok = uint(map_act[partial_base + sel_pos]);
+    uint row_base = b_base + tok * pc.K;
+    float sum = 0.0;
+
+    for (uint k = tid; k < pc.K; k += 128u) {
+        sum += map_act[a_base + k] * load_q8(row_base + k);
+    }
+
+    partial[tid] = sum;
+    barrier();
+
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        float val = partial[0];
+        if (pc.n_penalty > 0u && row_is_penalized(tok)) {
+            val = (val > 0.0) ? (val / pc.repeat_penalty) : (val * pc.repeat_penalty);
+        }
+        map_act[locs_idx_dst[row]] = float(tok);
+        map_act[locs_val_dst[row]] = val;
+    }
+}

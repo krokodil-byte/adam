@@ -1,4 +1,4 @@
-# ADAM v.0.0.1 (Universal Chat Bundle)
+# ADAMAH Chat Universal Bundle
 
 Single GitHub release for Windows and Linux.
 
@@ -21,8 +21,7 @@ Those installers will:
 
 ## Models
 
-Place gemma 1b q4k_m `.gguf` model file inside the bundle root before starting the chat.
-Soon more compatibility...
+Place one or more `.gguf` model files inside the bundle root before starting the chat.
 
 ## Linux system packages
 
