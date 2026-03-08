@@ -1,0 +1,6 @@
+include LICENSE
+include README.md
+include setup.py
+recursive-include adamah *.c
+recursive-include adamah/shaders *.spv
+recursive-include adamah/shaders/src *.comp

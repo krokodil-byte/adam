@@ -1,0 +1,67 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint n_rows;
+    uint dim;
+    float eps;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer { float data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer DstLocs { uint locs_dst[]; };
+layout(set = 0, binding = 3) buffer GammaLocs { uint locs_gamma[]; };
+layout(set = 0, binding = 4) buffer BetaLocs { uint locs_beta[]; };
+
+shared float sdata[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row_idx = gl_WorkGroupID.x;
+    if (row_idx >= pc.n_rows) return;
+
+    uint src_base = locs_src[row_idx] * pc.dim;
+    uint dst_base = locs_dst[row_idx] * pc.dim;
+    uint gamma_base = locs_gamma[row_idx];
+    uint beta_base = locs_beta[row_idx];
+
+    // Pass 1: compute mean
+    float sum_val = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256u) {
+        sum_val += data[src_base + i];
+    }
+    sdata[tid] = sum_val;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float mean = sdata[0] / float(pc.dim);
+    barrier();
+
+    // Pass 2: compute variance
+    float var_sum = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256u) {
+        float diff = data[src_base + i] - mean;
+        var_sum += diff * diff;
+    }
+    sdata[tid] = var_sum;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float variance = sdata[0] / float(pc.dim);
+    float inv_std = 1.0 / sqrt(variance + pc.eps);
+    barrier();
+
+    // Pass 3: normalize with gamma and beta
+    for (uint i = tid; i < pc.dim; i += 256u) {
+        float normalized = (data[src_base + i] - mean) * inv_std;
+        float gamma = data[gamma_base + i];
+        float beta = data[beta_base + i];
+        data[dst_base + i] = normalized * gamma + beta;
+    }
+}

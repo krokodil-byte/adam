@@ -1,0 +1,81 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PushConstants {
+    uint op_code; uint n_locs; uint pack_size; uint group_size;
+} pc;
+layout(set = 0, binding = 0) buffer MapBuffer { uint map_data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs   { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer DstLocs   { uint locs_dst[]; };
+layout(set = 0, binding = 3) buffer ScaleMap  { float scale_data[]; };
+layout(set = 0, binding = 4) buffer ZPMap     { float zp_data[]; };
+
+float load_q6(uint idx) {
+    uint word_idx = idx / 5u;
+    uint sub_idx  = idx % 5u;
+    uint raw = (map_data[word_idx] >> (sub_idx * 6u)) & 0x3Fu;
+    int ival = int(raw) - 32;
+    uint group = idx / pc.group_size;
+    float scale = scale_data[group];
+    float zp    = zp_data[group];
+    return float(ival) * scale + zp;
+}
+
+void store_q6(uint idx, float val) {
+    uint group = idx / pc.group_size;
+    float scale = scale_data[group];
+    float zp    = zp_data[group];
+    float qf = (val - zp) / max(scale, 1e-10);
+    int qi = clamp(int(round(qf)) + 32, 0, 63);
+    uint word_idx = idx / 5u;
+    uint sub_idx  = idx % 5u;
+    uint shift = sub_idx * 6u;
+    atomicAnd(map_data[word_idx], ~(0x3Fu << shift));
+    atomicOr(map_data[word_idx], (uint(qi) & 0x3Fu) << shift);
+}
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint li = tid / pc.pack_size, ei = tid % pc.pack_size;
+    if (li >= pc.n_locs) return;
+    uint src = locs_src[li] * pc.pack_size + ei;
+    uint dst = locs_dst[li] * pc.pack_size + ei;
+    float val = load_q6(src);
+    float r;
+    switch (pc.op_code) {
+        case 0u:  r = -val; break;
+        case 1u:  r = abs(val); break;
+        case 2u:  r = sqrt(max(val,0.0)); break;
+        case 3u:  r = exp(val); break;
+        case 4u:  r = log(max(val,1e-7)); break;
+        case 5u:  r = tanh(val); break;
+        case 6u:  r = max(0.0, val); break;
+        case 7u:  r = 0.5*val*(1.0+tanh(0.797884583*(val+0.0447149985*val*val*val))); break;
+        case 8u:  r = sin(val); break;
+        case 9u:  r = cos(val); break;
+        case 10u: r = tan(val); break;
+        case 11u: r = asin(clamp(val,-1.0,1.0)); break;
+        case 12u: r = acos(clamp(val,-1.0,1.0)); break;
+        case 13u: r = atan(val); break;
+        case 14u: r = sinh(val); break;
+        case 15u: r = cosh(val); break;
+        case 16u: r = 1.0/(1.0+exp(-val)); break;
+        case 17u: r = val/(1.0+exp(-val)); break;
+        case 18u: { float sp=log(1.0+exp(val)); r=val*tanh(sp); break; }
+        case 19u: { float t; if(val>0.0) t=val; else t=1.67325997*(exp(val)-1.0); r=t*1.05069995; break; }
+        case 20u: r = (val>0.0)?val:exp(val)-1.0; break;
+        case 21u: r = max(val,0.01*val); break;
+        case 22u: r = ceil(val); break;
+        case 23u: r = floor(val); break;
+        case 24u: r = round(val); break;
+        case 25u: r = (val>0.0)?1.0:((val<0.0)?-1.0:0.0); break;
+        case 26u: r = 1.0/val; break;
+        case 27u: r = val*val; break;
+        case 28u: r = val*val*val; break;
+        case 29u: r = log(1.0+exp(val)); break;
+        case 30u: r = clamp(0.2*val+0.5,0.0,1.0); break;
+        case 31u: r = val*clamp(0.2*val+0.5,0.0,1.0); break;
+        case 32u: r = exp(val)-1.0; break;
+        case 33u: r = log(1.0+val); break;
+        default:  r = val; break;
+    }
+    store_q6(dst, r);
+}

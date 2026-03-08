@@ -1,0 +1,54 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint op_code;   // 0=sum, 1=max, 2=min
+    uint n_locs;
+    uint pack_size;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer { float data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer DstLocs { uint locs_dst[]; };
+
+shared float sdata[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint loc_idx = gl_WorkGroupID.x;
+    if (loc_idx >= pc.n_locs) return;
+
+    uint src_base = locs_src[loc_idx] * pc.pack_size;
+    uint dst_base = locs_dst[loc_idx];
+
+    // Initialize accumulator based on op
+    float val;
+    if (pc.op_code == 0u) val = 0.0;
+    else if (pc.op_code == 1u) val = -9.99999968e+37;
+    else val = 9.99999968e+37;
+
+    // Each thread accumulates strided elements
+    for (uint i = tid; i < pc.pack_size; i += 256u) {
+        float x = data[src_base + i];
+        if (pc.op_code == 0u) val += x;
+        else if (pc.op_code == 1u) val = max(val, x);
+        else val = min(val, x);
+    }
+
+    sdata[tid] = val;
+    barrier();
+
+    // Parallel reduction in shared memory
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            if (pc.op_code == 0u) sdata[tid] += sdata[tid + s];
+            else if (pc.op_code == 1u) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+            else sdata[tid] = min(sdata[tid], sdata[tid + s]);
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        data[dst_base] = sdata[0];
+    }
+}

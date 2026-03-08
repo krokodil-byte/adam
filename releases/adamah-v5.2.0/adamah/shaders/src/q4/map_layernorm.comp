@@ -1,0 +1,58 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PushConstants {
+    uint n_rows; uint dim; float eps; uint group_size;
+} pc;
+layout(set = 0, binding = 0) buffer MapBuffer { uint map_data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs   { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer DstLocs   { uint locs_dst[]; };
+layout(set = 0, binding = 3) buffer GammaLocs { uint locs_gamma[]; };
+layout(set = 0, binding = 4) buffer BetaLocs  { uint locs_beta[]; };
+layout(set = 0, binding = 5) buffer ScaleMap  { float scale_data[]; };
+layout(set = 0, binding = 6) buffer ZPMap     { float zp_data[]; };
+shared float sdata[256];
+
+float load_q4(uint idx) {
+    uint word_idx = idx / 8u;
+    uint sub_idx  = idx % 8u;
+    uint raw = (map_data[word_idx] >> (sub_idx * 4u)) & 0xFu;
+    float ival = float(raw);
+    uint group = idx / pc.group_size;
+    float scale = scale_data[group];
+    float zp    = zp_data[group];
+    return ival * scale + zp;
+}
+
+void store_q4(uint idx, float val) {
+    uint group = idx / pc.group_size;
+    float scale = scale_data[group];
+    float zp    = zp_data[group];
+    float qf = (val - zp) / max(scale, 1e-10);
+    uint qi = uint(clamp(round(qf), 0.0, 15.0));
+    uint word_idx = idx / 8u;
+    uint sub_idx  = idx % 8u;
+    uint shift = sub_idx * 4u;
+    atomicAnd(map_data[word_idx], ~(0xFu << shift));
+    atomicOr(map_data[word_idx], (uint(qi) & 0xFu) << shift);
+}
+void main() {
+    uint tid=gl_LocalInvocationID.x;
+    uint ri=gl_WorkGroupID.x;
+    if (ri>=pc.n_rows) return;
+    uint sb=locs_src[ri]*pc.dim, db=locs_dst[ri]*pc.dim;
+    uint gb=locs_gamma[ri]*pc.dim, bb=locs_beta[ri]*pc.dim;
+    float sv=0.0;
+    for (uint i=tid;i<pc.dim;i+=256u) sv+=load_q4(sb+i);
+    sdata[tid]=sv; barrier();
+    for (uint s=128u;s>0u;s>>=1u) { if(tid<s) sdata[tid]+=sdata[tid+s]; barrier(); }
+    float mean=sdata[0]/float(pc.dim); barrier();
+    float vv=0.0;
+    for (uint i=tid;i<pc.dim;i+=256u) { float d=load_q4(sb+i)-mean; vv+=d*d; }
+    sdata[tid]=vv; barrier();
+    for (uint s=128u;s>0u;s>>=1u) { if(tid<s) sdata[tid]+=sdata[tid+s]; barrier(); }
+    float inv_std=1.0/sqrt(sdata[0]/float(pc.dim)+pc.eps); barrier();
+    for (uint i=tid;i<pc.dim;i+=256u) {
+        float n=(load_q4(sb+i)-mean)*inv_std;
+        store_q4(db+i, n*load_q4(gb+i)+load_q4(bb+i));
+    }
+}

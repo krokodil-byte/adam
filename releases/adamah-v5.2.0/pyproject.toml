@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adamah"
+version = "5.2.0"
+description = "High-performance cross-vendor GPU compute via Vulkan — f32, bf16, int8 quantized"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "CC-BY-NC-4.0"}
+authors = [{name = "Samuele Scuglia"}]
+keywords = ["gpu", "vulkan", "compute", "ai", "ml", "transformer", "cuda-alternative",
+            "bfloat16", "quantization", "cross-platform"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: C",
+  "Operating System :: POSIX :: Linux",
+]
+dependencies = ["numpy"]
+
+[project.urls]
+Homepage = "https://github.com/krokodil-byte/ADAMAH"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+"adamah" = [
+  "*.so",
+  "*.dll",
+  "*.def",
+  "*.h",
+  "*.c",
+  "shaders/*.spv",
+  "shaders/f32/*.spv",
+  "shaders/bf16/*.spv",
+  "shaders/q8/*.spv",
+  "shaders/q6/*.spv",
+  "shaders/q4/*.spv",
+  "shaders/src/f32/*.comp",
+  "shaders/src/bf16/*.comp",
+  "shaders/src/q8/*.comp",
+  "shaders/src/q6/*.comp",
+  "shaders/src/q4/*.comp",
+]

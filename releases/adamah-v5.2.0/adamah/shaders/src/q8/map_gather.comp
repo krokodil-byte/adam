@@ -1,0 +1,27 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PushConstants {
+    uint n_locs;
+    uint pack_size;
+    uint group_size;
+} pc;
+layout(set = 0, binding = 0) buffer MapBuffer  { uint map_data[]; };
+layout(set = 0, binding = 1) buffer DstBuffer  { float dst_data[]; };
+layout(set = 0, binding = 2) buffer LocsBuffer { uint locs[]; };
+layout(set = 0, binding = 3) buffer QParams    { float qparams[]; };  // [scale0,zp0,scale1,zp1,...]
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= pc.n_locs * pc.pack_size) return;
+    uint loc_idx  = tid / pc.pack_size;
+    uint elem_idx = tid % pc.pack_size;
+    uint logical  = locs[loc_idx] * pc.pack_size + elem_idx;
+
+    uint word_idx = logical / 4u;
+    uint sub_idx  = logical % 4u;
+    uint raw = (map_data[word_idx] >> (sub_idx * 8u)) & 0xFFu;
+    float ival = float(raw);
+
+    uint group = logical / pc.group_size;
+    dst_data[tid] = ival * qparams[group * 2u] + qparams[group * 2u + 1u];
+}

@@ -1,0 +1,49 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(push_constant) uniform PushConstants {
+    uint M; uint K; uint N; uint n_ops; uint group_size;
+} pc;
+layout(set = 0, binding = 0) buffer MapBuffer { uint map_data[]; };
+layout(set = 0, binding = 1) buffer LocsA     { uint locs_a[]; };
+layout(set = 0, binding = 2) buffer LocsB     { uint locs_b[]; };
+layout(set = 0, binding = 3) buffer LocsC     { uint locs_c[]; };
+layout(set = 0, binding = 4) buffer ScaleMap  { float scale_data[]; };
+layout(set = 0, binding = 5) buffer ZPMap     { float zp_data[]; };
+
+float load_q6(uint idx) {
+    uint word_idx = idx / 5u;
+    uint sub_idx  = idx % 5u;
+    uint raw = (map_data[word_idx] >> (sub_idx * 6u)) & 0x3Fu;
+    int ival = int(raw) - 32;
+    uint group = idx / pc.group_size;
+    float scale = scale_data[group];
+    float zp    = zp_data[group];
+    return float(ival) * scale + zp;
+}
+
+void store_q6(uint idx, float val) {
+    uint group = idx / pc.group_size;
+    float scale = scale_data[group];
+    float zp    = zp_data[group];
+    float qf = (val - zp) / max(scale, 1e-10);
+    int qi = clamp(int(round(qf)) + 32, 0, 63);
+    uint word_idx = idx / 5u;
+    uint sub_idx  = idx % 5u;
+    uint shift = sub_idx * 6u;
+    atomicAnd(map_data[word_idx], ~(0x3Fu << shift));
+    atomicOr(map_data[word_idx], (uint(qi) & 0x3Fu) << shift);
+}
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint col = gl_GlobalInvocationID.y;
+    uint op  = gl_GlobalInvocationID.z;
+    if (row>=pc.M || col>=pc.N || op>=pc.n_ops) return;
+    uint a_base = locs_a[op];
+    uint b_base = locs_b[op];
+    uint c_base = locs_c[op];
+    float sum = 0.0;
+    for (uint k=0u; k<pc.K; k++) {
+        sum += load_q6(a_base + row*pc.K + k) * load_q6(b_base + k*pc.N + col);
+    }
+    store_q6(c_base + row*pc.N + col, sum);
+}

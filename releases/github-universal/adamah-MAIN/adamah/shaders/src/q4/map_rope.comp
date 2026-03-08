@@ -1,0 +1,58 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PushConstants {
+    uint n_tokens; uint n_heads; uint head_dim; uint pos_offset; float freq_base; uint group_size;
+} pc;
+layout(set = 0, binding = 0) buffer MapBuffer { uint map_data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs   { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer DstLocs   { uint locs_dst[]; };
+
+layout(set = 0, binding = 3) buffer ScaleMap { float scale_data[]; };
+layout(set = 0, binding = 4) buffer ZPMap { float zp_data[]; };
+
+float load_q4(uint idx) {
+    uint word_idx = idx / 8u;
+    uint sub_idx  = idx % 8u;
+    uint raw = (map_data[word_idx] >> (sub_idx * 4u)) & 0xFu;
+    uint group = idx / pc.group_size;
+    return float(raw) * scale_data[group] + zp_data[group];
+}
+void store_q4(uint idx, float val) {
+    uint group = idx / pc.group_size;
+    float qf = (val - zp_data[group]) / max(scale_data[group], 1e-10);
+    uint qi = uint(clamp(round(qf), 0.0, 15.0));
+    uint word_idx = idx / 8u;
+    uint sub_idx  = idx % 8u;
+    uint shift = sub_idx * 4u;
+    atomicAnd(map_data[word_idx], ~(0xFu << shift));
+    atomicOr(map_data[word_idx], (uint(qi) & 0xFu) << shift);
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint total_pairs = pc.n_tokens * pc.n_heads * (pc.head_dim / 2u);
+    if (tid >= total_pairs) return;
+
+    uint pair = tid;
+    uint half_dim = pc.head_dim / 2u;
+    uint token = pair / (pc.n_heads * half_dim);
+    uint rem = pair % (pc.n_heads * half_dim);
+    uint head = rem / half_dim;
+    uint d = rem % half_dim;
+
+    uint pos = pc.pos_offset + token;
+    float freq = 1.0 / pow(pc.freq_base, float(2u * d) / float(pc.head_dim));
+    float angle = float(pos) * freq;
+    float cos_a = cos(angle);
+    float sin_a = sin(angle);
+
+    uint stride = pc.n_heads * pc.head_dim;
+    uint base_src = locs_src[token] * stride + head * pc.head_dim;
+    uint base_dst = locs_dst[token] * stride + head * pc.head_dim;
+
+    float x0 = load_q4(base_src + d);
+    float x1 = load_q4(base_src + d + half_dim);
+
+    store_q4(base_dst + d, x0 * cos_a - x1 * sin_a);
+    store_q4(base_dst + d + half_dim, x0 * sin_a + x1 * cos_a);
+}

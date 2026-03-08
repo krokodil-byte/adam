@@ -1,0 +1,34 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PushConstants {
+    uint n_copies; uint row_size; 
+} pc;
+layout(set = 0, binding = 0) buffer MapBuffer  { uint map_data[]; };
+layout(set = 0, binding = 1) buffer CopySpec   { uint copy_spec[]; };  // [src_row, dst_loc] pairs
+layout(set = 0, binding = 2) buffer SrcBase    { uint src_base[]; };   // base offset of embedding table
+
+
+float bf16_load(uint idx) {
+    uint w = idx >> 1u; uint s = idx & 1u;
+    return uintBitsToFloat(((map_data[w] >> (s*16u)) & 0xFFFFu) << 16u);
+}
+void bf16_store(uint idx, float val) {
+    uint v16 = (floatBitsToUint(val) + 0x7FFFu + ((floatBitsToUint(val) >> 16u) & 1u)) >> 16u;
+    uint w = idx >> 1u; uint s = idx & 1u;
+    uint shift = s * 16u;
+    atomicAnd(map_data[w], ~(0xFFFFu << shift));
+    atomicOr(map_data[w], (v16 & 0xFFFFu) << shift);
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint ci = tid / pc.row_size;
+    uint ei = tid % pc.row_size;
+    if (ci >= pc.n_copies) return;
+    uint src_row = copy_spec[ci * 2u];
+    uint dst_loc = copy_spec[ci * 2u + 1u];
+    uint src_off = src_base[0] + src_row * pc.row_size + ei;
+    uint dst_off = dst_loc * pc.row_size + ei;
+    float val = bf16_load(src_off);
+    bf16_store(dst_off, val);
+}

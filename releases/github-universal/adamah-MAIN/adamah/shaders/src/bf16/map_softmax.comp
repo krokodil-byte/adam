@@ -1,0 +1,76 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint n_rows;
+    uint row_size;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer { uint data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer DstLocs { uint locs_dst[]; };
+
+shared float sdata[256];
+
+float bf16_to_f32(uint val16) { return uintBitsToFloat(val16 << 16u); }
+uint f32_to_bf16(float val) {
+    uint bits = floatBitsToUint(val);
+    return (bits + 0x7FFFu + ((bits >> 16u) & 1u)) >> 16u;
+}
+
+float load_bf16(uint idx) {
+    uint w = idx >> 1u; uint s = idx & 1u;
+    return bf16_to_f32((data[w] >> (s * 16u)) & 0xFFFFu);
+}
+
+void store_bf16(uint idx, float val) {
+    uint v16 = f32_to_bf16(val);
+    uint w = idx >> 1u; uint s = idx & 1u;
+    uint shift = s * 16u;
+    atomicAnd(data[w], ~(0xFFFFu << shift));
+    atomicOr(data[w], (v16 & 0xFFFFu) << shift);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row_idx = gl_WorkGroupID.x;
+    if (row_idx >= pc.n_rows) return;
+
+    uint src_base = locs_src[row_idx] * pc.row_size;
+    uint dst_base = locs_dst[row_idx] * pc.row_size;
+
+    // Pass 1: max (in f32)
+    float max_val = -9.99999968e+37;
+    for (uint i = tid; i < pc.row_size; i += 256u) {
+        max_val = max(max_val, load_bf16(src_base + i));
+    }
+    sdata[tid] = max_val;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        barrier();
+    }
+    float row_max = sdata[0];
+    barrier();
+
+    // Pass 2: exp + sum (compute in f32, store bf16)
+    float sum_val = 0.0;
+    for (uint i = tid; i < pc.row_size; i += 256u) {
+        float e = exp(load_bf16(src_base + i) - row_max);
+        store_bf16(dst_base + i, e);
+        sum_val += e;
+    }
+    sdata[tid] = sum_val;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float inv_sum = 1.0 / sdata[0];
+    barrier();
+
+    // Pass 3: normalize
+    for (uint i = tid; i < pc.row_size; i += 256u) {
+        store_bf16(dst_base + i, load_bf16(dst_base + i) * inv_sum);
+    }
+}

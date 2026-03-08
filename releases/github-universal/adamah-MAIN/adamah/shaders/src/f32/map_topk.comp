@@ -1,0 +1,90 @@
+#version 450
+layout(local_size_x = 256) in;
+
+const uint TOPK_MAX = 64u;
+const uint INVALID_IDX = 0xffffffffu;
+const float NEG_INF = -3.402823466e+38;
+
+layout(push_constant) uniform PushConstants {
+    uint n_locs;
+    uint k;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer { float map_data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer IdxDstLocs { uint locs_idx_dst[]; };
+layout(set = 0, binding = 3) buffer ValDstLocs { uint locs_val_dst[]; };
+
+shared float s_vals[256];
+shared uint s_idxs[256];
+shared uint top_idxs[TOPK_MAX];
+
+bool better(float cand_val, uint cand_idx, float best_val, uint best_idx) {
+    if (best_idx == INVALID_IDX) return true;
+    if (cand_idx == INVALID_IDX) return false;
+    return (cand_val > best_val) || ((cand_val == best_val) && (cand_idx < best_idx));
+}
+
+bool already_selected(uint cand_idx, uint count) {
+    for (uint i = 0u; i < count; ++i) {
+        if (top_idxs[i] == cand_idx) return true;
+    }
+    return false;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint out_count = min(pc.k, TOPK_MAX);
+
+    if (tid < TOPK_MAX) {
+        top_idxs[tid] = INVALID_IDX;
+    }
+    barrier();
+
+    for (uint out_i = 0u; out_i < out_count; ++out_i) {
+        float best_val = NEG_INF;
+        uint best_idx = INVALID_IDX;
+
+        for (uint i = tid; i < pc.n_locs; i += 256u) {
+            if (already_selected(i, out_i)) continue;
+            float cand_val = map_data[locs_src[i]];
+            if (isnan(cand_val)) cand_val = NEG_INF;
+            if (better(cand_val, i, best_val, best_idx)) {
+                best_val = cand_val;
+                best_idx = i;
+            }
+        }
+
+        s_vals[tid] = best_val;
+        s_idxs[tid] = best_idx;
+        barrier();
+
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                float cand_val = s_vals[tid + stride];
+                uint cand_idx = s_idxs[tid + stride];
+                if (better(cand_val, cand_idx, s_vals[tid], s_idxs[tid])) {
+                    s_vals[tid] = cand_val;
+                    s_idxs[tid] = cand_idx;
+                }
+            }
+            barrier();
+        }
+
+        if (tid == 0u) {
+            uint win_idx = s_idxs[0];
+            float win_val = (win_idx == INVALID_IDX) ? NEG_INF : s_vals[0];
+            top_idxs[out_i] = win_idx;
+            map_data[locs_idx_dst[out_i]] = float((win_idx == INVALID_IDX) ? 0u : win_idx);
+            map_data[locs_val_dst[out_i]] = win_val;
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        for (uint out_i = out_count; out_i < pc.k && out_i < TOPK_MAX; ++out_i) {
+            map_data[locs_idx_dst[out_i]] = 0.0;
+            map_data[locs_val_dst[out_i]] = NEG_INF;
+        }
+    }
+}
