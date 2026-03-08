@@ -9,7 +9,8 @@ Single GitHub release for Windows and Linux.
 
 Those installers will:
 
-- install Python runtime dependencies (`numpy`, `gguf`)
+- create a local `.venv` on Linux (avoids Debian/Raspberry Pi OS pip restrictions)
+- install Python runtime dependencies (`numpy`, `gguf`, `jinja2`)
 - build the ADAMAH native library locally for the current machine
 - start `adamah_chat.py`
 
@@ -28,6 +29,7 @@ The Linux installer attempts `apt-get` automatically when available. If your dis
 
 - `python3`
 - `python3-pip`
+- `python3-venv`
 - `gcc` or `clang`
 - `libvulkan-dev`
 - `glslang-tools` (optional but recommended)

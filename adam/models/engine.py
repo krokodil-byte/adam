@@ -31,6 +31,7 @@ class ModelConfig:
     norm_eps: float = 1e-6
     rope_base_global: float = 10000.0; rope_base_local: float = 10000.0
     sliding_window: int = 0
+    chat_template: Optional[str] = None
     ffn_act: str = 'silu'    # 'silu' | 'gelu'
     emb_scale: float = 1.0   # embedding scale (Gemma: sqrt(n_embd), others: 1.0)
     attn_softcap: float = 0.0  # attention logit soft-cap (Gemma3: 50.0, 0=disabled)
@@ -60,6 +61,7 @@ class ModelConfig:
         c.norm_eps = g('attention.layer_norm_rms_epsilon', 1e-6)
         c.n_vocab = g('vocab_size', metadata.get('tokenizer.ggml.tokens', [None]))
         if isinstance(c.n_vocab, list): c.n_vocab = len(c.n_vocab)
+        c.chat_template = metadata.get('tokenizer.chat_template')
         c.head_dim = c.n_embd // c.n_head if c.n_head > 0 else 128
         c.head_dim_kv = c.n_embd // c.n_head_kv if c.n_head_kv > 0 else c.head_dim
         if arch == 'gemma3':

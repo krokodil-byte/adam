@@ -18,6 +18,7 @@ ADAMAH_PKG = ADAMAH_ROOT / "adamah"
 RUNTIME_REQUIREMENTS = (
     ("numpy", "numpy"),
     ("gguf", "gguf"),
+    ("jinja2", "jinja2"),
 )
 
 
