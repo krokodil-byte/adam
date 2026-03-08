@@ -1,0 +1,55 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PushConstants {
+    uint n_rows; uint dim; float eps; uint group_size;
+} pc;
+layout(set = 0, binding = 0) buffer MapBuffer { uint map_data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs   { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer WtLocs    { uint locs_wt[]; };
+layout(set = 0, binding = 3) buffer DstLocs   { uint locs_dst[]; };
+
+layout(set = 0, binding = 4) buffer ScaleMap { float scale_data[]; };
+layout(set = 0, binding = 5) buffer ZPMap { float zp_data[]; };
+shared float sdata[256];
+
+float load_q6(uint idx) {
+    uint word_idx = idx / 5u;
+    uint sub_idx  = idx % 5u;
+    uint raw = (map_data[word_idx] >> (sub_idx * 6u)) & 0x3Fu;
+    uint group = idx / pc.group_size;
+    return float(int(raw) - 32) * scale_data[group] + zp_data[group];
+}
+void store_q6(uint idx, float val) {
+    uint group = idx / pc.group_size;
+    float qf = (val - zp_data[group]) / max(scale_data[group], 1e-10);
+    int qi = clamp(int(round(qf)) + 32, 0, 63);
+    uint word_idx = idx / 5u;
+    uint sub_idx  = idx % 5u;
+    uint shift = sub_idx * 6u;
+    atomicAnd(map_data[word_idx], ~(0x3Fu << shift));
+    atomicOr(map_data[word_idx], (uint(qi) & 0x3Fu) << shift);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ri = gl_WorkGroupID.x;
+    if (ri >= pc.n_rows) return;
+    uint sb = locs_src[ri] * pc.dim;
+    uint wb = locs_wt[ri] * pc.dim;
+    uint db = locs_dst[ri] * pc.dim;
+    // Sum of squares
+    float ss = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256u) {
+        float x = load_q6(sb+i);
+        ss += x * x;
+    }
+    sdata[tid] = ss; barrier();
+    for (uint s=128u; s>0u; s>>=1u) { if(tid<s) sdata[tid]+=sdata[tid+s]; barrier(); }
+    float inv_rms = 1.0 / sqrt(sdata[0] / float(pc.dim) + pc.eps); barrier();
+    // Normalize and scale by weight
+    for (uint i = tid; i < pc.dim; i += 256u) {
+        float x = load_q6(sb+i);
+        float w = load_q6(wb+i);
+        store_q6(db+i, x * inv_rms * w);
+    }
+}

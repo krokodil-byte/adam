@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""First-run bootstrap for ADAM + ADAMAH runtime."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parent
+ADAMAH_ROOT = ROOT / "adamah-MAIN"
+ADAMAH_PKG = ADAMAH_ROOT / "adamah"
+RUNTIME_REQUIREMENTS = (
+    ("numpy", "numpy"),
+    ("gguf", "gguf"),
+)
+
+
+def _run(cmd, cwd: Path | None = None) -> None:
+    res = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        text=True,
+        capture_output=True,
+    )
+    if res.returncode != 0:
+        msg = res.stderr.strip() or res.stdout.strip() or f"command failed: {' '.join(cmd)}"
+        raise RuntimeError(msg)
+
+
+def ensure_python_deps(auto_install: bool = True) -> None:
+    missing = [pkg for mod, pkg in RUNTIME_REQUIREMENTS if importlib.util.find_spec(mod) is None]
+    if not missing:
+        return
+    if not auto_install:
+        raise RuntimeError(f"Missing Python dependencies: {', '.join(missing)}")
+    _run([sys.executable, "-m", "pip", "install", *missing], cwd=ROOT)
+
+
+def _compile_shaders(pkg_dir: Path) -> None:
+    src_dir = pkg_dir / "shaders" / "src"
+    if not src_dir.is_dir():
+        return
+    glslang = shutil.which("glslangValidator")
+    if not glslang:
+        return
+    for dtype_dir in sorted(src_dir.iterdir()):
+        if not dtype_dir.is_dir():
+            continue
+        out_dir = pkg_dir / "shaders" / dtype_dir.name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for comp_file in sorted(dtype_dir.glob("*.comp")):
+            dst = out_dir / (comp_file.stem + ".spv")
+            _run([glslang, "-V", str(comp_file), "-o", str(dst)], cwd=ROOT)
+    f32_dir = pkg_dir / "shaders" / "f32"
+    root_dir = pkg_dir / "shaders"
+    if f32_dir.is_dir():
+        for spv in f32_dir.glob("*.spv"):
+            shutil.copy2(spv, root_dir / spv.name)
+
+
+def _write_shader_header(pkg_dir: Path) -> Path:
+    shader_hdr = pkg_dir / "_shader_path.h"
+    shader_hdr.write_text(f'#define SHADER_PATH "{pkg_dir / "shaders"}"\n', encoding="utf-8")
+    return shader_hdr
+
+
+def _build_linux(pkg_dir: Path, force_rebuild: bool = False) -> Path:
+    out_file = pkg_dir / "adamah.so"
+    if out_file.exists() and not force_rebuild:
+        return out_file
+    cc = os.environ.get("CC") or shutil.which("gcc") or shutil.which("clang")
+    if not cc:
+        raise RuntimeError("No C compiler found. Install gcc or clang.")
+    shader_hdr = _write_shader_header(pkg_dir)
+    cmd = [
+        cc,
+        "-shared",
+        "-fPIC",
+        "-O2",
+        "-include",
+        str(shader_hdr),
+        str(pkg_dir / "adamah.c"),
+        "-o",
+        str(out_file),
+        "-lvulkan",
+        "-ldl",
+        "-lm",
+    ]
+    if os.environ.get("ADAMAH_CROSS_COMPILE") != "1":
+        cmd.insert(3, "-march=native")
+    _run(cmd, cwd=ROOT)
+    return out_file
+
+
+def _build_windows_msvc(pkg_dir: Path, force_rebuild: bool = False) -> Path | None:
+    out_file = pkg_dir / "adamah_opt.dll"
+    if out_file.exists() and not force_rebuild:
+        return out_file
+    cl = shutil.which("cl")
+    vulkan_sdk = os.environ.get("VULKAN_SDK")
+    if not cl or not vulkan_sdk:
+        return None
+    include_dir = Path(vulkan_sdk) / "Include"
+    lib_dir = Path(vulkan_sdk) / "Lib"
+    vulkan_lib = lib_dir / "vulkan-1.lib"
+    if not vulkan_lib.exists():
+        return None
+    shader_hdr = _write_shader_header(pkg_dir)
+    cmd = [
+        "cl",
+        "/nologo",
+        "/LD",
+        "/O2",
+        f"/I{include_dir}",
+        f"/FI{shader_hdr}",
+        str(pkg_dir / "adamah.c"),
+        "/link",
+        f"/OUT:{out_file}",
+        str(vulkan_lib),
+    ]
+    _run(cmd, cwd=ROOT)
+    return out_file
+
+
+def _build_windows_gnu(pkg_dir: Path, force_rebuild: bool = False) -> Path:
+    out_file = pkg_dir / "adamah_opt.dll"
+    if out_file.exists() and not force_rebuild:
+        return out_file
+    cc = os.environ.get("CC") or shutil.which("gcc") or shutil.which("clang")
+    if not cc:
+        raise RuntimeError("No MinGW/clang compiler found. Install gcc or clang.")
+    shader_hdr = _write_shader_header(pkg_dir)
+    cmd = [
+        cc,
+        "-shared",
+        "-O3",
+        "-std=c11",
+        "-include",
+        str(shader_hdr),
+        str(pkg_dir / "adamah.c"),
+        "-o",
+        str(out_file),
+    ]
+    vulkan_sdk = os.environ.get("VULKAN_SDK")
+    if vulkan_sdk:
+        inc = Path(vulkan_sdk) / "Include"
+        if inc.exists():
+            cmd.extend(["-I", str(inc)])
+    lib_candidates = [
+        ROOT / "libvulkan-1.a",
+    ]
+    if vulkan_sdk:
+        lib_candidates.append(Path(vulkan_sdk) / "Lib" / "libvulkan-1.a")
+    lib_arg = next((str(p) for p in lib_candidates if p.exists()), None)
+    if lib_arg is not None:
+        cmd.append(lib_arg)
+    else:
+        cmd.append("-lvulkan-1")
+    _run(cmd, cwd=ROOT)
+    return out_file
+
+
+def ensure_native_adamah(force_rebuild: bool = False) -> Path:
+    pkg_dir = ADAMAH_PKG
+    candidates = ["adamah_opt.dll", "adamah_new.dll", "adamah.dll"] if os.name == "nt" else ["adamah.so"]
+    if not force_rebuild:
+        for name in candidates:
+            path = pkg_dir / name
+            if path.exists():
+                return path
+    _compile_shaders(pkg_dir)
+    if os.name == "nt":
+        built = _build_windows_msvc(pkg_dir, force_rebuild=force_rebuild)
+        if built is not None:
+            return built
+        return _build_windows_gnu(pkg_dir, force_rebuild=force_rebuild)
+    return _build_linux(pkg_dir, force_rebuild=force_rebuild)
+
+
+def ensure_runtime(auto_install: bool = True, build_native: bool = True,
+                   force_rebuild: bool = False) -> Path | None:
+    ensure_python_deps(auto_install=auto_install)
+    if build_native:
+        return ensure_native_adamah(force_rebuild=force_rebuild)
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Bootstrap ADAM + ADAMAH runtime")
+    parser.add_argument("--no-python", action="store_true", help="skip Python dependency install")
+    parser.add_argument("--no-native", action="store_true", help="skip native library build check")
+    parser.add_argument("--rebuild-native", action="store_true", help="force native rebuild")
+    args = parser.parse_args(argv)
+
+    path = ensure_runtime(
+        auto_install=not args.no_python,
+        build_native=not args.no_native,
+        force_rebuild=args.rebuild_native,
+    )
+    if path is not None:
+        print(f"Runtime ready: {path}")
+    else:
+        print("Runtime ready")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,55 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint n_ops;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer { uint data[]; };
+layout(set = 0, binding = 1) buffer LocsA { uint locs_a[]; };
+layout(set = 0, binding = 2) buffer LocsB { uint locs_b[]; };
+layout(set = 0, binding = 3) buffer LocsC { uint locs_c[]; };
+
+float bf16_to_f32(uint val16) { return uintBitsToFloat(val16 << 16u); }
+uint f32_to_bf16(float val) {
+    uint bits = floatBitsToUint(val);
+    return (bits + 0x7FFFu + ((bits >> 16u) & 1u)) >> 16u;
+}
+
+float load_bf16(uint idx) {
+    uint w = idx >> 1u; uint s = idx & 1u;
+    return bf16_to_f32((data[w] >> (s * 16u)) & 0xFFFFu);
+}
+
+void store_bf16(uint idx, float val) {
+    uint v16 = f32_to_bf16(val);
+    uint w = idx >> 1u; uint s = idx & 1u;
+    uint shift = s * 16u;
+    atomicAnd(data[w], ~(0xFFFFu << shift));
+    atomicOr(data[w], (v16 & 0xFFFFu) << shift);
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint col = gl_GlobalInvocationID.y;
+    uint op_idx = gl_GlobalInvocationID.z;
+
+    if (row >= pc.M || col >= pc.N || op_idx >= pc.n_ops) return;
+
+    uint a_base = locs_a[op_idx];
+    uint b_base = locs_b[op_idx];
+    uint c_base = locs_c[op_idx];
+
+    // Accumulate in float32 for precision
+    float sum = 0.0;
+    for (uint k = 0u; k < pc.K; k++) {
+        float a_val = load_bf16(a_base + row * pc.K + k);
+        float b_val = load_bf16(b_base + k * pc.N + col);
+        sum += a_val * b_val;
+    }
+
+    store_bf16(c_base + row * pc.N + col, sum);
+}

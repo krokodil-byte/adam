@@ -1,0 +1,22 @@
+Creative Commons Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0)
+
+ADAM v1.0.0 — Adaptive Dispatch Architecture for Models
+Copyright (c) 2026 Samuele Scuglia
+
+ADAM is a derivative work of ADAMAH (Adaptive Dispatch Architecture for Massively
+Parallel Heterogeneous Workloads) by Samuele Scuglia, and is licensed under the
+same terms as ADAMAH.
+
+You are free to:
+- Share: copy and redistribute the material in any medium or format
+- Adapt: remix, transform, and build upon the material
+
+Under the following terms:
+- Attribution: You must give appropriate credit, provide a link to the license,
+  and indicate if changes were made. You must credit both ADAM and the underlying
+  ADAMAH library (Samuele Scuglia, 2026).
+- NonCommercial: You may not use the material for commercial purposes.
+
+Full license text: https://creativecommons.org/licenses/by-nc/4.0/legalcode
+
+For commercial licensing inquiries, contact the author.

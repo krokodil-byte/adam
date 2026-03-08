@@ -1,0 +1,58 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PushConstants {
+    uint op_code; uint n_locs; uint pack_size; uint group_size;
+} pc;
+layout(set = 0, binding = 0) buffer MapBuffer { uint map_data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs   { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer DstLocs   { uint locs_dst[]; };
+layout(set = 0, binding = 3) buffer ScaleMap  { float scale_data[]; };
+layout(set = 0, binding = 4) buffer ZPMap     { float zp_data[]; };
+shared float sdata[256];
+
+float load_q6(uint idx) {
+    uint word_idx = idx / 5u;
+    uint sub_idx  = idx % 5u;
+    uint raw = (map_data[word_idx] >> (sub_idx * 6u)) & 0x3Fu;
+    int ival = int(raw) - 32;
+    uint group = idx / pc.group_size;
+    float scale = scale_data[group];
+    float zp    = zp_data[group];
+    return float(ival) * scale + zp;
+}
+
+void store_q6(uint idx, float val) {
+    uint group = idx / pc.group_size;
+    float scale = scale_data[group];
+    float zp    = zp_data[group];
+    float qf = (val - zp) / max(scale, 1e-10);
+    int qi = clamp(int(round(qf)) + 32, 0, 63);
+    uint word_idx = idx / 5u;
+    uint sub_idx  = idx % 5u;
+    uint shift = sub_idx * 6u;
+    atomicAnd(map_data[word_idx], ~(0x3Fu << shift));
+    atomicOr(map_data[word_idx], (uint(qi) & 0x3Fu) << shift);
+}
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint li = gl_WorkGroupID.x;
+    if (li >= pc.n_locs) return;
+    uint base = locs_src[li] * pc.pack_size;
+    float val = (pc.op_code==0u)?0.0:((pc.op_code==1u)?-1e38:1e38);
+    for (uint i=tid; i<pc.pack_size; i+=256u) {
+        float x = load_q6(base+i);
+        if (pc.op_code==0u) val+=x;
+        else if (pc.op_code==1u) val=max(val,x);
+        else val=min(val,x);
+    }
+    sdata[tid]=val; barrier();
+    for (uint s=128u; s>0u; s>>=1u) {
+        if (tid<s) {
+            if (pc.op_code==0u) sdata[tid]+=sdata[tid+s];
+            else if (pc.op_code==1u) sdata[tid]=max(sdata[tid],sdata[tid+s]);
+            else sdata[tid]=min(sdata[tid],sdata[tid+s]);
+        }
+        barrier();
+    }
+    if (tid==0u) store_q6(locs_dst[li], sdata[0]);
+}

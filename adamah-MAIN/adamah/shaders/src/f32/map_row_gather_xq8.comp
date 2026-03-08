@@ -1,0 +1,32 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint src_base;
+    uint dst_base;
+    uint row_idx;
+    uint row_size;
+    uint group_size;
+    float scale;
+} pc;
+
+layout(set = 0, binding = 0) buffer ActBuffer  { float map_act[]; };
+layout(set = 0, binding = 1) buffer WtBuffer   { uint  map_wt[];  };
+layout(set = 0, binding = 2) buffer QParams    { float qparams[]; };
+
+float load_q8(uint idx) {
+    uint word_idx = idx / 4u;
+    uint sub_idx  = idx % 4u;
+    uint raw_uint = (map_wt[word_idx] >> (sub_idx * 8u)) & 0xFFu;
+    uint group = idx / pc.group_size;
+    return float(raw_uint) * qparams[group * 2u] + qparams[group * 2u + 1u];
+}
+
+void main() {
+    uint ei = gl_GlobalInvocationID.x;
+    if (ei >= pc.row_size) return;
+
+    uint src_off = pc.src_base + pc.row_idx * pc.row_size + ei;
+    uint dst_off = pc.dst_base + ei;
+    map_act[dst_off] = load_q8(src_off) * pc.scale;
+}

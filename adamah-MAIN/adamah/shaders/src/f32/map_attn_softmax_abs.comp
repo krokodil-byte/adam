@@ -1,0 +1,67 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint n_rows;
+    uint row_size;
+    float scale;
+    float cap;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer { float data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer DstLocs { uint locs_dst[]; };
+
+shared float sdata[256];
+
+float prep(float v) {
+    v *= pc.scale;
+    if (pc.cap > 0.0) {
+        v = tanh(v / pc.cap) * pc.cap;
+    }
+    return v;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row_idx = gl_WorkGroupID.x;
+    if (row_idx >= pc.n_rows) return;
+
+    uint src_base = locs_src[row_idx];
+    uint dst_base = locs_dst[row_idx];
+
+    float max_val = -9.99999968e+37;
+    for (uint i = tid; i < pc.row_size; i += 256u) {
+        max_val = max(max_val, prep(data[src_base + i]));
+    }
+    sdata[tid] = max_val;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        barrier();
+    }
+    float row_max = sdata[0];
+    barrier();
+
+    float sum_val = 0.0;
+    for (uint i = tid; i < pc.row_size; i += 256u) {
+        float e = exp(prep(data[src_base + i]) - row_max);
+        data[dst_base + i] = e;
+        sum_val += e;
+    }
+    sdata[tid] = sum_val;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float row_sum = sdata[0];
+    float inv_sum = 1.0 / row_sum;
+    barrier();
+
+    for (uint i = tid; i < pc.row_size; i += 256u) {
+        data[dst_base + i] *= inv_sum;
+    }
+}

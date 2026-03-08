@@ -1,0 +1,33 @@
+{
+  "bundle": "github-universal",
+  "top_level": [
+    "adam",
+    "adamah_chat.py",
+    "runtime_bootstrap.py",
+    "install_runtime.py",
+    "requirements-runtime.txt",
+    "LICENSE"
+  ],
+  "adamah_root": [
+    "README.md",
+    "setup.py",
+    "pyproject.toml",
+    "LICENSE"
+  ],
+  "adamah_package_common": [
+    "__init__.py",
+    "uucis.py",
+    "adamah.c",
+    "shaders"
+  ],
+  "platforms": {
+    "windows": [
+      "install_windows.bat",
+      "run_chat_windows.bat"
+    ],
+    "linux": [
+      "install_linux.sh",
+      "run_chat_linux.sh"
+    ]
+  }
+}

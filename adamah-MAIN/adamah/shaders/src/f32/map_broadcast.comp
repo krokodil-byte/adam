@@ -1,0 +1,35 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint op_code;   // 0=mul, 1=div, 2=add, 3=sub
+    uint n_locs;
+    uint pack_size;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer { float data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer ScalarLocs { uint locs_scalar[]; };
+layout(set = 0, binding = 3) buffer DstLocs { uint locs_dst[]; };
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint loc_idx = tid / pc.pack_size;
+    uint elem_idx = tid % pc.pack_size;
+    if (loc_idx >= pc.n_locs) return;
+
+    uint src_offset = locs_src[loc_idx] * pc.pack_size + elem_idx;
+    uint scalar_offset = locs_scalar[loc_idx];
+    uint dst_offset = locs_dst[loc_idx] * pc.pack_size + elem_idx;
+
+    float val = data[src_offset];
+    float scalar = data[scalar_offset];
+    float result;
+
+    if (pc.op_code == 0u) result = val * scalar;
+    else if (pc.op_code == 1u) result = val / scalar;
+    else if (pc.op_code == 2u) result = val + scalar;
+    else result = val - scalar;
+
+    data[dst_offset] = result;
+}

@@ -1,0 +1,54 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint op_code;
+    uint n_locs;
+    uint pack_size;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer { uint data[]; };
+layout(set = 0, binding = 1) buffer SrcLocs { uint locs_src[]; };
+layout(set = 0, binding = 2) buffer ScalarLocs { uint locs_scalar[]; };
+layout(set = 0, binding = 3) buffer DstLocs { uint locs_dst[]; };
+
+float bf16_to_f32(uint val16) { return uintBitsToFloat(val16 << 16u); }
+uint f32_to_bf16(float val) {
+    uint bits = floatBitsToUint(val);
+    return (bits + 0x7FFFu + ((bits >> 16u) & 1u)) >> 16u;
+}
+
+float load_bf16(uint idx) {
+    uint w = idx >> 1u; uint s = idx & 1u;
+    return bf16_to_f32((data[w] >> (s * 16u)) & 0xFFFFu);
+}
+
+void store_bf16(uint idx, float val) {
+    uint v16 = f32_to_bf16(val);
+    uint w = idx >> 1u; uint s = idx & 1u;
+    uint shift = s * 16u;
+    atomicAnd(data[w], ~(0xFFFFu << shift));
+    atomicOr(data[w], (v16 & 0xFFFFu) << shift);
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint loc_idx = tid / pc.pack_size;
+    uint elem_idx = tid % pc.pack_size;
+    if (loc_idx >= pc.n_locs) return;
+
+    uint src_offset = locs_src[loc_idx] * pc.pack_size + elem_idx;
+    uint scalar_offset = locs_scalar[loc_idx];
+    uint dst_offset = locs_dst[loc_idx] * pc.pack_size + elem_idx;
+
+    float val = load_bf16(src_offset);
+    float scalar = load_bf16(scalar_offset);
+    float result;
+
+    if (pc.op_code == 0u) result = val * scalar;
+    else if (pc.op_code == 1u) result = val / scalar;
+    else if (pc.op_code == 2u) result = val + scalar;
+    else result = val - scalar;
+
+    store_bf16(dst_offset, result);
+}

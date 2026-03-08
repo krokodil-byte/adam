@@ -1,0 +1,40 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(push_constant) uniform PushConstants {
+    uint M; uint K; uint N; uint n_ops; uint group_size;
+} pc;
+// Cross-map: F32 activations × Q4 weights → F32 output
+layout(set = 0, binding = 0) buffer ActBuffer  { float map_act[]; };  // F32 workspace
+layout(set = 0, binding = 1) buffer WtBuffer   { uint  map_wt[];  };  // Q4 packed nibbles
+layout(set = 0, binding = 2) buffer LocsA      { uint  locs_a[];  };
+layout(set = 0, binding = 3) buffer LocsB      { uint  locs_b[];  };
+layout(set = 0, binding = 4) buffer LocsC      { uint  locs_c[];  };
+layout(set = 0, binding = 5) buffer QParams    { float qparams[]; };  // [scale0,zp0,scale1,zp1,...]
+
+float load_q4(uint idx) {
+    uint word_idx = idx / 8u;
+    uint sub_idx  = idx % 8u;
+    uint raw = (map_wt[word_idx] >> (sub_idx * 4u)) & 0xFu;
+    uint group = idx / pc.group_size;
+    return float(raw) * qparams[group * 2u] + qparams[group * 2u + 1u];
+}
+
+// C = A @ B^T
+// A[M,K] from map_act (F32), B[N,K] from map_wt (Q4 packed)
+// C[M,N] written to map_act (F32)
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint col = gl_GlobalInvocationID.y;
+    uint op  = gl_GlobalInvocationID.z;
+    if (row >= pc.M || col >= pc.N || op >= pc.n_ops) return;
+    uint a_base = locs_a[op];
+    uint b_base = locs_b[op];
+    uint c_base = locs_c[op];
+    float sum = 0.0;
+    for (uint k = 0u; k < pc.K; k++) {
+        float a_val = map_act[a_base + row * pc.K + k];
+        float b_val = load_q4(b_base + col * pc.K + k);
+        sum += a_val * b_val;
+    }
+    map_act[c_base + row * pc.N + col] = sum;
+}
