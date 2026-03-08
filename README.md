@@ -20,7 +20,8 @@ Those installers will:
 
 ## Models
 
-Place one or more `.gguf` model files inside the bundle root before starting the chat.
+Place gemma 1b q4k_m `.gguf` model file inside the bundle root before starting the chat.
+Soon more compatibility...
 
 ## Linux system packages
 
