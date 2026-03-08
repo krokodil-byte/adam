@@ -1386,16 +1386,27 @@ int adamah_init_ex(uint64_t hot_bytes, uint64_t cold_bytes) {
   ctx.pending_desc_reset = 0;
 
   if (cache_init(hot_bytes, cold_bytes) != 0) {
-    return ADAMAH_ERR_MEMORY;
+    goto fail_cleanup;
+  }
+
+  // Scale staging pool with cache allocation; bounded to [32 MB, 512 MB].
+  // Smaller cache requests (e.g. from RPi/low-VRAM fallback) also get a
+  // smaller staging pool so total allocation stays within device limits.
+  {
+    uint64_t staging_bytes = (uint64_t)hot_bytes / 4;
+    if (staging_bytes < 32ULL * 1024 * 1024)
+      staging_bytes = 32ULL * 1024 * 1024;
+    if (staging_bytes > STAGING_POOL_BYTES)
+      staging_bytes = STAGING_POOL_BYTES;
+    ctx.pool_size = (VkDeviceSize)staging_bytes;
   }
 
   // Allocate shared staging pool (host-visible, used by all scatter/gather).
-  ctx.pool_size = STAGING_POOL_BYTES;
   VkBufferUsageFlags pool_usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   if (create_buffer_ex(&ctx.pool_buf, &ctx.pool_mem, ctx.pool_size,
                        pool_usage, 0, &ctx.pool_mem_props) != 0) {
-    return ADAMAH_ERR_MEMORY;
+    goto fail_cleanup;
   }
   vkMapMemory(ctx.device, ctx.pool_mem, 0, ctx.pool_size, 0, &ctx.pool_ptr);
 
@@ -1405,6 +1416,32 @@ int adamah_init_ex(uint64_t hot_bytes, uint64_t cold_bytes) {
 
   ctx.initialized = 1;
   return ADAMAH_OK;
+
+fail_cleanup:
+  /* Free any GPU buffers partially allocated by cache_init, then tear down
+   * all Vulkan objects so a retry with smaller values can succeed cleanly. */
+  for (int fi = 0; fi < ctx.buf_count; fi++) {
+    if (ctx.bufs[fi].ptr)
+      vkUnmapMemory(ctx.device, ctx.bufs[fi].mem);
+    if (ctx.bufs[fi].buf)
+      vkDestroyBuffer(ctx.device, ctx.bufs[fi].buf, NULL);
+    if (ctx.bufs[fi].mem)
+      vkFreeMemory(ctx.device, ctx.bufs[fi].mem, NULL);
+  }
+  for (int fi = 0; fi < CMD_RING; fi++) {
+    if (ctx.fence_ring[fi])
+      vkDestroyFence(ctx.device, ctx.fence_ring[fi], NULL);
+  }
+  if (ctx.fence)
+    vkDestroyFence(ctx.device, ctx.fence, NULL);
+  if (ctx.cmd_pool)
+    vkDestroyCommandPool(ctx.device, ctx.cmd_pool, NULL);
+  if (ctx.device)
+    vkDestroyDevice(ctx.device, NULL);
+  if (ctx.instance)
+    vkDestroyInstance(ctx.instance, NULL);
+  memset(&ctx, 0, sizeof(ctx));
+  return ADAMAH_ERR_MEMORY;
 }
 
 int adamah_init(void) {
@@ -1442,7 +1479,12 @@ int adamah_init(void) {
     }
   }
 
-  // Query VRAM
+  // Query device type and VRAM before destroying the probe instance.
+  VkPhysicalDeviceProperties selected_props;
+  vkGetPhysicalDeviceProperties(ctx.phys, &selected_props);
+  int is_integrated = (selected_props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+                       selected_props.deviceType == VK_PHYSICAL_DEVICE_TYPE_OTHER);
+
   VkPhysicalDeviceMemoryProperties mem_props;
   vkGetPhysicalDeviceMemoryProperties(ctx.phys, &mem_props);
   uint64_t vram = 0;
@@ -1459,27 +1501,33 @@ int adamah_init(void) {
   ctx.instance = NULL;
   ctx.phys = NULL;
 
-  // Phase 2: Calculate optimal pool sizes based on VRAM
+  // Phase 2: Calculate optimal pool sizes based on device type and VRAM.
   uint64_t hot, cold;
-  if (vram >= 8ull * 1024 * 1024 * 1024) {
-    // 8GB+ VRAM: use 25% hot, 12.5% cold
-    hot = vram / 4;
+  if (is_integrated) {
+    // Integrated / unified-memory GPU (Raspberry Pi, Intel UHD, etc.).
+    // The reported device-local heap is shared system RAM; individual Vulkan
+    // allocations are constrained by CMA / driver limits far below the
+    // reported heap size.  Start conservative; init_gpu_backend() will retry
+    // with even smaller values if this still fails.
+    hot  = 128ull * 1024 * 1024;  // 128 MB
+    cold =  64ull * 1024 * 1024;  //  64 MB
+  } else if (vram >= 8ull * 1024 * 1024 * 1024) {
+    // 8 GB+ discrete: 25% hot, 12.5% cold
+    hot  = vram / 4;
     cold = vram / 8;
   } else if (vram >= 4ull * 1024 * 1024 * 1024) {
-    // 4-8GB VRAM: use 20% hot, 10% cold
-    hot = vram / 5;
-    cold = vram / 10;
+    // 4-8 GB discrete: allocate ~2 GB hot, ~1 GB cold
+    hot  = vram / 2;
+    cold = vram / 4;
   } else {
-    // <4GB: conservative
-    hot = 512ull * 1024 * 1024;
+    // <4 GB discrete: conservative
+    hot  = 512ull * 1024 * 1024;
     cold = 256ull * 1024 * 1024;
   }
 
   // Cap at reasonable maximums
-  if (hot > 4ull * 1024 * 1024 * 1024)
-    hot = 4ull * 1024 * 1024 * 1024;
-  if (cold > 2ull * 1024 * 1024 * 1024)
-    cold = 2ull * 1024 * 1024 * 1024;
+  if (hot  > 4ull * 1024 * 1024 * 1024) hot  = 4ull * 1024 * 1024 * 1024;
+  if (cold > 2ull * 1024 * 1024 * 1024) cold = 2ull * 1024 * 1024 * 1024;
 
   // Now do full init with optimal sizes
   return adamah_init_ex(hot, cold);
