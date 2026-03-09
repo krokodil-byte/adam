@@ -120,7 +120,10 @@ class GGUFLoader:
             self.tensor_infos.append(ti)
             self.tensor_info_by_name[nm] = ti
             self.tensor_types[nm] = dt
-            self.tensor_shapes[nm] = sh
+            # GGUF stores ne[] with the fastest-changing dimension first.
+            # The dequantized ndarray shape and the inference engine both expect
+            # the logical row-major order, i.e. the reversed shape.
+            self.tensor_shapes[nm] = sh[::-1]
         align=self.metadata.get('general.alignment',32)
         pos=f.tell(); self._data_offset=(pos+align-1)//align*align
         if v:
