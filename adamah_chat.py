@@ -158,10 +158,39 @@ def _mb_str(value_bytes):
     return f"{int(value_bytes) / (1024 * 1024):.0f}MB"
 
 
+def _runtime_profile_overrides(profile_name, cfg, unified):
+    name = (profile_name or "").strip().lower()
+    if not name or name in ("default", "auto"):
+        return {"name": "default"}
+    if name == "unified_small_gpu":
+        return {
+            "name": "unified_small_gpu",
+            "reserve_ratio": 0.12,
+            "kv_cap_max": 256,
+            "stream_load": True,
+            "stream_chunk_mb": 8,
+            "gpu_approx_rerank": cfg.n_vocab >= 131072,
+            "gpu_fused_rows_per_group": 128,
+            "pool_hot_mb_max": 64,
+            "pool_cold_mb_max": 32,
+        }
+    if name == "broadcom_v3dv":
+        return {
+            "name": "broadcom_v3dv",
+            "reserve_ratio": 0.15,
+            "kv_cap_max": 256,
+            "stream_load": True,
+            "stream_chunk_mb": 8,
+            "gpu_approx_rerank": cfg.n_vocab >= 131072,
+            "gpu_fused_rows_per_group": 128,
+            "pool_hot_mb_max": 64,
+            "pool_cold_mb_max": 32,
+        }
+    return {"name": name}
+
+
 def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
     reserve_ratio = min(max(float(os.environ.get("ADAM_RUNTIME_RESERVE_RATIO", "0.10")), 0.0), 0.5)
-    rows_per_group = max(1, _env_int("ADAM_GPU_FUSED_ROWS_PER_GROUP", FAST_LM_ROWS_PER_GROUP))
-    approx_rerank = bool(_env_flag("ADAM_GPU_APPROX_RERANK", False))
     machine = ""
     try:
         machine = os.uname().machine.lower()
@@ -180,6 +209,20 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
         device = {}
 
     unified = bool(device.get("is_unified_memory")) or arm_like
+    profile_name = os.environ.get("ADAM_RUNTIME_PROFILE", "default")
+    profile = _runtime_profile_overrides(profile_name, cfg, unified)
+    if "reserve_ratio" in profile and os.environ.get("ADAM_RUNTIME_RESERVE_RATIO") is None:
+        reserve_ratio = float(profile["reserve_ratio"])
+    rows_per_group = max(
+        1,
+        _env_int(
+            "ADAM_GPU_FUSED_ROWS_PER_GROUP",
+            int(profile.get("gpu_fused_rows_per_group", FAST_LM_ROWS_PER_GROUP)),
+        ),
+    )
+    approx_rerank = bool(
+        _env_flag("ADAM_GPU_APPROX_RERANK", profile.get("gpu_approx_rerank", False))
+    )
     host_avail = int(host.get("available_bytes") or 0)
     device_free = int(device.get("free_budget_bytes") or device.get("budget_bytes") or device.get("heap_bytes") or 0)
     usable_device = int(device_free * (1.0 - reserve_ratio)) if device_free > 0 else 0
@@ -190,6 +233,8 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
     kv_cap = int(kv_cap_env) if kv_cap_env else engine_cls.KV_CAP_DEFAULT
     if unified and kv_cap_env is None:
         kv_cap = min(kv_cap, 512)
+    if kv_cap_env is None and profile.get("kv_cap_max") is not None:
+        kv_cap = min(kv_cap, int(profile["kv_cap_max"]))
     while True:
         gpu_est = engine_cls.estimate_persistent_gpu_bytes(
             cfg,
@@ -215,11 +260,18 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
         )
     except Exception:
         pool_plan = {}
+    if pool_plan:
+        if profile.get("pool_hot_mb_max") is not None:
+            pool_plan["hot_mb"] = min(int(pool_plan.get("hot_mb", 0)), int(profile["pool_hot_mb_max"]))
+        if profile.get("pool_cold_mb_max") is not None:
+            pool_plan["cold_mb"] = min(int(pool_plan.get("cold_mb", 0)), int(profile["pool_cold_mb_max"]))
 
     eager_host_bytes = loader.estimate_raw_bytes() + loader.estimate_f32_bytes()
     stream_default = unified
     if host_avail > 0 and eager_host_bytes + 512 * 1024 * 1024 > int(host_avail * (1.0 - reserve_ratio)):
         stream_default = True
+    if profile.get("stream_load") is not None and os.environ.get("ADAM_STREAM_LOAD") is None:
+        stream_default = bool(profile["stream_load"])
     stream_load = _env_flag("ADAM_STREAM_LOAD", stream_default)
 
     chunk_env = os.environ.get("ADAM_STREAM_CHUNK_MB")
@@ -238,8 +290,11 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
             stream_chunk_mb = max(8, min(64, min(host_chunk, pool_chunk)))
         else:
             stream_chunk_mb = max(16, min(256, min(host_chunk, max(pool_chunk, 64))))
+        if profile.get("stream_chunk_mb") is not None:
+            stream_chunk_mb = min(stream_chunk_mb, int(profile["stream_chunk_mb"]))
 
     return {
+        "profile": profile.get("name", "default"),
         "reserve_ratio": reserve_ratio,
         "host": host,
         "device": device,
@@ -260,6 +315,7 @@ def print_runtime_plan(plan):
     gpu_est = plan.get("gpu_est", {})
     pool_plan = plan.get("pool_plan", {})
     reserve_pct = int(round(plan.get("reserve_ratio", 0.10) * 100))
+    profile = plan.get("profile", "default")
 
     if device:
         heap = device.get("heap_bytes", 0)
@@ -277,7 +333,7 @@ def print_runtime_plan(plan):
     if pool_plan:
         print(f"{GREEN}GPU pools:{RESET} hot={pool_plan.get('hot_mb', 0)}MB "
               f"cold={pool_plan.get('cold_mb', 0)}MB")
-    print(f"{GREEN}Runtime:{RESET} kv_cap={plan.get('kv_cap', 0)} "
+    print(f"{GREEN}Runtime:{RESET} profile={profile} kv_cap={plan.get('kv_cap', 0)} "
           f"stream={'on' if plan.get('stream_load') else 'off'} "
           f"chunk={plan.get('stream_chunk_mb', 0)}MB "
           f"sampler={'approx_rerank' if plan.get('gpu_approx_rerank') else 'exact_fused_topk'} "
