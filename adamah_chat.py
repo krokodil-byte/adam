@@ -140,8 +140,136 @@ def select_model(models):
             pass
         print(f"{RED}Invalid choice{RESET}")
 
-def init_gpu_backend(adamah_mod):
-    """Initialize ADAMAH, falling back to smaller cache pools on unified-memory GPUs."""
+def _env_flag(name, default=None):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _mb_str(value_bytes):
+    return f"{int(value_bytes) / (1024 * 1024):.0f}MB"
+
+
+def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
+    reserve_ratio = min(max(float(os.environ.get("ADAM_RUNTIME_RESERVE_RATIO", "0.10")), 0.0), 0.5)
+    machine = ""
+    try:
+        machine = os.uname().machine.lower()
+    except AttributeError:
+        machine = ""
+    arm_like = machine in ("aarch64", "arm64", "armv7l", "armv6l")
+    host = {}
+    device = {}
+    try:
+        host = adamah_mod.host_memory_info()
+    except Exception:
+        host = {}
+    try:
+        device = adamah_mod.probe_device()
+    except Exception:
+        device = {}
+
+    unified = bool(device.get("is_unified_memory")) or arm_like
+    host_avail = int(host.get("available_bytes") or 0)
+    device_free = int(device.get("free_budget_bytes") or device.get("budget_bytes") or device.get("heap_bytes") or 0)
+    usable_device = int(device_free * (1.0 - reserve_ratio)) if device_free > 0 else 0
+    if unified and host_avail > 0:
+        usable_device = min(usable_device or host_avail, int(host_avail * (1.0 - reserve_ratio)))
+
+    kv_cap = int(os.environ.get("ADAM_KV_CAP", str(engine_cls.KV_CAP_DEFAULT)))
+    while True:
+        gpu_est = engine_cls.estimate_persistent_gpu_bytes(
+            cfg,
+            loader.tensor_shapes,
+            loader.tensor_types,
+            kv_cap=kv_cap,
+            gpu_tied_lm_head=True,
+            gpu_approx_rerank=False,
+            gpu_fused_rows_per_group=FAST_LM_ROWS_PER_GROUP,
+        )
+        if kv_cap <= 256 or usable_device <= 0:
+            break
+        limit_ratio = 0.80 if unified else 0.92
+        if gpu_est["total_bytes"] <= int(usable_device * limit_ratio):
+            break
+        kv_cap //= 2
+
+    pool_plan = {}
+    try:
+        pool_plan = adamah_mod.recommend_pool_sizes(
+            working_set_bytes=gpu_est["total_bytes"],
+            reserve_ratio=reserve_ratio,
+        )
+    except Exception:
+        pool_plan = {}
+
+    eager_host_bytes = loader.estimate_raw_bytes() + loader.estimate_f32_bytes()
+    stream_default = unified
+    if host_avail > 0 and eager_host_bytes + 512 * 1024 * 1024 > int(host_avail * (1.0 - reserve_ratio)):
+        stream_default = True
+    stream_load = _env_flag("ADAM_STREAM_LOAD", stream_default)
+
+    chunk_env = os.environ.get("ADAM_STREAM_CHUNK_MB")
+    if chunk_env is not None:
+        stream_chunk_mb = max(8, min(256, int(chunk_env)))
+    else:
+        if host_avail > 0:
+            host_chunk = max(8, min(256, host_avail // (64 * 1024 * 1024)))
+        else:
+            host_chunk = 32 if unified else 64
+        if pool_plan:
+            pool_chunk = max(8, min(256, max(1, pool_plan.get("hot_mb", host_chunk) // 2)))
+        else:
+            pool_chunk = host_chunk
+        if unified:
+            stream_chunk_mb = max(8, min(64, min(host_chunk, pool_chunk)))
+        else:
+            stream_chunk_mb = max(16, min(256, min(host_chunk, max(pool_chunk, 64))))
+
+    return {
+        "reserve_ratio": reserve_ratio,
+        "host": host,
+        "device": device,
+        "usable_device_bytes": usable_device,
+        "gpu_est": gpu_est,
+        "pool_plan": pool_plan,
+        "stream_load": bool(stream_load),
+        "stream_chunk_mb": int(stream_chunk_mb),
+        "kv_cap": int(kv_cap),
+    }
+
+
+def print_runtime_plan(plan):
+    device = plan.get("device", {})
+    host = plan.get("host", {})
+    gpu_est = plan.get("gpu_est", {})
+    pool_plan = plan.get("pool_plan", {})
+    reserve_pct = int(round(plan.get("reserve_ratio", 0.10) * 100))
+
+    if device:
+        heap = device.get("heap_bytes", 0)
+        free_budget = device.get("free_budget_bytes", device.get("budget_bytes", 0))
+        print(f"{GREEN}GPU memory:{RESET} {device.get('device_type_name', 'gpu')} "
+              f"heap={_mb_str(heap)} free_budget={_mb_str(free_budget)} "
+              f"usable={_mb_str(plan.get('usable_device_bytes', 0))} reserve={reserve_pct}%")
+    if host:
+        print(f"{GREEN}Host RAM:{RESET} total={_mb_str(host.get('total_bytes', 0))} "
+              f"available={_mb_str(host.get('available_bytes', 0))}")
+    if gpu_est:
+        print(f"{GREEN}Model GPU est:{RESET} total={_mb_str(gpu_est.get('total_bytes', 0))} "
+              f"workspace={_mb_str(gpu_est.get('workspace_bytes', 0))} "
+              f"kv={_mb_str(gpu_est.get('kv_bytes', 0))}")
+    if pool_plan:
+        print(f"{GREEN}GPU pools:{RESET} hot={pool_plan.get('hot_mb', 0)}MB "
+              f"cold={pool_plan.get('cold_mb', 0)}MB")
+    print(f"{GREEN}Runtime:{RESET} kv_cap={plan.get('kv_cap', 0)} "
+          f"stream={'on' if plan.get('stream_load') else 'off'} "
+          f"chunk={plan.get('stream_chunk_mb', 0)}MB")
+
+
+def init_gpu_backend(adamah_mod, runtime_plan=None):
+    """Initialize ADAMAH with adaptive pools and conservative fallback retries."""
     attempts = []
     hot_env = os.environ.get("ADAMAH_CACHE_MB")
     cold_env = os.environ.get("ADAMAH_COLD_CACHE_MB")
@@ -149,6 +277,14 @@ def init_gpu_backend(adamah_mod):
         hot = int(hot_env) if hot_env else None
         cold = int(cold_env) if cold_env else None
         attempts.append((hot, cold))
+    elif runtime_plan and runtime_plan.get("pool_plan"):
+        hot = int(runtime_plan["pool_plan"].get("hot_mb", 0))
+        cold = int(runtime_plan["pool_plan"].get("cold_mb", 0))
+        attempts.append((hot, cold))
+        attempts.extend([
+            (max(16, hot // 2), max(8, cold // 2)),
+            (max(16, hot // 4), max(8, cold // 4)),
+        ])
     attempts.extend([
         (None, None),
         (512, 256),
@@ -188,11 +324,21 @@ def load_model(model_path):
     import adamah as adamah_mod
 
     print(f"\n{CYAN}Loading {os.path.basename(model_path)}...{RESET}")
-    loader = GGUFLoader(model_path)
+    loader = GGUFLoader(model_path, keep_tensors=False, keep_raw_blocks=False)
     loader.load(verbose=True)
 
     # Auto-detect config from GGUF metadata (works for any architecture)
     cfg = ModelConfig.from_gguf_metadata(loader.metadata, verbose=True)
+    runtime_plan = build_runtime_plan(adamah_mod, loader, cfg, ADAMEngine)
+    print_runtime_plan(runtime_plan)
+
+    if runtime_plan["stream_load"]:
+        print(f"{GREEN}GGUF mode:{RESET} streamed upload, chunk={runtime_plan['stream_chunk_mb']}MB")
+    else:
+        loader.keep_tensors = True
+        loader.keep_raw_blocks = True
+        loader.materialize(verbose=True)
+        print(f"{GREEN}GGUF mode:{RESET} eager host load")
 
     # Tokenizer (architecture-agnostic, reads from GGUF vocab)
     tokenizer = GGUFTokenizer(
@@ -206,13 +352,17 @@ def load_model(model_path):
 
     # Init GPU
     print(f"{CYAN}Initializing GPU...{RESET}")
-    gpu = init_gpu_backend(adamah_mod)
+    gpu = init_gpu_backend(adamah_mod, runtime_plan)
 
     # Build engine
     engine = ADAMEngine(
         gpu, cfg, loader.tensors,
         raw_blocks=loader.raw_blocks,
         tensor_types=loader.tensor_types,
+        tensor_shapes=loader.tensor_shapes,
+        tensor_loader=(loader if runtime_plan["stream_load"] else None),
+        stream_chunk_mb=runtime_plan["stream_chunk_mb"],
+        kv_cap=runtime_plan["kv_cap"],
         adamah_mod=adamah_mod,
         verbose=True,
         production_mode=True,
