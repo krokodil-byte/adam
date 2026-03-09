@@ -454,6 +454,58 @@ static int create_buffer(VkBuffer *buf, VkDeviceMemory *mem, VkDeviceSize size,
   return create_buffer_ex(buf, mem, size, usage, device_local, NULL);
 }
 
+static int upload_qparams_chunked(Map *m, const float *scales,
+                                  const float *zero_points, uint32_t n_groups,
+                                  int use_defaults) {
+  if (!m || m->qparam_buf == VK_NULL_HANDLE || n_groups == 0)
+    return ADAMAH_OK;
+  if (!ctx.pool_buf || !ctx.pool_ptr)
+    return ADAMAH_ERR_MEMORY;
+
+  size_t groups_per_chunk = (size_t)ctx.pool_size / (2 * sizeof(float));
+  if (groups_per_chunk == 0)
+    return ADAMAH_ERR_MEMORY;
+
+  uint32_t done = 0;
+  while (done < n_groups) {
+    uint32_t chunk_groups = (uint32_t)groups_per_chunk;
+    if (chunk_groups > n_groups - done)
+      chunk_groups = n_groups - done;
+
+    float *qp = (float *)ctx.pool_ptr;
+    for (uint32_t g = 0; g < chunk_groups; g++) {
+      if (use_defaults) {
+        qp[g * 2] = 1.0f;
+        qp[g * 2 + 1] = 0.0f;
+      } else {
+        qp[g * 2] = scales[done + g];
+        qp[g * 2 + 1] = zero_points[done + g];
+      }
+    }
+
+    VkDeviceSize chunk_bytes = (VkDeviceSize)chunk_groups * 2 * sizeof(float);
+    if (!(ctx.pool_mem_props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+      VkMappedMemoryRange flush_range = {
+          .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+          .memory = ctx.pool_mem,
+          .offset = 0,
+          .size = chunk_bytes};
+      vkFlushMappedMemoryRanges(ctx.device, 1, &flush_range);
+    }
+
+    cmd_begin();
+    VkBufferCopy copy = {
+        .srcOffset = 0,
+        .dstOffset = (VkDeviceSize)done * 2 * sizeof(float),
+        .size = chunk_bytes};
+    vkCmdCopyBuffer(ctx.cmd, ctx.pool_buf, m->qparam_buf, 1, &copy);
+    cmd_submit();
+    done += chunk_groups;
+  }
+
+  return ADAMAH_OK;
+}
+
 // ============================================
 // True Vulkan Batching - accumulate in single command buffer
 // ============================================
@@ -1830,27 +1882,13 @@ int map_init_dtype(uint32_t id, uint32_t dtype, uint32_t pack_size,
       vkFreeMemory(ctx.device, m->mem, NULL);
       return ADAMAH_ERR_MEMORY;
     }
-    VkMemoryPropertyFlags qprops;
-    if (create_buffer_ex(&m->qparam_staging, &m->qparam_staging_mem,
-                         qparam_bytes, usage, 0, &qprops) != 0) {
+    if (upload_qparams_chunked(m, NULL, NULL, m->n_groups, 1) != ADAMAH_OK) {
       vkDestroyBuffer(ctx.device, m->qparam_buf, NULL);
       vkFreeMemory(ctx.device, m->qparam_mem, NULL);
       vkDestroyBuffer(ctx.device, m->buf, NULL);
       vkFreeMemory(ctx.device, m->mem, NULL);
       return ADAMAH_ERR_MEMORY;
     }
-    vkMapMemory(ctx.device, m->qparam_staging_mem, 0, qparam_bytes, 0,
-                &m->qparam_staging_ptr);
-    // Init scale=1.0, zp=0.0
-    float *qp = (float *)m->qparam_staging_ptr;
-    for (uint32_t g = 0; g < m->n_groups; g++) {
-      qp[g * 2] = 1.0f;
-      qp[g * 2 + 1] = 0.0f;
-    }
-    cmd_begin();
-    VkBufferCopy qcopy = {.size = qparam_bytes};
-    vkCmdCopyBuffer(ctx.cmd, m->qparam_staging, m->qparam_buf, 1, &qcopy);
-    cmd_submit();
   }
 
   m->active = 1;
@@ -3352,19 +3390,9 @@ int map_set_qparams(uint32_t map_id, const float *scales,
     return ADAMAH_ERR_INVALID;
   if (n_groups > m->n_groups)
     return ADAMAH_ERR_INVALID;
-
-  float *qp = (float *)m->qparam_staging_ptr;
-  for (uint32_t g = 0; g < n_groups; g++) {
-    qp[g * 2] = scales[g];
-    qp[g * 2 + 1] = zero_points[g];
-  }
-
-  cmd_begin();
-  VkBufferCopy copy = {.size = (VkDeviceSize)n_groups * 2 * sizeof(float)};
-  vkCmdCopyBuffer(ctx.cmd, m->qparam_staging, m->qparam_buf, 1, &copy);
-  cmd_submit();
-
-  return ADAMAH_OK;
+  if (!scales || !zero_points)
+    return ADAMAH_ERR_INVALID;
+  return upload_qparams_chunked(m, scales, zero_points, n_groups, 0);
 }
 
 // Get map dtype
