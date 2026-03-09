@@ -34,6 +34,20 @@ def _run(cmd, cwd: Path | None = None) -> None:
         raise RuntimeError(msg)
 
 
+def _shader_profile() -> str:
+    return (os.environ.get("ADAMAH_SHADER_PROFILE")
+            or os.environ.get("ADAM_RUNTIME_PROFILE")
+            or "").strip().lower()
+
+
+def _shader_compile_args() -> list[str]:
+    profile = _shader_profile()
+    args: list[str] = []
+    if profile == "broadcom_v3dv":
+        args.append("-DADAMAH_PROFILE_BROADCOM_V3DV=1")
+    return args
+
+
 def ensure_python_deps(auto_install: bool = True) -> None:
     missing = [pkg for mod, pkg in RUNTIME_REQUIREMENTS if importlib.util.find_spec(mod) is None]
     if not missing:
@@ -50,6 +64,9 @@ def _compile_shaders(pkg_dir: Path) -> None:
     glslang = shutil.which("glslangValidator")
     if not glslang:
         return
+    compile_args = _shader_compile_args()
+    profile = _shader_profile() or "default"
+    print(f"ADAMAH: Compiling shaders for profile '{profile}'")
     for dtype_dir in sorted(src_dir.iterdir()):
         if not dtype_dir.is_dir():
             continue
@@ -57,7 +74,7 @@ def _compile_shaders(pkg_dir: Path) -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         for comp_file in sorted(dtype_dir.glob("*.comp")):
             dst = out_dir / (comp_file.stem + ".spv")
-            _run([glslang, "-V", str(comp_file), "-o", str(dst)], cwd=ROOT)
+            _run([glslang, "-V", *compile_args, str(comp_file), "-o", str(dst)], cwd=ROOT)
     f32_dir = pkg_dir / "shaders" / "f32"
     root_dir = pkg_dir / "shaders"
     if f32_dir.is_dir():
@@ -167,9 +184,11 @@ def _build_windows_gnu(pkg_dir: Path, force_rebuild: bool = False) -> Path:
     return out_file
 
 
-def ensure_native_adamah(force_rebuild: bool = False) -> Path:
+def ensure_native_adamah(force_rebuild: bool = False, rebuild_shaders: bool = False) -> Path:
     pkg_dir = ADAMAH_PKG
     candidates = ["adamah_opt.dll", "adamah_new.dll", "adamah.dll"] if os.name == "nt" else ["adamah.so"]
+    if rebuild_shaders:
+        _compile_shaders(pkg_dir)
     if not force_rebuild:
         for name in candidates:
             path = pkg_dir / name
@@ -185,10 +204,13 @@ def ensure_native_adamah(force_rebuild: bool = False) -> Path:
 
 
 def ensure_runtime(auto_install: bool = True, build_native: bool = True,
-                   force_rebuild: bool = False) -> Path | None:
+                   force_rebuild: bool = False,
+                   rebuild_shaders: bool = False) -> Path | None:
     ensure_python_deps(auto_install=auto_install)
     if build_native:
-        return ensure_native_adamah(force_rebuild=force_rebuild)
+        return ensure_native_adamah(force_rebuild=force_rebuild, rebuild_shaders=rebuild_shaders)
+    if rebuild_shaders:
+        _compile_shaders(ADAMAH_PKG)
     return None
 
 
@@ -197,12 +219,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-python", action="store_true", help="skip Python dependency install")
     parser.add_argument("--no-native", action="store_true", help="skip native library build check")
     parser.add_argument("--rebuild-native", action="store_true", help="force native rebuild")
+    parser.add_argument("--rebuild-shaders", action="store_true", help="force shader rebuild for the active shader profile")
     args = parser.parse_args(argv)
 
     path = ensure_runtime(
         auto_install=not args.no_python,
         build_native=not args.no_native,
         force_rebuild=args.rebuild_native,
+        rebuild_shaders=args.rebuild_shaders or args.rebuild_native,
     )
     if path is not None:
         print(f"Runtime ready: {path}")

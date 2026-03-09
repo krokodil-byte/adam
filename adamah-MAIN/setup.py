@@ -18,6 +18,20 @@ def get_pkg_dir():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'adamah')
 
 
+def get_shader_profile():
+    return (os.environ.get('ADAMAH_SHADER_PROFILE')
+            or os.environ.get('ADAM_RUNTIME_PROFILE')
+            or '').strip().lower()
+
+
+def shader_compile_args():
+    profile = get_shader_profile()
+    args = []
+    if profile == 'broadcom_v3dv':
+        args.append('-DADAMAH_PROFILE_BROADCOM_V3DV=1')
+    return args
+
+
 def compile_shaders(pkg_dir):
     """Compile all .comp GLSL shaders to .spv SPIR-V."""
     src_dir = os.path.join(pkg_dir, 'shaders', 'src')
@@ -31,6 +45,9 @@ def compile_shaders(pkg_dir):
         print("  Install with: sudo apt install glslang-tools")
         return True  # Non-fatal, precompiled .spv should be there
 
+    profile = get_shader_profile() or 'default'
+    extra_args = shader_compile_args()
+    print(f"ADAMAH: Compiling shaders for profile '{profile}'")
     ok = True
     for dtype_dir in sorted(os.listdir(src_dir)):
         dtype_src = os.path.join(src_dir, dtype_dir)
@@ -49,7 +66,7 @@ def compile_shaders(pkg_dir):
 
             print(f"  {dtype_dir}/{comp_file} -> {spv_name}")
             ret = subprocess.run(
-                [glslang, '-V', src_path, '-o', dst_path],
+                [glslang, '-V', *extra_args, src_path, '-o', dst_path],
                 capture_output=True, text=True
             )
             if ret.returncode != 0:
