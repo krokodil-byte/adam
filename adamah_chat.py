@@ -147,12 +147,21 @@ def _env_flag(name, default=None):
     return value.strip().lower() not in ("0", "false", "no", "off")
 
 
+def _env_int(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return int(value)
+
+
 def _mb_str(value_bytes):
     return f"{int(value_bytes) / (1024 * 1024):.0f}MB"
 
 
 def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
     reserve_ratio = min(max(float(os.environ.get("ADAM_RUNTIME_RESERVE_RATIO", "0.10")), 0.0), 0.5)
+    rows_per_group = max(1, _env_int("ADAM_GPU_FUSED_ROWS_PER_GROUP", FAST_LM_ROWS_PER_GROUP))
+    approx_rerank = bool(_env_flag("ADAM_GPU_APPROX_RERANK", False))
     machine = ""
     try:
         machine = os.uname().machine.lower()
@@ -188,8 +197,8 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
             loader.tensor_types,
             kv_cap=kv_cap,
             gpu_tied_lm_head=True,
-            gpu_approx_rerank=False,
-            gpu_fused_rows_per_group=FAST_LM_ROWS_PER_GROUP,
+            gpu_approx_rerank=approx_rerank,
+            gpu_fused_rows_per_group=rows_per_group,
         )
         if kv_cap <= 256 or usable_device <= 0:
             break
@@ -240,6 +249,8 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
         "stream_load": bool(stream_load),
         "stream_chunk_mb": int(stream_chunk_mb),
         "kv_cap": int(kv_cap),
+        "gpu_approx_rerank": approx_rerank,
+        "gpu_fused_rows_per_group": int(rows_per_group),
     }
 
 
@@ -268,7 +279,9 @@ def print_runtime_plan(plan):
               f"cold={pool_plan.get('cold_mb', 0)}MB")
     print(f"{GREEN}Runtime:{RESET} kv_cap={plan.get('kv_cap', 0)} "
           f"stream={'on' if plan.get('stream_load') else 'off'} "
-          f"chunk={plan.get('stream_chunk_mb', 0)}MB")
+          f"chunk={plan.get('stream_chunk_mb', 0)}MB "
+          f"sampler={'approx_rerank' if plan.get('gpu_approx_rerank') else 'exact_fused_topk'} "
+          f"rows={plan.get('gpu_fused_rows_per_group', FAST_LM_ROWS_PER_GROUP)}")
 
 
 def init_gpu_backend(adamah_mod, runtime_plan=None):
@@ -370,11 +383,14 @@ def load_model(model_path):
         verbose=True,
         production_mode=True,
         gpu_fused_topk=True,
-        gpu_fused_rows_per_group=FAST_LM_ROWS_PER_GROUP,
-        gpu_approx_rerank=False,
+        gpu_fused_rows_per_group=runtime_plan["gpu_fused_rows_per_group"],
+        gpu_approx_rerank=runtime_plan["gpu_approx_rerank"],
         gpu_tied_lm_head=True,
     )
-    print(f"{GREEN}Chat fast path:{RESET} exact gpu_fused_topk, rows_per_group={FAST_LM_ROWS_PER_GROUP}, production_mode=on")
+    sampler_name = ("gpu_approx_rerank" if runtime_plan["gpu_approx_rerank"]
+                    else "exact gpu_fused_topk")
+    print(f"{GREEN}Chat fast path:{RESET} {sampler_name}, "
+          f"rows_per_group={runtime_plan['gpu_fused_rows_per_group']}, production_mode=on")
 
     return engine, tokenizer, cfg, GenerationConfig
 
@@ -510,7 +526,10 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                 print(f"  FF: {cfg.n_ff}, Vocab: {cfg.n_vocab}")
                 print(f"  Context: {cfg.n_ctx}, RoPE base: {cfg.rope_base_global}")
                 print(f"{BOLD}Gen config:{RESET} temp={gen_cfg.temperature}, max={gen_cfg.max_tokens}, top_k={gen_cfg.top_k}, top_p={gen_cfg.top_p}, repeat={gen_cfg.repeat_penalty}, seed={gen_cfg.seed}")
-                print(f"{BOLD}GPU path:{RESET} gpu_fused_topk rows_per_group={FAST_LM_ROWS_PER_GROUP}")
+                mode = ("gpu_approx_rerank" if getattr(engine, "_gpu_approx_rerank", False)
+                        else "gpu_fused_topk")
+                rows = getattr(engine, "_gpu_fused_rows_per_group", FAST_LM_ROWS_PER_GROUP)
+                print(f"{BOLD}GPU path:{RESET} {mode} rows_per_group={rows}")
             elif cmd[0] == '/reset':
                 engine.reset()
                 print(f"{YELLOW}KV cache cleared.{RESET}")
