@@ -455,7 +455,8 @@ def print_help():
 {BOLD}Commands:{RESET}
   {CYAN}/help{RESET}    — Show this help
   {CYAN}/info{RESET}    — Show model info
-  {CYAN}/reset{RESET}   — Clear KV cache
+  {CYAN}/reset{RESET}   — Clear chat history and KV cache
+  {CYAN}/clear{RESET}   — Alias for /reset
   {CYAN}/temp N{RESET}  — Set temperature (e.g. /temp 0.7)
   {CYAN}/topk N{RESET}  — Set top-k (e.g. /topk 40)
   {CYAN}/topp P{RESET}  — Set top-p (e.g. /topp 0.95)
@@ -531,6 +532,85 @@ def apply_chat_template(text: str, arch: str, chat_template: str | None = None,
         return f"### Instruction:\n{text}\n\n### Response:\n"
 
 
+def render_chat_messages(messages, arch: str, tokenizer,
+                         chat_template: str | None = None,
+                         system_prompt: str | None = None) -> str:
+    """Render a full conversation history into the model prompt format."""
+    convo = list(messages)
+    if system_prompt:
+        has_system = bool(convo and convo[0].get("role") == "system")
+        if not has_system:
+            convo = [{"role": "system", "content": system_prompt}] + convo
+
+    if chat_template and tokenizer is not None:
+        rendered = _render_gguf_chat_template(chat_template, tokenizer, convo)
+        if rendered is not None:
+            return rendered
+
+    a = arch.lower()
+    if a in ('gemma', 'gemma2', 'gemma3'):
+        parts = []
+        for msg in convo:
+            role = "model" if msg["role"] == "assistant" else msg["role"]
+            parts.append(f"<start_of_turn>{role}\n{msg['content']}<end_of_turn>\n")
+        parts.append("<start_of_turn>model\n")
+        return "".join(parts)
+    if a in ('llama', 'llama2', 'llama3'):
+        parts = []
+        for msg in convo:
+            if msg["role"] == "system":
+                parts.append(f"<|system|>\n{msg['content']}</s>\n")
+            elif msg["role"] == "assistant":
+                parts.append(f"<|assistant|>\n{msg['content']}</s>\n")
+            else:
+                parts.append(f"<|user|>\n{msg['content']}</s>\n")
+        parts.append("<|assistant|>\n")
+        return "".join(parts)
+    if a in ('mistral', 'mixtral'):
+        parts = []
+        pending_user = None
+        for msg in convo:
+            if msg["role"] == "system":
+                pending_user = f"{msg['content']}\n\n"
+            elif msg["role"] == "user":
+                pending_user = (pending_user or "") + msg["content"]
+            elif msg["role"] == "assistant" and pending_user is not None:
+                parts.append(f"[INST] {pending_user} [/INST]{msg['content']}")
+                pending_user = None
+        if pending_user is not None:
+            parts.append(f"[INST] {pending_user} [/INST]")
+        return "".join(parts)
+    if a in ('qwen2', 'qwen'):
+        parts = []
+        for msg in convo:
+            role = msg["role"]
+            if role == "assistant":
+                role = "assistant"
+            parts.append(f"<|im_start|>{role}\n{msg['content']}<|im_end|>\n")
+        parts.append("<|im_start|>assistant\n")
+        return "".join(parts)
+    if a in ('phi3', 'phi'):
+        parts = []
+        for msg in convo:
+            role = msg["role"]
+            if role == "assistant":
+                parts.append(f"<|assistant|>\n{msg['content']}<|end|>\n")
+            elif role == "system":
+                parts.append(f"<|system|>\n{msg['content']}<|end|>\n")
+            else:
+                parts.append(f"<|user|>\n{msg['content']}<|end|>\n")
+        parts.append("<|assistant|>\n")
+        return "".join(parts)
+
+    # Generic fallback: flatten prior turns, end with the next response marker.
+    parts = []
+    for msg in convo:
+        role = msg["role"].capitalize()
+        parts.append(f"### {role}:\n{msg['content']}\n\n")
+    parts.append("### Assistant:\n")
+    return "".join(parts)
+
+
 def prepare_chat_prompt(text: str, arch: str, tokenizer, chat_template: str | None = None,
                         system_prompt: str | None = None):
     prompt = apply_chat_template(
@@ -540,6 +620,44 @@ def prepare_chat_prompt(text: str, arch: str, tokenizer, chat_template: str | No
     bos_token = _token_text(tokenizer, tokenizer.bos_id)
     add_bos = not (bos_token and prompt.startswith(bos_token))
     return prompt, add_bos
+
+
+def prepare_chat_messages(messages, arch: str, tokenizer,
+                          chat_template: str | None = None,
+                          system_prompt: str | None = None):
+    prompt = render_chat_messages(
+        messages, arch, tokenizer, chat_template=chat_template,
+        system_prompt=system_prompt,
+    )
+    bos_token = _token_text(tokenizer, tokenizer.bos_id)
+    add_bos = not (bos_token and prompt.startswith(bos_token))
+    return prompt, add_bos
+
+
+def _trim_messages_to_fit(engine, tokenizer, cfg, messages, gen_cfg):
+    kv_cap = getattr(engine, "_kv_cap", 0)
+    if kv_cap <= 0:
+        prompt, add_bos = prepare_chat_messages(
+            messages, cfg.arch, tokenizer, chat_template=getattr(cfg, "chat_template", None)
+        )
+        tokens = tokenizer.encode(prompt, add_bos=add_bos)
+        return list(messages), prompt, add_bos, tokens, 0
+
+    trimmed = list(messages)
+    dropped = 0
+    while True:
+        prompt, add_bos = prepare_chat_messages(
+            trimmed, cfg.arch, tokenizer, chat_template=getattr(cfg, "chat_template", None)
+        )
+        tokens = tokenizer.encode(prompt, add_bos=add_bos)
+        if len(tokens) + gen_cfg.max_tokens <= kv_cap:
+            return trimmed, prompt, add_bos, tokens, dropped
+        base = 1 if trimmed and trimmed[0].get("role") == "system" else 0
+        if len(trimmed) <= base + 1:
+            return trimmed, prompt, add_bos, tokens, dropped
+        drop_n = 2 if len(trimmed) >= base + 2 and trimmed[base + 1].get("role") == "assistant" else 1
+        trimmed = trimmed[:base] + trimmed[base + drop_n:]
+        dropped += drop_n
 
 
 def chat_loop(engine, tokenizer, cfg, GenConfig):
@@ -553,6 +671,7 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
             eos_ids.add(tok_id)
     gen_cfg = GenConfig(max_tokens=128, temperature=0.7, top_k=40, top_p=0.95, seed=42,
                         eos_token_ids=tuple(eos_ids))
+    history = []
 
     print(f"\n{GREEN}Ready!{RESET} Type {CYAN}/help{RESET} for commands.\n")
     print(f"{DIM}Template: {cfg.arch}{RESET}\n")
@@ -581,14 +700,16 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                 print(f"  Heads: {cfg.n_head}, KV Heads: {cfg.n_head_kv}")
                 print(f"  FF: {cfg.n_ff}, Vocab: {cfg.n_vocab}")
                 print(f"  Context: {cfg.n_ctx}, RoPE base: {cfg.rope_base_global}")
+                print(f"  Conversation messages: {len(history)}")
                 print(f"{BOLD}Gen config:{RESET} temp={gen_cfg.temperature}, max={gen_cfg.max_tokens}, top_k={gen_cfg.top_k}, top_p={gen_cfg.top_p}, repeat={gen_cfg.repeat_penalty}, seed={gen_cfg.seed}")
                 mode = ("gpu_approx_rerank" if getattr(engine, "_gpu_approx_rerank", False)
                         else "gpu_fused_topk")
                 rows = getattr(engine, "_gpu_fused_rows_per_group", FAST_LM_ROWS_PER_GROUP)
                 print(f"{BOLD}GPU path:{RESET} {mode} rows_per_group={rows}")
-            elif cmd[0] == '/reset':
+            elif cmd[0] in ('/reset', '/clear'):
+                history.clear()
                 engine.reset()
-                print(f"{YELLOW}KV cache cleared.{RESET}")
+                print(f"{YELLOW}Chat history and KV cache cleared.{RESET}")
             elif cmd[0] == '/temp' and len(cmd) > 1:
                 try:
                     gen_cfg.temperature = float(cmd[1])
@@ -629,17 +750,19 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                 print(f"{RED}Unknown command. Type /help{RESET}")
             continue
 
-        # Apply chat template then encode
-        templated, add_bos = prepare_chat_prompt(
-            prompt, cfg.arch, tokenizer, chat_template=getattr(cfg, "chat_template", None)
+        pending_messages = history + [{"role": "user", "content": prompt}]
+        pending_messages, templated, add_bos, tokens, dropped = _trim_messages_to_fit(
+            engine, tokenizer, cfg, pending_messages, gen_cfg
         )
-        tokens = tokenizer.encode(templated, add_bos=add_bos)
+        if dropped:
+            print(f"{DIM}[context trimmed: dropped {dropped} older message(s) to fit kv_cap]{RESET}")
         t0 = time.perf_counter()
 
         try:
             out_tokens, stats = engine.generate(tokens, gen_cfg, stream=False)
             elapsed = time.perf_counter() - t0
             text = tokenizer.decode(out_tokens)
+            history = pending_messages + [{"role": "assistant", "content": text}]
 
             print(f"\n{MAGENTA}{text}{RESET}")
             n_gen = stats.get('n_gen', len(out_tokens))

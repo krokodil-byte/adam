@@ -8,7 +8,7 @@ for p in [ROOT, os.path.join(ROOT, "adamah-MAIN")]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from adamah_chat import prepare_chat_prompt
+from adamah_chat import prepare_chat_prompt, prepare_chat_messages
 
 
 class DummyTokenizer:
@@ -43,6 +43,21 @@ def main():
     )
     assert prompt == "<s><start_of_turn>user\nhi<end_of_turn>\n<start_of_turn>model"
     assert add_bos is False
+
+    convo, add_bos = prepare_chat_messages(
+        [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "how are you?"},
+        ],
+        "llama",
+        tok,
+        chat_template=tiny_template,
+    )
+    assert "<|user|>\nhi</s>" in convo
+    assert "<|user|>\nhow are you?</s>" in convo
+    assert convo.rstrip().endswith("<|assistant|>")
+    assert add_bos is True
 
     print("PASS adaptive chat template rendering")
     return 0
