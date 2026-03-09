@@ -177,7 +177,10 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
     if unified and host_avail > 0:
         usable_device = min(usable_device or host_avail, int(host_avail * (1.0 - reserve_ratio)))
 
-    kv_cap = int(os.environ.get("ADAM_KV_CAP", str(engine_cls.KV_CAP_DEFAULT)))
+    kv_cap_env = os.environ.get("ADAM_KV_CAP")
+    kv_cap = int(kv_cap_env) if kv_cap_env else engine_cls.KV_CAP_DEFAULT
+    if unified and kv_cap_env is None:
+        kv_cap = min(kv_cap, 512)
     while True:
         gpu_est = engine_cls.estimate_persistent_gpu_bytes(
             cfg,
