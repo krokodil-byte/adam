@@ -158,35 +158,29 @@ def _mb_str(value_bytes):
     return f"{int(value_bytes) / (1024 * 1024):.0f}MB"
 
 
-def _base_reasoning_prompt():
-    return (
-        "Respond directly to the user's latest message. "
-        "Do not invent a new task, scenario, assignment, or question. "
-        "Do not change topic. "
-        "For every reply, provide a short visible reasoning summary followed by the answer. "
-        "Use exactly this structure and nothing else:\n"
-        "Analysis:\n"
-        "- 1 to 4 short bullet points about the user's actual request\n"
-        "Final:\n"
-        "- the final answer for the user\n"
-        "Keep the reasoning concise and high-signal. "
-        "If the user just greets you or says something simple, keep both sections very short. "
-        "Do not omit the Analysis section."
-    )
-
-
-def _build_session_system_prompt(reasoning_mode: bool, memory_summary: str | None) -> str | None:
+def _build_session_system_prompt(memory_summary: str | None,
+                                 reasoning_notes: str | None = None) -> str | None:
     parts = []
-    if reasoning_mode:
-        parts.append(_base_reasoning_prompt())
     if memory_summary:
         parts.append(
             "Conversation memory summary:\n"
             f"{memory_summary.strip()}"
         )
+    if reasoning_notes:
+        parts.append(
+            "Working notes for the next reply:\n"
+            f"{reasoning_notes.strip()}"
+        )
     if not parts:
         return None
     return "\n\n".join(parts)
+
+
+def _reasoning_cycles_from_env() -> int:
+    value = os.environ.get("ADAM_REASONING_CYCLES")
+    if value is not None:
+        return max(0, int(value))
+    return 2 if _env_flag("ADAM_REASONING", False) else 0
 
 
 def _runtime_profile_overrides(profile_name, cfg, unified):
@@ -489,7 +483,7 @@ def print_help():
   {CYAN}/reset{RESET}   — Clear chat history and KV cache
   {CYAN}/clear{RESET}   — Alias for /reset
   {CYAN}/compact{RESET} — Summarize old history into compact memory
-  {CYAN}/reason on|off{RESET} — Toggle visible Analysis/Final reasoning mode
+  {CYAN}/reason N{RESET} — Set reasoning refinement cycles (e.g. /reason 3, /reason off)
   {CYAN}/temp N{RESET}  — Set temperature (e.g. /temp 0.7)
   {CYAN}/topk N{RESET}  — Set top-k (e.g. /topk 40)
   {CYAN}/topp P{RESET}  — Set top-p (e.g. /topp 0.95)
@@ -734,6 +728,61 @@ def _summarize_history(engine, tokenizer, cfg, GenConfig, history, seed=None):
     return text or None
 
 
+def _build_reasoning_draft(engine, tokenizer, cfg, GenConfig, history,
+                           memory_summary, user_prompt, cycles, seed=None):
+    if cycles <= 0:
+        return None
+
+    recent = []
+    for msg in history[-4:]:
+        role = msg.get("role", "user").capitalize()
+        content = msg.get("content", "").strip()
+        if content:
+            recent.append(f"{role}: {content[:400]}")
+    context_text = "\n".join(recent).strip()
+    base_system = _build_session_system_prompt(memory_summary)
+
+    draft = None
+    for i in range(int(cycles)):
+        if i == 0 or not draft:
+            req = (
+                f"User request:\n{user_prompt.strip()}\n\n"
+                "Write short working notes that help answer the request well. "
+                "Do not answer the user directly. Return notes only."
+            )
+            if context_text:
+                req += f"\n\nRecent conversation context:\n{context_text}"
+        else:
+            req = (
+                f"User request:\n{user_prompt.strip()}\n\n"
+                f"Current working notes:\n{draft}\n\n"
+                "Refine and improve these notes. Fix mistakes, sharpen weak parts, "
+                "and keep them concise. Return notes only."
+            )
+
+        prompt, add_bos = prepare_chat_messages(
+            [{"role": "user", "content": req}],
+            cfg.arch,
+            tokenizer,
+            chat_template=getattr(cfg, "chat_template", None),
+            system_prompt=base_system,
+        )
+        tokens = tokenizer.encode(prompt, add_bos=add_bos)
+        scratch_cfg = GenConfig(
+            max_tokens=96,
+            temperature=0.2,
+            top_k=20,
+            top_p=0.9,
+            seed=seed,
+            eos_token_ids=(tokenizer.eos_id,),
+        )
+        out_tokens, _ = engine.generate(tokens, scratch_cfg, stream=False)
+        draft = tokenizer.decode(out_tokens).strip()
+        if not draft:
+            break
+    return draft or None
+
+
 def chat_loop(engine, tokenizer, cfg, GenConfig):
     """Main interactive chat loop."""
     # Collect EOS token IDs: the main EOS plus any type-3 "end-of-turn" specials.
@@ -747,7 +796,7 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                         eos_token_ids=tuple(eos_ids))
     history = []
     memory_summary = None
-    reasoning_mode = bool(_env_flag("ADAM_REASONING", False))
+    reasoning_cycles = _reasoning_cycles_from_env()
     context_compaction = bool(_env_flag("ADAM_CONTEXT_COMPACTION", True))
 
     print(f"\n{GREEN}Ready!{RESET} Type {CYAN}/help{RESET} for commands.\n")
@@ -779,7 +828,7 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                 print(f"  Context: {cfg.n_ctx}, RoPE base: {cfg.rope_base_global}")
                 print(f"  Conversation messages: {len(history)}")
                 print(f"  Memory summary: {'yes' if memory_summary else 'no'}")
-                print(f"  Reasoning mode: {'on' if reasoning_mode else 'off'}")
+                print(f"  Reasoning cycles: {reasoning_cycles}")
                 print(f"  Context compaction: {'on' if context_compaction else 'off'}")
                 print(f"{BOLD}Gen config:{RESET} temp={gen_cfg.temperature}, max={gen_cfg.max_tokens}, top_k={gen_cfg.top_k}, top_p={gen_cfg.top_p}, repeat={gen_cfg.repeat_penalty}, seed={gen_cfg.seed}")
                 mode = ("gpu_approx_rerank" if getattr(engine, "_gpu_approx_rerank", False)
@@ -805,11 +854,18 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                         print(f"{RED}Compaction failed to produce a summary.{RESET}")
             elif cmd[0] == '/reason' and len(cmd) > 1:
                 value = cmd[1].lower()
-                if value in ('on', 'off'):
-                    reasoning_mode = (value == 'on')
-                    print(f"{GREEN}Reasoning mode → {'on' if reasoning_mode else 'off'}{RESET}")
+                if value == 'off':
+                    reasoning_cycles = 0
+                    print(f"{GREEN}Reasoning cycles → 0{RESET}")
+                elif value == 'on':
+                    reasoning_cycles = max(reasoning_cycles, 2)
+                    print(f"{GREEN}Reasoning cycles → {reasoning_cycles}{RESET}")
                 else:
-                    print(f"{RED}Usage: /reason on|off{RESET}")
+                    try:
+                        reasoning_cycles = max(0, int(value))
+                        print(f"{GREEN}Reasoning cycles → {reasoning_cycles}{RESET}")
+                    except ValueError:
+                        print(f"{RED}Usage: /reason 3  or  /reason off{RESET}")
             elif cmd[0] == '/temp' and len(cmd) > 1:
                 try:
                     gen_cfg.temperature = float(cmd[1])
@@ -850,7 +906,7 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                 print(f"{RED}Unknown command. Type /help{RESET}")
             continue
 
-        system_prompt = _build_session_system_prompt(reasoning_mode, memory_summary)
+        system_prompt = _build_session_system_prompt(memory_summary)
         pending_messages = history + [{"role": "user", "content": prompt}]
         pending_messages, templated, add_bos, tokens, dropped = _trim_messages_to_fit(
             engine, tokenizer, cfg, pending_messages, gen_cfg, system_prompt=system_prompt
@@ -864,12 +920,25 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                 memory_summary = summary
                 history = []
                 engine.reset()
-                system_prompt = _build_session_system_prompt(reasoning_mode, memory_summary)
+                system_prompt = _build_session_system_prompt(memory_summary)
                 pending_messages = history + [{"role": "user", "content": prompt}]
                 pending_messages, templated, add_bos, tokens, dropped = _trim_messages_to_fit(
                     engine, tokenizer, cfg, pending_messages, gen_cfg, system_prompt=system_prompt
                 )
                 print(f"{DIM}[context compacted into memory summary]{RESET}")
+        if reasoning_cycles > 0:
+            draft = _build_reasoning_draft(
+                engine, tokenizer, cfg, GenConfig, history, memory_summary,
+                prompt, reasoning_cycles, seed=gen_cfg.seed,
+            )
+            if draft:
+                system_prompt = _build_session_system_prompt(memory_summary, draft)
+                pending_messages, templated, add_bos, tokens, dropped_after_reason = _trim_messages_to_fit(
+                    engine, tokenizer, cfg, pending_messages, gen_cfg, system_prompt=system_prompt
+                )
+                if dropped_after_reason:
+                    print(f"{DIM}[reasoning fit trimmed {dropped_after_reason} older message(s)]{RESET}")
+                print(f"{DIM}[reasoning refined in {reasoning_cycles} cycle(s)]{RESET}")
         if dropped:
             print(f"{DIM}[context trimmed: dropped {dropped} older message(s) to fit kv_cap]{RESET}")
         t0 = time.perf_counter()
