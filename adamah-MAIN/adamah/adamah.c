@@ -454,6 +454,9 @@ static int create_buffer(VkBuffer *buf, VkDeviceMemory *mem, VkDeviceSize size,
   return create_buffer_ex(buf, mem, size, usage, device_local, NULL);
 }
 
+static void cmd_begin(void);
+static void cmd_submit(void);
+
 static int upload_qparams_chunked(Map *m, const float *scales,
                                   const float *zero_points, uint32_t n_groups,
                                   int use_defaults) {
@@ -592,9 +595,6 @@ static void cmd_buffer_barrier(VkPipelineStageFlags src_stage,
   vkCmdPipelineBarrier(ctx.cmd, src_stage, dst_stage, 0, 0, NULL, count,
                        barriers, 0, NULL);
 }
-
-static void cmd_begin(void);
-static void cmd_submit(void);
 
 static VkDeviceSize align_up(VkDeviceSize v, VkDeviceSize a) {
   if (a == 0)
