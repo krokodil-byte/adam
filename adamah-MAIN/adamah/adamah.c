@@ -80,6 +80,8 @@ int adamah_set_dtype(uint32_t dtype);
 static int init_dtype_pipelines(uint32_t dtype);
 int map_set_qparams(uint32_t map_id, const float *scales,
                     const float *zero_points, uint32_t n_groups);
+int adamah_probe_device(uint64_t *heap_bytes, uint64_t *budget_bytes,
+                        uint64_t *usage_bytes, uint32_t *device_type);
 
 // Fusion operation entry
 typedef struct {
@@ -1442,6 +1444,130 @@ fail_cleanup:
     vkDestroyInstance(ctx.instance, NULL);
   memset(&ctx, 0, sizeof(ctx));
   return ADAMAH_ERR_MEMORY;
+}
+
+int adamah_probe_device(uint64_t *heap_bytes, uint64_t *budget_bytes,
+                        uint64_t *usage_bytes, uint32_t *device_type) {
+  if (heap_bytes)
+    *heap_bytes = 0;
+  if (budget_bytes)
+    *budget_bytes = 0;
+  if (usage_bytes)
+    *usage_bytes = 0;
+  if (device_type)
+    *device_type = VK_PHYSICAL_DEVICE_TYPE_OTHER;
+
+  VkInstance instance = VK_NULL_HANDLE;
+  VkApplicationInfo ai = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+                          .pApplicationName = "ADAMAH",
+                          .apiVersion = VK_API_VERSION_1_0};
+  VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                              .pApplicationInfo = &ai};
+  if (vkCreateInstance(&ici, NULL, &instance) != VK_SUCCESS)
+    return ADAMAH_ERR_VULKAN;
+
+  uint32_t dc = 0;
+  vkEnumeratePhysicalDevices(instance, &dc, NULL);
+  if (!dc) {
+    vkDestroyInstance(instance, NULL);
+    return ADAMAH_ERR_VULKAN;
+  }
+
+  VkPhysicalDevice devs[8];
+  if (dc > 8)
+    dc = 8;
+  vkEnumeratePhysicalDevices(instance, &dc, devs);
+
+  VkPhysicalDevice phys = devs[0];
+  for (uint32_t i = 0; i < dc; i++) {
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(devs[i], &props);
+    if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+      phys = devs[i];
+      break;
+    }
+  }
+
+  VkPhysicalDeviceProperties props;
+  vkGetPhysicalDeviceProperties(phys, &props);
+  if (device_type)
+    *device_type = props.deviceType;
+
+  VkPhysicalDeviceMemoryProperties mem_props;
+  vkGetPhysicalDeviceMemoryProperties(phys, &mem_props);
+  uint64_t heap = 0;
+  for (uint32_t i = 0; i < mem_props.memoryHeapCount; i++) {
+    if (mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+      if (mem_props.memoryHeaps[i].size > heap)
+        heap = mem_props.memoryHeaps[i].size;
+    }
+  }
+
+  uint64_t budget = heap;
+  uint64_t usage = 0;
+
+#ifdef VK_EXT_MEMORY_BUDGET_EXTENSION_NAME
+  uint32_t ext_count = 0;
+  if (vkEnumerateDeviceExtensionProperties(phys, NULL, &ext_count, NULL) ==
+          VK_SUCCESS &&
+      ext_count > 0) {
+    VkExtensionProperties *exts =
+        (VkExtensionProperties *)malloc(sizeof(VkExtensionProperties) *
+                                        (size_t)ext_count);
+    int has_budget_ext = 0;
+    if (exts &&
+        vkEnumerateDeviceExtensionProperties(phys, NULL, &ext_count, exts) ==
+            VK_SUCCESS) {
+      for (uint32_t i = 0; i < ext_count; i++) {
+        if (strcmp(exts[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) ==
+            0) {
+          has_budget_ext = 1;
+          break;
+        }
+      }
+    }
+
+    if (has_budget_ext) {
+      PFN_vkGetPhysicalDeviceMemoryProperties2 pfn_props2 =
+          (PFN_vkGetPhysicalDeviceMemoryProperties2)vkGetInstanceProcAddr(
+              instance, "vkGetPhysicalDeviceMemoryProperties2");
+      if (!pfn_props2) {
+        pfn_props2 =
+            (PFN_vkGetPhysicalDeviceMemoryProperties2)vkGetInstanceProcAddr(
+                instance, "vkGetPhysicalDeviceMemoryProperties2KHR");
+      }
+      if (pfn_props2) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_props = {
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 props2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+            .pNext = &budget_props};
+        pfn_props2(phys, &props2);
+        for (uint32_t i = 0; i < props2.memoryProperties.memoryHeapCount; i++) {
+          if (props2.memoryProperties.memoryHeaps[i].flags &
+              VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            if (budget_props.heapBudget[i] > budget)
+              budget = budget_props.heapBudget[i];
+            if (budget_props.heapUsage[i] > usage)
+              usage = budget_props.heapUsage[i];
+          }
+        }
+      }
+    }
+    if (exts)
+      free(exts);
+  }
+#endif
+
+  if (heap_bytes)
+    *heap_bytes = heap;
+  if (budget_bytes)
+    *budget_bytes = budget;
+  if (usage_bytes)
+    *usage_bytes = usage;
+  vkDestroyInstance(instance, NULL);
+  return ADAMAH_OK;
 }
 
 int adamah_init(void) {

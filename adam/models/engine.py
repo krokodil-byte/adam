@@ -114,12 +114,137 @@ class ADAMEngine:
     SAMPLE_REPEAT_MAX = 64
     SAMPLE_FUSED_ROWS_PER_GROUP = 256
 
+    @classmethod
+    def estimate_persistent_gpu_bytes(cls, cfg: ModelConfig,
+                                      tensor_shapes: Dict[str, tuple],
+                                      tensor_types: Dict[str, int],
+                                      force_f32: bool = False,
+                                      kv_cap: Optional[int] = None,
+                                      gpu_tied_lm_head: bool = True,
+                                      gpu_approx_rerank: bool = False,
+                                      gpu_fused_rows_per_group: Optional[int] = None) -> Dict[str, int]:
+        kv_cap = int(kv_cap if kv_cap is not None else cls.KV_CAP_DEFAULT)
+        rows_per_group = int(gpu_fused_rows_per_group or cls.SAMPLE_FUSED_ROWS_PER_GROUP)
+        tied_lm_head = (
+            gpu_tied_lm_head and
+            'output.weight' not in tensor_shapes and
+            'token_embd.weight' in tensor_shapes
+        )
+
+        q4_elems = 0
+        q8_elems = 0
+        f32_weight_elems = 0
+        norm_elems = 0
+        lm_q4_approx_elems = 0
+        wt_matrix_names = []
+        norm_names = []
+
+        for name in sorted(tensor_shapes):
+            sh = tuple(tensor_shapes[name])
+            if name == 'token_embd.weight' and not tied_lm_head:
+                continue
+            if len(sh) == 2 and (name.startswith('blk.') or name == 'output.weight' or
+                                 (tied_lm_head and name == 'token_embd.weight')):
+                wt_matrix_names.append(name)
+            elif len(sh) == 1 or name == 'output_norm.weight':
+                norm_names.append(name)
+            else:
+                (wt_matrix_names if len(sh) == 2 else norm_names).append(name)
+
+        for name in wt_matrix_names:
+            sh = tuple(tensor_shapes[name])
+            elems = 1
+            for s in sh:
+                elems *= int(s)
+            is_lm_head_candidate = (
+                name == 'output.weight' or (tied_lm_head and name == 'token_embd.weight')
+            )
+            trans = (
+                name == 'token_embd.weight' and len(sh) == 2 and
+                sh[0] == cfg.n_embd and sh[1] != cfg.n_embd
+            )
+            if force_f32:
+                f32_weight_elems += elems
+            elif tensor_types.get(name) in cls._GGML_Q8_MAP:
+                q8_elems += elems
+                if gpu_approx_rerank and is_lm_head_candidate and not trans:
+                    lm_q4_approx_elems += elems
+            else:
+                q4_elems += elems
+
+        for name in norm_names:
+            elems = 1
+            for s in tensor_shapes[name]:
+                elems *= int(s)
+            norm_elems += elems
+
+        sc_sz = cfg.n_head * kv_cap
+        pos = sc_sz + 1
+        if cfg.emb_scale != 1.0:
+            pos += 1
+        if cfg.attn_softcap > 0:
+            pos += 1
+        if cfg.final_softcap > 0:
+            pos += 1
+
+        sample_fused_groups = (cfg.n_vocab + rows_per_group - 1) // rows_per_group
+        sample_fused_partial_cap = sample_fused_groups * cls.SAMPLE_TOPK_MAX
+        slots = {
+            'hidden': cfg.n_embd,
+            'normed': cfg.n_embd,
+            'q': cfg.n_head * cfg.head_dim,
+            'k': cfg.n_head_kv * cfg.head_dim_kv,
+            'v': cfg.n_head_kv * cfg.head_dim_kv,
+            'attn_out': cfg.n_head * cfg.head_dim_kv,
+            'o_proj': cfg.n_embd,
+            'gate': cfg.n_ff,
+            'up': cfg.n_ff,
+            'act': cfg.n_ff,
+            'ffn_out': cfg.n_embd,
+            'logits': cfg.n_vocab,
+            'sample_token': 1,
+            'sample_topk_idx': cls.SAMPLE_TOPK_MAX,
+            'sample_topk_val': cls.SAMPLE_TOPK_MAX,
+            'sample_topk_prob': cls.SAMPLE_TOPK_MAX,
+            'sample_short_sel': cls.SAMPLE_APPROX_SHORTLIST_MAX,
+            'sample_exact_idx': cls.SAMPLE_APPROX_SHORTLIST_MAX,
+            'sample_exact_val': cls.SAMPLE_APPROX_SHORTLIST_MAX,
+            'sample_fused_idx': sample_fused_partial_cap,
+            'sample_fused_val': sample_fused_partial_cap,
+            'normed2': cfg.n_embd,
+        }
+        pos += sum(slots.values())
+        pos += norm_elems
+        if cfg.head_dim_kv > 0 and pos % cfg.head_dim_kv != 0:
+            pos += cfg.head_dim_kv - (pos % cfg.head_dim_kv)
+        kv_elems = 2 * cfg.n_layer * cfg.n_head_kv * kv_cap * cfg.head_dim_kv
+        pos += kv_elems
+
+        workspace_bytes = pos * 4
+        q4_total_elems = q4_elems + lm_q4_approx_elems
+        q4_bytes = 0 if force_f32 else ((q4_total_elems + 1) // 2) + (((q4_total_elems + cls.Q4_GROUP_SIZE - 1) // cls.Q4_GROUP_SIZE) * 8)
+        q8_bytes = q8_elems + (((q8_elems + cls.Q8_GROUP_SIZE - 1) // cls.Q8_GROUP_SIZE) * 8)
+        f32_weight_bytes = f32_weight_elems * 4
+        total_bytes = workspace_bytes + q4_bytes + q8_bytes + f32_weight_bytes
+        return {
+            'workspace_bytes': workspace_bytes,
+            'q4_bytes': q4_bytes,
+            'q8_bytes': q8_bytes,
+            'f32_weight_bytes': f32_weight_bytes,
+            'kv_bytes': kv_elems * 4,
+            'total_bytes': total_bytes,
+        }
+
     def __init__(self, gpu, cfg: ModelConfig, tensors: Dict[str, np.ndarray],
                  adamah_mod=None, verbose=True, **kw):
-        self.gpu = gpu; self.cfg = cfg; self.tensors = tensors
+        self.gpu = gpu; self.cfg = cfg; self.tensors = dict(tensors)
         self.A = adamah_mod; self.verbose = verbose
-        self.raw_blocks = kw.get('raw_blocks', {})
+        self.raw_blocks = dict(kw.get('raw_blocks', {}))
         self.tensor_types = kw.get('tensor_types', {})
+        self.tensor_shapes = dict(kw.get(
+            'tensor_shapes', {name: tuple(arr.shape) for name, arr in self.tensors.items()}))
+        self._tensor_loader = kw.get('tensor_loader')
+        self._stream_chunk_mb = max(1, int(kw.get('stream_chunk_mb', 32)))
         self._kv_cap = int(kw.get('kv_cap', self.KV_CAP_DEFAULT))
         self._force_f32 = bool(kw.get('force_f32', False))
         self._cpu_attention_fallback = bool(kw.get('cpu_attention_fallback', False))
@@ -149,27 +274,88 @@ class ADAMEngine:
         if self.verbose and self._cpu_attention_fallback:
             print("[GPU] Attention: CPU fallback enabled (workaround for batched attention kernel bug)")
 
+    def _shape_of(self, name):
+        if name in self.tensor_shapes:
+            return tuple(self.tensor_shapes[name])
+        if name in self.tensors:
+            return tuple(self.tensors[name].shape)
+        raise KeyError(name)
+
+    def _size_of(self, name):
+        ne = 1
+        for s in self._shape_of(name):
+            ne *= int(s)
+        return ne
+
+    def _all_tensor_names(self):
+        if self.tensor_shapes:
+            return list(self.tensor_shapes.keys())
+        return list(self.tensors.keys())
+
+    def _load_tensor_f32(self, name, keep=False):
+        if name in self.tensors:
+            return self.tensors[name]
+        if self._tensor_loader is None:
+            raise KeyError(name)
+        arr = self._tensor_loader.load_tensor_f32(name)
+        if keep:
+            self.tensors[name] = arr
+        return arr
+
+    def _load_raw_block(self, name, keep=False):
+        if name in self.raw_blocks:
+            return self.raw_blocks[name]
+        if self._tensor_loader is None:
+            raise KeyError(name)
+        raw = self._tensor_loader.load_tensor_raw(name)
+        if keep:
+            self.raw_blocks[name] = raw
+        return raw
+
+    def _iter_tensor_chunks(self, name, include_raw=False, include_f32=True):
+        if self._tensor_loader is not None and name not in self.tensors and name not in self.raw_blocks:
+            yield from self._tensor_loader.iter_tensor_chunks(
+                name,
+                max_chunk_mb=self._stream_chunk_mb,
+                include_raw=include_raw,
+                include_f32=include_f32,
+            )
+            return
+
+        raw = self.raw_blocks.get(name) if include_raw else None
+        arr = self.tensors.get(name) if include_f32 else None
+        if arr is None and include_f32:
+            arr = self._load_tensor_f32(name)
+        if raw is None and include_raw:
+            raw = self._load_raw_block(name)
+        flat = (np.ascontiguousarray(arr.reshape(-1), dtype=np.float32)
+                if arr is not None else None)
+        yield 0, self._size_of(name), raw, flat
+
     # ============================================================
     # Auto-detect from tensor shapes
     # ============================================================
     def _detect_dims(self):
         c = self.cfg
-        for n, t in self.tensors.items():
-            if 'attn_q.weight' in n and t.ndim == 2:
-                q_out = t.shape[1] if t.shape[0] == c.n_embd else t.shape[0]
+        for n in self._all_tensor_names():
+            sh = self._shape_of(n)
+            if 'attn_q.weight' in n and len(sh) == 2:
+                q_out = sh[1] if sh[0] == c.n_embd else sh[0]
                 c.head_dim = q_out // c.n_head
                 break
-        for n, t in self.tensors.items():
-            if 'attn_k.weight' in n and t.ndim == 2:
-                k_out = t.shape[1] if t.shape[0] == c.n_embd else t.shape[0]
+        for n in self._all_tensor_names():
+            sh = self._shape_of(n)
+            if 'attn_k.weight' in n and len(sh) == 2:
+                k_out = sh[1] if sh[0] == c.n_embd else sh[0]
                 c.head_dim_kv = k_out // c.n_head_kv
                 break
-        if 'token_embd.weight' in self.tensors:
-            t = self.tensors['token_embd.weight']
-            c.n_vocab = max(t.shape); c.n_embd = min(t.shape)
-        for n, t in self.tensors.items():
-            if 'ffn_gate.weight' in n and t.ndim == 2:
-                c.n_ff = max(t.shape) if min(t.shape) == c.n_embd else min(t.shape)
+        if 'token_embd.weight' in self.tensor_shapes:
+            sh = self._shape_of('token_embd.weight')
+            c.n_vocab = max(sh); c.n_embd = min(sh)
+        for n in self._all_tensor_names():
+            sh = self._shape_of(n)
+            if 'ffn_gate.weight' in n and len(sh) == 2:
+                c.n_ff = max(sh) if min(sh) == c.n_embd else min(sh)
                 break
         if self.verbose:
             q_dim = c.n_head * c.head_dim; k_dim = c.n_head_kv * c.head_dim_kv
@@ -197,67 +383,68 @@ class ADAMEngine:
         wt_matrix_names = []; norm_names = []
         tied_lm_head = (
             self._gpu_tied_lm_head and
-            'output.weight' not in self.tensors and
-            'token_embd.weight' in self.tensors
+            'output.weight' not in self.tensor_shapes and
+            'token_embd.weight' in self.tensor_shapes
         )
 
-        for name, t in sorted(self.tensors.items()):
+        for name in sorted(self._all_tensor_names()):
+            sh = self._shape_of(name)
             # token_embd always stays CPU-backed for the per-token embedding lookup.
             # If the model is weight-tied (no output.weight tensor), also upload it
             # to a GPU weight map so the LM head can stay on device.
             if name == 'token_embd.weight':
                 self._cpu_only.add(name)
                 if not tied_lm_head:
-                    self._trans[name] = (t.ndim == 2 and t.shape[0] == c.n_embd
-                                         and t.shape[1] != c.n_embd)
+                    self._trans[name] = (len(sh) == 2 and sh[0] == c.n_embd and
+                                         sh[1] != c.n_embd)
                     if self.verbose:
-                        print(f"[GPU] CPU-only: '{name}' ({t.size:,} elems)")
+                        print(f"[GPU] CPU-only: '{name}' ({self._size_of(name):,} elems)")
                     continue
                 if self.verbose:
-                    print(f"[GPU] CPU lookup + GPU LM head: '{name}' ({t.size:,} elems)")
-            if t.ndim == 2 and (name.startswith('blk.') or name == 'output.weight' or
-                                (tied_lm_head and name == 'token_embd.weight')):
+                    print(f"[GPU] CPU lookup + GPU LM head: '{name}' ({self._size_of(name):,} elems)")
+            if len(sh) == 2 and (name.startswith('blk.') or name == 'output.weight' or
+                                 (tied_lm_head and name == 'token_embd.weight')):
                 wt_matrix_names.append(name)
-            elif t.ndim == 1 or name == 'output_norm.weight':
+            elif len(sh) == 1 or name == 'output_norm.weight':
                 norm_names.append(name)
             else:
-                (wt_matrix_names if t.ndim == 2 else norm_names).append(name)
+                (wt_matrix_names if len(sh) == 2 else norm_names).append(name)
 
         q4_pos = 0; q8_pos = 0
         self._f32_wt_tensors = set()
         for name in wt_matrix_names:
-            t = self.tensors[name]
+            sh = self._shape_of(name)
             is_lm_head_candidate = (name == 'output.weight' or
                                     (tied_lm_head and name == 'token_embd.weight'))
             self._trans[name] = (
-                name == 'token_embd.weight' and t.ndim == 2 and
-                t.shape[0] == c.n_embd and t.shape[1] != c.n_embd
+                name == 'token_embd.weight' and len(sh) == 2 and
+                sh[0] == c.n_embd and sh[1] != c.n_embd
             )
             if self._force_f32:
                 self._off[name] = q4_pos; self.tensor_map_id[name] = 1
                 self._f32_wt_tensors.add(name)
-                q4_pos += t.size
+                q4_pos += self._size_of(name)
             elif self.tensor_types.get(name) in self._GGML_Q8_MAP:
                 # Q5_0 / Q8_0 → Q8 map (map 2), full int8 precision
                 self._off[name] = q8_pos; self.tensor_map_id[name] = 2
                 self._q8_tensors.add(name)
-                q8_pos += t.size
+                q8_pos += self._size_of(name)
                 if (self._gpu_approx_rerank and is_lm_head_candidate and
                         self._lm_q4_approx_off is None and not self._trans[name]):
                     self._lm_q4_approx_name = name
                     self._lm_q4_approx_off = q4_pos
-                    q4_pos += t.size
+                    q4_pos += self._size_of(name)
             else:
                 # Q4_K and all other types → Q4 map (map 1)
                 self._off[name] = q4_pos; self.tensor_map_id[name] = 1
                 self._q4_tensors.add(name)
-                q4_pos += t.size
+                q4_pos += self._size_of(name)
 
         self._q4_total_elems = 0 if self._force_f32 else q4_pos
         self._q8_total_elems = q8_pos
         self._f32_wt_total_elems = q4_pos if self._force_f32 else 0
         self._norm_names_ordered = norm_names
-        self._norm_sizes = {n: self.tensors[n].size for n in norm_names}
+        self._norm_sizes = {n: self._size_of(n) for n in norm_names}
 
         if self.verbose:
             if self._force_f32:
@@ -290,10 +477,10 @@ class ADAMEngine:
                       f"({self._f32_wt_total_elems * 4 / 1e6:.0f} MB)")
             t0 = time.perf_counter()
             for name in sorted(self._f32_wt_tensors):
-                data = self.tensors[name].flatten().astype(np.float32)
                 off = self._off[name]
-                locs = np.arange(off, off + data.size, dtype=np.uint32)
-                g.scatter(self.wt_map_id, locs, data)
+                for elem_off, take, _, data in self._iter_tensor_chunks(name, include_f32=True):
+                    locs = np.arange(off + elem_off, off + elem_off + take, dtype=np.uint32)
+                    g.scatter(self.wt_map_id, locs, data)
             if self.verbose:
                 print(f"[GPU] F32 weight upload: {len(self._f32_wt_tensors)} tensors in "
                       f"{time.perf_counter()-t0:.1f}s")
@@ -309,56 +496,62 @@ class ADAMEngine:
             _GGML_Q4K = 12; n_direct = 0
             for name in sorted(self._q4_tensors):
                 off = self._off[name]
-                if self.tensor_types.get(name) == _GGML_Q4K and name in self.raw_blocks:
+                if self.tensor_types.get(name) == _GGML_Q4K and (
+                        name in self.raw_blocks or self._tensor_loader is not None):
                     # Q4_K: extract original sub-block scales/zeros directly from raw bytes.
                     # Q4_K decode: val = sc*nibble - mn  →  ADAMAH: scale=sc, zero=-mn
                     # Scatter with these exact qparams recovers original nibbles bit-exactly.
-                    raw = self.raw_blocks[name]
-                    n_elem = self.tensors[name].size; n_blk = n_elem // 256
-                    blks = np.frombuffer(raw, dtype=np.uint8)[:n_blk * 144].reshape(n_blk, 144)
-                    d  = np.ascontiguousarray(blks[:, 0:2]).view(np.float16).reshape(n_blk).astype(np.float32)
-                    dm = np.ascontiguousarray(blks[:, 2:4]).view(np.float16).reshape(n_blk).astype(np.float32)
-                    rs = blks[:, 4:16].astype(np.int32)
-                    s2 = np.empty((n_blk, 8), np.float32); m2 = np.empty((n_blk, 8), np.float32)
-                    s2[:, 0:4] = rs[:, 0:4] & 0x3F;  m2[:, 0:4] = rs[:, 4:8] & 0x3F
-                    s2[:, 4:8] = (rs[:, 8:12] & 0x0F) | ((rs[:, 0:4] >> 6) << 4)
-                    m2[:, 4:8] = (rs[:, 8:12] >> 4)   | ((rs[:, 4:8] >> 6) << 4)
-                    sc = d[:, None] * s2; mn = dm[:, None] * m2
-                    gi = off // self.Q4_GROUP_SIZE
-                    all_scales[gi:gi + n_blk * 8] = np.where(sc.reshape(-1) > 0, sc.reshape(-1), 1.0)
-                    all_zeros[gi:gi + n_blk * 8]  = (-mn).reshape(-1)
+                    for elem_off, take, raw, _ in self._iter_tensor_chunks(
+                            name, include_raw=True, include_f32=False):
+                        n_blk = take // 256
+                        blks = np.frombuffer(raw, dtype=np.uint8)[:n_blk * 144].reshape(n_blk, 144)
+                        d = np.ascontiguousarray(blks[:, 0:2]).view(np.float16).reshape(n_blk).astype(np.float32)
+                        dm = np.ascontiguousarray(blks[:, 2:4]).view(np.float16).reshape(n_blk).astype(np.float32)
+                        rs = blks[:, 4:16].astype(np.int32)
+                        s2 = np.empty((n_blk, 8), np.float32)
+                        m2 = np.empty((n_blk, 8), np.float32)
+                        s2[:, 0:4] = rs[:, 0:4] & 0x3F;  m2[:, 0:4] = rs[:, 4:8] & 0x3F
+                        s2[:, 4:8] = (rs[:, 8:12] & 0x0F) | ((rs[:, 0:4] >> 6) << 4)
+                        m2[:, 4:8] = (rs[:, 8:12] >> 4)   | ((rs[:, 4:8] >> 6) << 4)
+                        sc = d[:, None] * s2; mn = dm[:, None] * m2
+                        gi = (off + elem_off) // self.Q4_GROUP_SIZE
+                        all_scales[gi:gi + n_blk * 8] = np.where(sc.reshape(-1) > 0, sc.reshape(-1), 1.0)
+                        all_zeros[gi:gi + n_blk * 8] = (-mn).reshape(-1)
                     n_direct += 1
                 else:
-                    data = self.tensors[name].flatten().astype(np.float32)
-                    for gi_e in range(0, data.size, self.Q4_GROUP_SIZE):
-                        chunk = data[gi_e:gi_e + self.Q4_GROUP_SIZE]
-                        vmin, vmax = float(chunk.min()), float(chunk.max())
-                        scale = (vmax - vmin) / 15.0 if vmax > vmin else 1.0
-                        group_idx = (off + gi_e) // self.Q4_GROUP_SIZE
-                        all_scales[group_idx] = scale; all_zeros[group_idx] = vmin
+                    for elem_off, take, _, data in self._iter_tensor_chunks(name, include_f32=True):
+                        for gi_e in range(0, take, self.Q4_GROUP_SIZE):
+                            chunk = data[gi_e:gi_e + self.Q4_GROUP_SIZE]
+                            vmin, vmax = float(chunk.min()), float(chunk.max())
+                            scale = (vmax - vmin) / 15.0 if vmax > vmin else 1.0
+                            group_idx = (off + elem_off + gi_e) // self.Q4_GROUP_SIZE
+                            all_scales[group_idx] = scale
+                            all_zeros[group_idx] = vmin
             if self.verbose and n_direct:
                 print(f"[GPU] Q4_K direct qparams: {n_direct}/{len(self._q4_tensors)} tensors")
             if self._lm_q4_approx_off is not None and self._lm_q4_approx_name is not None:
-                data = self.tensors[self._lm_q4_approx_name].flatten().astype(np.float32)
                 off = self._lm_q4_approx_off
-                for gi_e in range(0, data.size, self.Q4_GROUP_SIZE):
-                    chunk = data[gi_e:gi_e + self.Q4_GROUP_SIZE]
-                    vmin, vmax = float(chunk.min()), float(chunk.max())
-                    scale = (vmax - vmin) / 15.0 if vmax > vmin else 1.0
-                    group_idx = (off + gi_e) // self.Q4_GROUP_SIZE
-                    all_scales[group_idx] = scale
-                    all_zeros[group_idx] = vmin
+                for elem_off, take, _, data in self._iter_tensor_chunks(
+                        self._lm_q4_approx_name, include_f32=True):
+                    for gi_e in range(0, take, self.Q4_GROUP_SIZE):
+                        chunk = data[gi_e:gi_e + self.Q4_GROUP_SIZE]
+                        vmin, vmax = float(chunk.min()), float(chunk.max())
+                        scale = (vmax - vmin) / 15.0 if vmax > vmin else 1.0
+                        group_idx = (off + elem_off + gi_e) // self.Q4_GROUP_SIZE
+                        all_scales[group_idx] = scale
+                        all_zeros[group_idx] = vmin
             g.set_qparams(self.wt_map_id, all_scales, all_zeros)
             for name in sorted(self._q4_tensors):
-                t = self.tensors[name]; data = t.flatten().astype(np.float32)
                 off = self._off[name]
-                locs = np.arange(off, off + data.size, dtype=np.uint32)
-                g.scatter(self.wt_map_id, locs, data)
+                for elem_off, take, _, data in self._iter_tensor_chunks(name, include_f32=True):
+                    locs = np.arange(off + elem_off, off + elem_off + take, dtype=np.uint32)
+                    g.scatter(self.wt_map_id, locs, data)
             if self._lm_q4_approx_off is not None and self._lm_q4_approx_name is not None:
-                data = self.tensors[self._lm_q4_approx_name].flatten().astype(np.float32)
                 off = self._lm_q4_approx_off
-                locs = np.arange(off, off + data.size, dtype=np.uint32)
-                g.scatter(self.wt_map_id, locs, data)
+                for elem_off, take, _, data in self._iter_tensor_chunks(
+                        self._lm_q4_approx_name, include_f32=True):
+                    locs = np.arange(off + elem_off, off + elem_off + take, dtype=np.uint32)
+                    g.scatter(self.wt_map_id, locs, data)
             if self.verbose:
                 print(f"[GPU] Q4 upload: {len(self._q4_tensors)} tensors in "
                       f"{time.perf_counter()-t0:.1f}s")
@@ -379,47 +572,40 @@ class ADAMEngine:
                 # xq8 shader reads unsigned: val = float(u8) * scale + zero, with zero = -128 * scale.
                 for name in sorted(self._q8_tensors):
                     off = self._off[name]
-                    raw = self.raw_blocks.get(name)
                     t_type = self.tensor_types.get(name)
-                    n_elem = self.tensors[name].size
-                    n_blk = n_elem // 32
-                    gi = off // self.Q8_GROUP_SIZE
-                    if raw is not None and t_type == _GGML_Q8_0:
-                        # Q8_0: 34 bytes/block = 2 bytes fp16 scale + 32 bytes signed int8
-                        blks = np.frombuffer(raw, dtype=np.uint8)[:n_blk * 34].reshape(n_blk, 34)
-                        d = np.ascontiguousarray(blks[:, 0:2]).view(np.float16).reshape(n_blk).astype(np.float32)
-                        q8_scales[gi:gi + n_blk] = np.where(d > 0, d, 1.0)
-                        # int8 values are in blks[:,2:34] stored as raw bytes (two's complement)
-                        int8_raw = blks[:, 2:34].reshape(-1)  # uint8 view of signed int8
-                        # Reinterpret as signed then add 128 offset for unsigned encoding
-                        uint8_vals = (int8_raw.view(np.int8).astype(np.int16) + 128).astype(np.uint8)
-                    elif raw is not None and t_type == _GGML_Q5_0:
-                        # Q5_0: 22 bytes/block = 2 bytes fp16 scale + 4 bytes qh + 16 bytes qs
-                        # Use the dequantized F32 tensor (already decoded correctly by GGUF lib)
-                        # and re-encode to uint8 using the original block scales.
-                        blks = np.frombuffer(raw, dtype=np.uint8)[:n_blk * 22].reshape(n_blk, 22)
-                        d = np.ascontiguousarray(blks[:, 0:2]).view(np.float16).reshape(n_blk).astype(np.float32)
-                        d_abs = np.abs(d)
-                        d_safe = np.where(d_abs > 0, d_abs, 1.0)  # Q5_0 d can be negative
-                        q8_scales[gi:gi + n_blk] = d_safe
-                        # Divide F32 by d per group to recover original int5 values [-16,15]
-                        # then add 128 offset for unsigned Q8 encoding
-                        data_f32 = self.tensors[name].flatten().astype(np.float32)
-                        int8_per_group = np.round(data_f32.reshape(n_blk, 32) / d_safe[:, None]).astype(np.int16).clip(-16, 15)
-                        uint8_vals = (int8_per_group + 128).astype(np.uint8).reshape(-1)
-                    else:
-                        # Fallback: quantize F32 to signed int8 then encode with +128 offset
-                        data_f32 = self.tensors[name].flatten().astype(np.float32)
-                        uint8_vals = np.empty(n_elem, dtype=np.uint8)
-                        for bi in range(0, n_elem, self.Q8_GROUP_SIZE):
-                            chunk = data_f32[bi:bi + self.Q8_GROUP_SIZE]
-                            vmax = float(np.abs(chunk).max())
-                            sc = vmax / 127.0 if vmax > 0 else 1.0
-                            q8_scales[(off + bi) // self.Q8_GROUP_SIZE] = sc
-                            q8_int8 = np.round(chunk / sc).astype(np.int16).clip(-127, 127)
-                            uint8_vals[bi:bi + len(chunk)] = (q8_int8 + 128).astype(np.uint8)
-                    locs = np.arange(off, off + n_elem, dtype=np.uint32)
-                    g.scatter(self.q8_map_id, locs, uint8_vals)
+                    for elem_off, take, raw, data_f32 in self._iter_tensor_chunks(
+                            name,
+                            include_raw=(t_type in (_GGML_Q8_0, _GGML_Q5_0)),
+                            include_f32=(t_type != _GGML_Q8_0)):
+                        n_blk = take // 32
+                        gi = (off + elem_off) // self.Q8_GROUP_SIZE
+                        if raw is not None and t_type == _GGML_Q8_0:
+                            blks = np.frombuffer(raw, dtype=np.uint8)[:n_blk * 34].reshape(n_blk, 34)
+                            d = np.ascontiguousarray(blks[:, 0:2]).view(np.float16).reshape(n_blk).astype(np.float32)
+                            q8_scales[gi:gi + n_blk] = np.where(d > 0, d, 1.0)
+                            int8_raw = blks[:, 2:34].reshape(-1)
+                            uint8_vals = (int8_raw.view(np.int8).astype(np.int16) + 128).astype(np.uint8)
+                        elif raw is not None and t_type == _GGML_Q5_0:
+                            blks = np.frombuffer(raw, dtype=np.uint8)[:n_blk * 22].reshape(n_blk, 22)
+                            d = np.ascontiguousarray(blks[:, 0:2]).view(np.float16).reshape(n_blk).astype(np.float32)
+                            d_abs = np.abs(d)
+                            d_safe = np.where(d_abs > 0, d_abs, 1.0)
+                            q8_scales[gi:gi + n_blk] = d_safe
+                            int8_per_group = np.round(
+                                data_f32.reshape(n_blk, 32) / d_safe[:, None]
+                            ).astype(np.int16).clip(-16, 15)
+                            uint8_vals = (int8_per_group + 128).astype(np.uint8).reshape(-1)
+                        else:
+                            uint8_vals = np.empty(take, dtype=np.uint8)
+                            for bi in range(0, take, self.Q8_GROUP_SIZE):
+                                chunk = data_f32[bi:bi + self.Q8_GROUP_SIZE]
+                                vmax = float(np.abs(chunk).max())
+                                sc = vmax / 127.0 if vmax > 0 else 1.0
+                                q8_scales[(off + elem_off + bi) // self.Q8_GROUP_SIZE] = sc
+                                q8_int8 = np.round(chunk / sc).astype(np.int16).clip(-127, 127)
+                                uint8_vals[bi:bi + len(chunk)] = (q8_int8 + 128).astype(np.uint8)
+                        locs = np.arange(off + elem_off, off + elem_off + take, dtype=np.uint32)
+                        g.scatter(self.q8_map_id, locs, uint8_vals)
                 # xq8 shader: val = float(u8) * scale + zero; with zero = -128*scale → u8=128 ↦ 0
                 q8_zeros = (-128.0 * q8_scales).astype(np.float32)
                 g.set_qparams(self.q8_map_id, q8_scales, q8_zeros)
@@ -432,11 +618,10 @@ class ADAMEngine:
         # pre-compute 1+delta and store the actual multiplicative weight.)
         t0 = time.perf_counter()
         for name in self._norm_names_ordered:
-            t = self.tensors[name]
-            data = np.ascontiguousarray(t.flatten(), dtype=np.float32)
             off = self._off[name]
-            locs = np.arange(off, off + data.size, dtype=np.uint32)
-            g.scatter(self.ws_map_id, locs, data)
+            for elem_off, take, _, data in self._iter_tensor_chunks(name, include_f32=True):
+                locs = np.arange(off + elem_off, off + elem_off + take, dtype=np.uint32)
+                g.scatter(self.ws_map_id, locs, data)
         if self.verbose:
             print(f"[GPU] F32 norm upload: {len(self._norm_names_ordered)} tensors in "
                   f"{time.perf_counter()-t0:.1f}s")
@@ -780,14 +965,14 @@ class ADAMEngine:
         self._pending_embed_tok = 0
         if 'token_embd.weight' in self.tensor_map_id:
             name = 'token_embd.weight'
-            t = self.tensors[name]
+            sh = self._shape_of(name)
             off = np.uint32(self._off[name])
             if (not self._trans[name]) and (name in self._q8_tensors):
                 self._gpu_token_embd_name = name
                 self._gpu_token_embd_mode = 'row_xq8'
                 self._emb_row_base = int(off)
             elif self._trans[name]:
-                base = off + np.arange(c.n_embd, dtype=np.uint32) * np.uint32(t.shape[1])
+                base = off + np.arange(c.n_embd, dtype=np.uint32) * np.uint32(sh[1])
                 self._gpu_token_embd_name = name
                 self._gpu_token_embd_mode = 'gather'
                 self._emb_gather_base = base
@@ -817,7 +1002,7 @@ class ADAMEngine:
             self._lm_wt_name = 'token_embd.weight'
         elif 'token_embd.weight' in self._cpu_only:
             self._lm_wt_name = None   # weight-tied, use CPU fallback
-            lm = self.tensors['token_embd.weight'].astype(np.float32)
+            lm = self._load_tensor_f32('token_embd.weight', keep=True).astype(np.float32)
             self._lm_weight = lm
             if self.verbose:
                 print(f"[GPU] LM head: weight-tied, CPU fallback ({lm.nbytes/1e6:.0f} MB)")
@@ -1167,7 +1352,7 @@ class ADAMEngine:
             self._prepare_gpu_embed_token(tok)
             use_gpu_embed = True
         elif 'token_embd.weight' in self._cpu_only:
-            emb_t = self.tensors['token_embd.weight']
+            emb_t = self._load_tensor_f32('token_embd.weight', keep=True)
             emb_data = (emb_t[tok] if emb_t.shape[0] == c.n_vocab
                         else emb_t[:, tok]).astype(np.float32)
             if c.emb_scale != 1.0:

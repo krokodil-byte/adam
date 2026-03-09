@@ -48,6 +48,7 @@ class GGUFLoader:
         self.keep_raw_blocks = bool(keep_raw_blocks)
         self.metadata: Dict = {}
         self.tensor_infos: List[TensorInfo] = []
+        self.tensor_info_by_name: Dict[str, TensorInfo] = {}
         self.tensors: Dict[str, np.ndarray] = {}      # f32 dequantized
         self.raw_blocks: Dict[str, bytes] = {}          # raw GGUF bytes
         self.tensor_types: Dict[str, int] = {}          # ggml type per tensor
@@ -61,6 +62,20 @@ class GGUFLoader:
             self._parse_header(f, verbose)
             self._parse_metadata(f, verbose)
             self._parse_tensor_infos(f, verbose)
+            if self.keep_tensors or self.keep_raw_blocks:
+                self._load_tensors(f, verbose)
+            elif verbose:
+                print(f"[GGUF] Indexed {len(self.tensor_infos)} tensors")
+                print("[GGUF] Raw blocks: 0 MB (streamed on demand)")
+                print("[GGUF] F32 dequant: 0 MB (streamed on demand)")
+        return self
+
+    def materialize(self, verbose=True):
+        if self.keep_tensors is False and self.keep_raw_blocks is False:
+            raise RuntimeError("materialize() requires keep_tensors or keep_raw_blocks enabled")
+        if self.tensors or self.raw_blocks:
+            return self
+        with open(self.path, 'rb') as f:
             self._load_tensors(f, verbose)
         return self
 
@@ -101,7 +116,11 @@ class GGUFLoader:
             nm=self._rs(f); nd=struct.unpack('<I',f.read(4))[0]
             sh=tuple(struct.unpack('<Q',f.read(8))[0] for _ in range(nd))
             dt=struct.unpack('<I',f.read(4))[0]; off=struct.unpack('<Q',f.read(8))[0]
-            self.tensor_infos.append(TensorInfo(nm,sh,dt,off))
+            ti = TensorInfo(nm,sh,dt,off)
+            self.tensor_infos.append(ti)
+            self.tensor_info_by_name[nm] = ti
+            self.tensor_types[nm] = dt
+            self.tensor_shapes[nm] = sh
         align=self.metadata.get('general.alignment',32)
         pos=f.tell(); self._data_offset=(pos+align-1)//align*align
         if v:
@@ -130,9 +149,6 @@ class GGUFLoader:
         for s in ti.shape: ne *= s
         f.seek(self._data_offset + ti.offset)
 
-        self.tensor_types[ti.name] = ti.dtype
-        self.tensor_shapes[ti.name] = ti.shape
-
         if ti.dtype in QUANT_INFO:
             bpb, epb = QUANT_INFO[ti.dtype]
             n_blocks = ne // epb
@@ -151,6 +167,87 @@ class GGUFLoader:
                 self.tensors[ti.name] = _gguf_lib.dequantize(raw_np, qtype)
         else:
             raise NotImplementedError(f"Unsupported type {ti.dtype} for {ti.name}")
+
+    def _tensor_numel(self, ti: TensorInfo) -> int:
+        ne = 1
+        for s in ti.shape:
+            ne *= s
+        return ne
+
+    def _tensor_raw_size(self, ti: TensorInfo) -> int:
+        if ti.dtype not in QUANT_INFO:
+            raise NotImplementedError(f"Unsupported type {ti.dtype} for {ti.name}")
+        bpb, epb = QUANT_INFO[ti.dtype]
+        ne = self._tensor_numel(ti)
+        return (ne // epb) * bpb
+
+    def get_tensor_info(self, name: str) -> TensorInfo:
+        return self.tensor_info_by_name[name]
+
+    def estimate_raw_bytes(self) -> int:
+        return sum(self._tensor_raw_size(ti) for ti in self.tensor_infos)
+
+    def estimate_f32_bytes(self) -> int:
+        return sum(self._tensor_numel(ti) * 4 for ti in self.tensor_infos)
+
+    def load_tensor_raw(self, name: str) -> bytes:
+        if name in self.raw_blocks:
+            return self.raw_blocks[name]
+        ti = self.get_tensor_info(name)
+        raw_size = self._tensor_raw_size(ti)
+        with open(self.path, 'rb') as f:
+            f.seek(self._data_offset + ti.offset)
+            raw = f.read(raw_size)
+        if self.keep_raw_blocks:
+            self.raw_blocks[name] = raw
+        return raw
+
+    def load_tensor_f32(self, name: str) -> np.ndarray:
+        if name in self.tensors:
+            return self.tensors[name]
+        ti = self.get_tensor_info(name)
+        raw = self.load_tensor_raw(name)
+        arr = self._dequant(ti.dtype, raw, self._tensor_numel(ti))
+        if self.keep_tensors:
+            self.tensors[name] = arr
+        return arr
+
+    def iter_tensor_chunks(self, name: str, max_chunk_mb: int = 32,
+                           include_raw: bool = False, include_f32: bool = True):
+        ti = self.get_tensor_info(name)
+        ne = self._tensor_numel(ti)
+        if ne <= 0:
+            return
+
+        if name in self.tensors or name in self.raw_blocks:
+            raw = self.raw_blocks.get(name) if include_raw else None
+            arr = self.tensors.get(name) if include_f32 else None
+            if arr is None and include_f32:
+                arr = self.load_tensor_f32(name)
+            if raw is None and include_raw:
+                raw = self.load_tensor_raw(name)
+            yield 0, ne, raw, (arr.reshape(-1).astype(np.float32, copy=False) if arr is not None else None)
+            return
+
+        max_chunk_bytes = max(1, int(max_chunk_mb)) * 1024 * 1024
+        bpb, epb = QUANT_INFO[ti.dtype]
+
+        if include_f32:
+            chunk_elems = max(epb, (max_chunk_bytes // 4 // epb) * epb)
+        else:
+            chunk_elems = max(epb, (max_chunk_bytes // bpb) * epb)
+        chunk_elems = min(chunk_elems, ne)
+
+        with open(self.path, 'rb') as f:
+            f.seek(self._data_offset + ti.offset)
+            elem_off = 0
+            while elem_off < ne:
+                take = min(chunk_elems, ne - elem_off)
+                raw_size = (take // epb) * bpb
+                raw = f.read(raw_size)
+                arr = self._dequant(ti.dtype, raw, take) if include_f32 else None
+                yield elem_off, take, (raw if include_raw else None), arr
+                elem_off += take
 
     def release_tensors(self, keep_names=()):
         keep = set(keep_names)

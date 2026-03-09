@@ -27,7 +27,7 @@ import ctypes
 import numpy as np
 import os
 from contextlib import contextmanager
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 __version__ = "5.2.0"
 
@@ -95,6 +95,13 @@ OP_ATAN2 = 17
 OP_STEP = 18
 OP_SMOOTHSTEP = 19
 
+# Vulkan physical device types
+DEVICE_OTHER = 0
+DEVICE_INTEGRATED_GPU = 1
+DEVICE_DISCRETE_GPU = 2
+DEVICE_VIRTUAL_GPU = 3
+DEVICE_CPU = 4
+
 # ============================================
 # Helpers
 # ============================================
@@ -103,6 +110,210 @@ def _unpack_ticket_handle(v: int) -> Tuple[int, int]:
     handle = v & 0xFFFFFFFF
     ticket = (v >> 32) & 0xFFFFFFFFFFFFFFFF
     return handle, ticket
+
+
+def _resolve_lib_path(lib_path: Optional[str] = None) -> str:
+    if lib_path is not None:
+        return lib_path
+    env_lib = os.environ.get("ADAMAH_LIB_PATH")
+    if env_lib:
+        return env_lib
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if os.name == 'nt':
+        candidates = ['adamah_opt.dll', 'adamah_new.dll', 'adamah.dll']
+    else:
+        candidates = ['adamah.so']
+    for lib_name in candidates:
+        cand = os.path.join(current_dir, lib_name)
+        if os.path.exists(cand):
+            return cand
+
+    raise FileNotFoundError(
+        f"{candidates[0]} not found in {current_dir}\n"
+        f"Please compile the ADAMAH native library first"
+    )
+
+
+def _device_type_name(device_type: int) -> str:
+    return {
+        DEVICE_OTHER: "other",
+        DEVICE_INTEGRATED_GPU: "integrated",
+        DEVICE_DISCRETE_GPU: "discrete",
+        DEVICE_VIRTUAL_GPU: "virtual",
+        DEVICE_CPU: "cpu",
+    }.get(int(device_type), f"type{device_type}")
+
+
+def host_memory_info() -> Dict[str, int]:
+    total = 0
+    available = 0
+
+    if os.name == "nt":
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_uint32),
+                ("dwMemoryLoad", ctypes.c_uint32),
+                ("ullTotalPhys", ctypes.c_uint64),
+                ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64),
+                ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64),
+                ("ullAvailVirtual", ctypes.c_uint64),
+                ("ullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            total = int(stat.ullTotalPhys)
+            available = int(stat.ullAvailPhys)
+    elif os.path.exists("/proc/meminfo"):
+        vals = {}
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                key, rest = line.split(":", 1)
+                parts = rest.strip().split()
+                if not parts:
+                    continue
+                try:
+                    vals[key] = int(parts[0]) * 1024
+                except ValueError:
+                    continue
+        total = int(vals.get("MemTotal", 0))
+        available = int(vals.get("MemAvailable", vals.get("MemFree", 0)))
+    elif hasattr(os, "sysconf"):
+        try:
+            page = int(os.sysconf("SC_PAGE_SIZE"))
+            total_pages = int(os.sysconf("SC_PHYS_PAGES"))
+            avail_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+            total = page * total_pages
+            available = page * avail_pages
+        except (OSError, ValueError):
+            total = 0
+            available = 0
+
+    return {"total_bytes": total, "available_bytes": available}
+
+
+def probe_device(lib_path: Optional[str] = None) -> Dict[str, int]:
+    lib = ctypes.CDLL(_resolve_lib_path(lib_path))
+    probe = getattr(lib, "adamah_probe_device", None)
+    if probe is None:
+        return {}
+
+    probe.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    probe.restype = ctypes.c_int
+
+    heap = ctypes.c_uint64(0)
+    budget = ctypes.c_uint64(0)
+    usage = ctypes.c_uint64(0)
+    device_type = ctypes.c_uint32(DEVICE_OTHER)
+    ret = probe(
+        ctypes.byref(heap),
+        ctypes.byref(budget),
+        ctypes.byref(usage),
+        ctypes.byref(device_type),
+    )
+    if ret != 0:
+        raise RuntimeError(f"adamah_probe_device failed with code {ret}")
+
+    heap_bytes = int(heap.value)
+    budget_bytes = int(budget.value) if budget.value else heap_bytes
+    usage_bytes = int(usage.value)
+    return {
+        "heap_bytes": heap_bytes,
+        "budget_bytes": budget_bytes,
+        "usage_bytes": usage_bytes,
+        "free_budget_bytes": max(0, budget_bytes - usage_bytes),
+        "device_type": int(device_type.value),
+        "device_type_name": _device_type_name(int(device_type.value)),
+        "is_unified_memory": int(device_type.value) in (DEVICE_OTHER, DEVICE_INTEGRATED_GPU),
+    }
+
+
+def _align_mb_floor(value_bytes: int, minimum_mb: int) -> int:
+    step = 16 * 1024 * 1024
+    min_bytes = int(minimum_mb) * 1024 * 1024
+    if value_bytes <= min_bytes:
+        return min_bytes
+    return max(min_bytes, (int(value_bytes) // step) * step)
+
+
+def _staging_bytes_for_hot(hot_bytes: int) -> int:
+    hot_bytes = max(0, int(hot_bytes))
+    return max(32 * 1024 * 1024, min(512 * 1024 * 1024, hot_bytes // 4))
+
+
+def recommend_pool_sizes(working_set_bytes: int = 0,
+                         reserve_ratio: float = 0.10,
+                         lib_path: Optional[str] = None) -> Dict[str, int]:
+    device = probe_device(lib_path)
+    host = host_memory_info()
+    reserve_ratio = min(max(float(reserve_ratio), 0.0), 0.5)
+
+    heap_bytes = int(device.get("budget_bytes") or device.get("heap_bytes") or 0)
+    free_budget_bytes = int(device.get("free_budget_bytes") or heap_bytes)
+    host_available = int(host.get("available_bytes") or 0)
+    unified = bool(device.get("is_unified_memory"))
+    if heap_bytes <= 0 and free_budget_bytes <= 0:
+        return {}
+
+    usable_device = int(free_budget_bytes * (1.0 - reserve_ratio))
+    if unified and host_available > 0:
+        usable_device = min(usable_device or host_available,
+                            int(host_available * (1.0 - reserve_ratio)))
+    elif usable_device <= 0:
+        usable_device = heap_bytes
+
+    working_set_bytes = max(0, int(working_set_bytes))
+    misc_overhead = 64 * 1024 * 1024
+    headroom = max(0, usable_device - working_set_bytes - misc_overhead)
+
+    if unified:
+        target_total = min(headroom, 256 * 1024 * 1024)
+        target_total = max(target_total, 96 * 1024 * 1024 if headroom >= 96 * 1024 * 1024 else headroom)
+    else:
+        target_total = min(headroom // 2 if headroom > 0 else 0, 1024 * 1024 * 1024)
+        target_total = max(target_total, 192 * 1024 * 1024 if headroom >= 192 * 1024 * 1024 else headroom)
+
+    min_hot_mb = 32 if unified else 64
+    min_cold_mb = 16 if unified else 32
+    if target_total <= 0:
+        hot_bytes = min_hot_mb * 1024 * 1024
+        cold_bytes = min_cold_mb * 1024 * 1024
+    else:
+        hot_bytes = _align_mb_floor(int(target_total * 0.55), min_hot_mb)
+        staging = _staging_bytes_for_hot(hot_bytes)
+        cold_budget = max(0, headroom - hot_bytes - staging)
+        cold_bytes = _align_mb_floor(min(int(target_total * 0.25), cold_budget), min_cold_mb)
+
+        while hot_bytes + cold_bytes + _staging_bytes_for_hot(hot_bytes) > headroom:
+            if hot_bytes > cold_bytes and hot_bytes > min_hot_mb * 1024 * 1024:
+                hot_bytes -= 16 * 1024 * 1024
+            elif cold_bytes > min_cold_mb * 1024 * 1024:
+                cold_bytes -= 16 * 1024 * 1024
+            else:
+                break
+
+    return {
+        "hot_mb": max(min_hot_mb, hot_bytes // (1024 * 1024)),
+        "cold_mb": max(min_cold_mb, cold_bytes // (1024 * 1024)),
+        "headroom_mb": headroom // (1024 * 1024),
+        "usable_device_mb": usable_device // (1024 * 1024),
+        "heap_mb": heap_bytes // (1024 * 1024),
+        "free_budget_mb": free_budget_bytes // (1024 * 1024),
+        "device_type": int(device.get("device_type", DEVICE_OTHER)),
+        "device_type_name": device.get("device_type_name", "other"),
+        "is_unified_memory": unified,
+    }
 
 # ============================================
 # ArrayHandle - Wrapper for GPU arrays
@@ -156,29 +367,7 @@ class Adamah:
 
     def __init__(self, lib_path: Optional[str] = None, cache_mb: Optional[int] = None, cold_cache_mb: Optional[int] = None):
         """Initialize ADAMAH library."""
-        if lib_path is None:
-            env_lib = os.environ.get("ADAMAH_LIB_PATH")
-            if env_lib:
-                lib_path = env_lib
-            else:
-                # Auto-detect library path
-                current_dir = os.path.dirname(os.path.abspath(__file__))
-                if os.name == 'nt':
-                    candidates = ['adamah_opt.dll', 'adamah_new.dll', 'adamah.dll']
-                else:
-                    candidates = ['adamah.so']
-                for lib_name in candidates:
-                    cand = os.path.join(current_dir, lib_name)
-                    if os.path.exists(cand):
-                        lib_path = cand
-                        break
-                if lib_path is None:
-                    lib_name = candidates[0]
-                    raise FileNotFoundError(
-                        f"{lib_name} not found in {current_dir}\n"
-                        f"Please compile the ADAMAH native library first"
-                    )
-
+        lib_path = _resolve_lib_path(lib_path)
         self._lib = ctypes.CDLL(lib_path)
         self._setup_ctypes()
 
@@ -217,6 +406,15 @@ class Adamah:
         if init_ex is not None:
             init_ex.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
             init_ex.restype = ctypes.c_int
+        probe = getattr(self._lib, "adamah_probe_device", None)
+        if probe is not None:
+            probe.argtypes = [
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            probe.restype = ctypes.c_int
 
         self._lib.adamah_shutdown.argtypes = []
         self._lib.adamah_shutdown.restype = None
@@ -1867,6 +2065,12 @@ def init(cache_mb: Optional[int] = None, cold_cache_mb: Optional[int] = None) ->
         hot = int(hot_env) if hot_env else None
         cold = int(cold_env) if cold_env else None
         attempts.append((hot, cold))
+    if not attempts:
+        try:
+            plan = recommend_pool_sizes()
+            attempts.append((plan["hot_mb"], plan["cold_mb"]))
+        except Exception:
+            pass
     attempts.extend([
         (None, None),
         (512, 256),
@@ -1897,7 +2101,11 @@ def init(cache_mb: Optional[int] = None, cold_cache_mb: Optional[int] = None) ->
 # Everything importable from `import adamah`
 __all__ = [
     # Core
-    'Adamah', 'init', '__version__',
+    'Adamah', 'init', 'probe_device', 'host_memory_info', 'recommend_pool_sizes', '__version__',
+
+    # Device types
+    'DEVICE_OTHER', 'DEVICE_INTEGRATED_GPU', 'DEVICE_DISCRETE_GPU',
+    'DEVICE_VIRTUAL_GPU', 'DEVICE_CPU',
     
     # Data types
     'DTYPE_F32', 'DTYPE_BF16', 'DTYPE_Q8', 'DTYPE_Q4', 'DTYPE_Q6',
