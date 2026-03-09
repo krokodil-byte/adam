@@ -160,8 +160,13 @@ def _mb_str(value_bytes):
 
 def _base_reasoning_prompt():
     return (
-        "Think carefully and verify intermediate conclusions before answering. "
-        "Keep the final answer concise unless the user asks for detail."
+        "For every reply, provide a short visible reasoning summary followed by the answer. "
+        "Use exactly this structure:\n"
+        "Analysis:\n"
+        "- 2 to 6 short bullet points with the key reasoning steps\n"
+        "Final:\n"
+        "- the final answer for the user\n"
+        "Keep the reasoning concise and high-signal. Do not omit the Analysis section."
     )
 
 
@@ -479,7 +484,7 @@ def print_help():
   {CYAN}/reset{RESET}   — Clear chat history and KV cache
   {CYAN}/clear{RESET}   — Alias for /reset
   {CYAN}/compact{RESET} — Summarize old history into compact memory
-  {CYAN}/reason on|off{RESET} — Toggle prompt-based reasoning mode
+  {CYAN}/reason on|off{RESET} — Toggle visible Analysis/Final reasoning mode
   {CYAN}/temp N{RESET}  — Set temperature (e.g. /temp 0.7)
   {CYAN}/topk N{RESET}  — Set top-k (e.g. /topk 40)
   {CYAN}/topp P{RESET}  — Set top-p (e.g. /topp 0.95)
