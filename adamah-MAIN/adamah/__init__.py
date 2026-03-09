@@ -1839,6 +1839,10 @@ BROADCAST_DIV = 1
 BROADCAST_ADD = 2
 BROADCAST_SUB = 3
 
+def _is_memory_init_error(exc: Exception) -> bool:
+    return "adamah_init failed with code -2" in str(exc)
+
+
 def init(cache_mb: Optional[int] = None, cold_cache_mb: Optional[int] = None) -> Adamah:
     """Initialize ADAMAH and return a GPU context.
     
@@ -1853,7 +1857,41 @@ def init(cache_mb: Optional[int] = None, cold_cache_mb: Optional[int] = None) ->
         gpu = adamah.init()
         gpu.set_dtype(adamah.DTYPE_BF16)
     """
-    return Adamah(cache_mb=cache_mb, cold_cache_mb=cold_cache_mb)
+    if cache_mb is not None or cold_cache_mb is not None:
+        return Adamah(cache_mb=cache_mb, cold_cache_mb=cold_cache_mb)
+
+    attempts = []
+    hot_env = os.environ.get("ADAMAH_CACHE_MB")
+    cold_env = os.environ.get("ADAMAH_COLD_CACHE_MB")
+    if hot_env or cold_env:
+        hot = int(hot_env) if hot_env else None
+        cold = int(cold_env) if cold_env else None
+        attempts.append((hot, cold))
+    attempts.extend([
+        (None, None),
+        (512, 256),
+        (256, 128),
+        (128, 64),
+        (64, 32),
+        (32, 16),
+        (16, 8),
+    ])
+
+    seen = set()
+    last_err = None
+    for hot_mb, cold_mb in attempts:
+        key = (hot_mb, cold_mb)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            return Adamah(cache_mb=hot_mb, cold_cache_mb=cold_mb)
+        except RuntimeError as exc:
+            if not _is_memory_init_error(exc):
+                raise
+            last_err = exc
+            continue
+    raise RuntimeError(f"adamah init failed after fallback attempts: {last_err}")
 
 
 # Everything importable from `import adamah`

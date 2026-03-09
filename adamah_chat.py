@@ -155,6 +155,8 @@ def init_gpu_backend(adamah_mod):
         (256, 128),
         (128, 64),
         (64, 32),
+        (32, 16),
+        (16, 8),
     ])
 
     seen = set()
