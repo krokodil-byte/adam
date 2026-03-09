@@ -160,13 +160,18 @@ def _mb_str(value_bytes):
 
 def _base_reasoning_prompt():
     return (
+        "Respond directly to the user's latest message. "
+        "Do not invent a new task, scenario, assignment, or question. "
+        "Do not change topic. "
         "For every reply, provide a short visible reasoning summary followed by the answer. "
-        "Use exactly this structure:\n"
+        "Use exactly this structure and nothing else:\n"
         "Analysis:\n"
-        "- 2 to 6 short bullet points with the key reasoning steps\n"
+        "- 1 to 4 short bullet points about the user's actual request\n"
         "Final:\n"
         "- the final answer for the user\n"
-        "Keep the reasoning concise and high-signal. Do not omit the Analysis section."
+        "Keep the reasoning concise and high-signal. "
+        "If the user just greets you or says something simple, keep both sections very short. "
+        "Do not omit the Analysis section."
     )
 
 
