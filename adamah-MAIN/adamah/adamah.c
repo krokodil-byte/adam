@@ -3038,6 +3038,7 @@ static int init_pipelines(void) {
   // Get library directory for relative shader lookup
   char lib_dir[512] = {0};
   get_lib_dir(lib_dir, sizeof(lib_dir));
+  const char *env_shaders = getenv("ADAMAH_SHADER_PATH");
 
   char lib_shaders[600] = {0};
   if (lib_dir[0]) {
@@ -3053,6 +3054,7 @@ static int init_pipelines(void) {
   // 6. ./src/adamah/shaders (old structure)
   // 7. System path
   const char *paths[] = {
+      env_shaders ? env_shaders : "",
 #ifdef SHADER_PATH
       SHADER_PATH,
 #endif

@@ -768,6 +768,7 @@ def load_model(model_path, startup=None):
     desired_profile = _desired_shader_profile(startup)
     os.environ["ADAM_RUNTIME_PROFILE"] = desired_profile
     os.environ["ADAMAH_SHADER_PROFILE"] = desired_profile
+    os.environ["ADAMAH_SHADER_PATH"] = os.path.join(ADAMAH_DIR, "adamah", "shaders")
     ensure_runtime(rebuild_shaders=(compiled_shader_profile() != desired_profile))
     from adam.loaders.gguf import GGUFLoader
     from adam.tokenizers.gguf_tok import GGUFTokenizer
