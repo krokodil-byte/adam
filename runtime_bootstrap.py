@@ -94,6 +94,12 @@ def _compile_shaders(pkg_dir: Path) -> None:
     SHADER_PROFILE_STAMP.write_text(profile, encoding="utf-8")
 
 
+def _has_essential_shaders(pkg_dir: Path) -> bool:
+    root_op1 = pkg_dir / "shaders" / "map_op1.spv"
+    f32_op1 = pkg_dir / "shaders" / "f32" / "map_op1.spv"
+    return root_op1.exists() and f32_op1.exists()
+
+
 def _sync_root_shader_copies(pkg_dir: Path) -> None:
     f32_dir = pkg_dir / "shaders" / "f32"
     root_dir = pkg_dir / "shaders"
@@ -212,6 +218,8 @@ def ensure_native_adamah(force_rebuild: bool = False, rebuild_shaders: bool = Fa
     pkg_dir = ADAMAH_PKG
     candidates = ["adamah_opt.dll", "adamah_new.dll", "adamah.dll"] if os.name == "nt" else ["adamah.so"]
     _sync_root_shader_copies(pkg_dir)
+    if not _has_essential_shaders(pkg_dir):
+        rebuild_shaders = True
     if rebuild_shaders:
         _compile_shaders(pkg_dir)
         _sync_root_shader_copies(pkg_dir)
