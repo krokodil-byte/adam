@@ -13,8 +13,10 @@ from adamah_chat import (
     _build_compaction_seed_message,
     _build_reasoning_request,
     _build_session_system_prompt,
+    _gen_preset_defaults,
     _reasoning_enabled,
     _reasoning_stage_name,
+    _runtime_preset_defaults,
     _runtime_profile_overrides,
     prepare_chat_prompt,
     prepare_chat_messages,
@@ -76,6 +78,11 @@ def main():
         "Do not mention the notes themselves unless the user explicitly asks for them.\n\n"
         "Working notes for the next reply:\nremember this"
     )
+    assert _runtime_preset_defaults("desktop_long")["kv_cap"] == 16384
+    assert _runtime_preset_defaults("broadcom_trace")["runtime_profile"] == "broadcom_v3dv_trace"
+    factual = _gen_preset_defaults("factual")
+    assert factual["top_k"] == 32
+    assert factual["max_tokens"] == 256
     seed = _build_compaction_seed_message("goal: ship the app")
     assert seed["role"] == "system"
     assert "Context from a previous conversation:" in seed["content"]

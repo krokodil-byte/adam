@@ -33,12 +33,133 @@ RESET = "\033[0m"
 BOX_TL = "╔"; BOX_TR = "╗"; BOX_BL = "╚"; BOX_BR = "╝"
 BOX_H = "═"; BOX_V = "║"
 FAST_LM_ROWS_PER_GROUP = 256
+RUNTIME_PRESET_CHOICES = [
+    ("auto", "Auto"),
+    ("desktop_long", "Desktop long context"),
+    ("broadcom_fast", "Broadcom fast"),
+    ("broadcom_trace", "Broadcom trace"),
+    ("broadcom_exact", "Broadcom exact"),
+]
+GEN_PRESET_CHOICES = [
+    ("balanced", "Balanced"),
+    ("factual", "Factual"),
+    ("creative", "Creative"),
+]
 
 def box(text, width=52):
     pad = width - len(text) - 2
     print(f"{CYAN}{BOX_TL}{BOX_H * width}{BOX_TR}")
     print(f"{BOX_V}  {BOLD}{text}{RESET}{CYAN}{' ' * pad}{BOX_V}")
     print(f"{BOX_BL}{BOX_H * width}{BOX_BR}{RESET}")
+
+
+def _choose_preset(prompt: str, choices, default_key: str):
+    idx_default = 0
+    for i, (key, _) in enumerate(choices):
+        if key == default_key:
+            idx_default = i
+            break
+    options = "  ".join(f"[{i+1}] {label}" for i, (_, label) in enumerate(choices))
+    print(f"{CYAN}{prompt}:{RESET} {options}")
+    while True:
+        raw = input(f"{YELLOW}Choice [{idx_default+1}]: {RESET}").strip()
+        if not raw:
+            return choices[idx_default][0]
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(choices):
+                return choices[idx][0]
+        lowered = raw.lower()
+        for key, label in choices:
+            if lowered in (key, label.lower()):
+                return key
+        print(f"{RED}Invalid choice{RESET}")
+
+
+def _prompt_int_optional(prompt: str, default=None, minimum=None):
+    suffix = f" [{default}]" if default is not None else ""
+    while True:
+        raw = input(f"{YELLOW}{prompt}{suffix}: {RESET}").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+            if minimum is not None and value < minimum:
+                raise ValueError
+            return value
+        except ValueError:
+            if minimum is not None:
+                print(f"{RED}Enter an integer >= {minimum}{RESET}")
+            else:
+                print(f"{RED}Enter an integer{RESET}")
+
+
+def _runtime_preset_defaults(name: str) -> dict:
+    name = (name or "auto").strip().lower()
+    if name == "desktop_long":
+        return {"runtime_profile": "default", "kv_cap": 16384}
+    if name == "broadcom_fast":
+        return {"runtime_profile": "broadcom_v3dv"}
+    if name == "broadcom_trace":
+        return {"runtime_profile": "broadcom_v3dv_trace", "trace_decode": True}
+    if name == "broadcom_exact":
+        return {"runtime_profile": "broadcom_v3dv_exact"}
+    return {"runtime_profile": "default"}
+
+
+def _gen_preset_defaults(name: str) -> dict:
+    name = (name or "balanced").strip().lower()
+    if name == "factual":
+        return {
+            "temperature": 0.55,
+            "top_k": 32,
+            "top_p": 0.90,
+            "repeat_penalty": 1.08,
+            "max_tokens": 256,
+        }
+    if name == "creative":
+        return {
+            "temperature": 0.85,
+            "top_k": 64,
+            "top_p": 0.97,
+            "repeat_penalty": 1.05,
+            "max_tokens": 384,
+        }
+    return {
+        "temperature": 0.70,
+        "top_k": 40,
+        "top_p": 0.95,
+        "repeat_penalty": 1.08,
+        "max_tokens": 256,
+    }
+
+
+def prompt_startup_config(model_info: dict | None = None) -> dict:
+    print(f"\n{BOLD}Launch setup{RESET}")
+    if model_info:
+        arch = model_info.get("arch", "?")
+        name = model_info.get("model_name", model_info.get("name", "model"))
+        print(f"{DIM}{name} | {arch} | {model_info.get('size_gb', 0.0):.1f}GB{RESET}")
+    runtime_preset = _choose_preset("Runtime preset", RUNTIME_PRESET_CHOICES, "auto")
+    runtime = _runtime_preset_defaults(runtime_preset)
+    gen_preset = _choose_preset("Reply preset", GEN_PRESET_CHOICES, "balanced")
+    gen = _gen_preset_defaults(gen_preset)
+    kv_default = runtime.get("kv_cap")
+    kv_cap = _prompt_int_optional("KV cap override (blank = preset/auto)", default=kv_default, minimum=256)
+    reasoning_cycles = _prompt_int_optional("Reasoning cycles (0 = off)", default=0, minimum=0)
+    print(
+        f"{DIM}Launch: runtime={runtime_preset}  reply={gen_preset}  "
+        f"kv={'auto' if kv_cap is None else kv_cap}  reason={reasoning_cycles}{RESET}\n"
+    )
+    return {
+        "runtime_preset": runtime_preset,
+        "gen_preset": gen_preset,
+        "runtime_profile": runtime.get("runtime_profile"),
+        "kv_cap": kv_cap,
+        "trace_decode": runtime.get("trace_decode"),
+        "reasoning_cycles": reasoning_cycles,
+        **gen,
+    }
 
 def scan_models(search_dirs=None):
     """Find all .gguf files in project tree (deduplicated by realpath)."""
@@ -376,8 +497,9 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
     return {"name": name}
 
 
-def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
+def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
     reserve_ratio = min(max(float(os.environ.get("ADAM_RUNTIME_RESERVE_RATIO", "0.10")), 0.0), 0.5)
+    startup = startup or {}
     machine = ""
     try:
         machine = os.uname().machine.lower()
@@ -396,22 +518,21 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
         device = {}
 
     unified = bool(device.get("is_unified_memory")) or arm_like
-    profile_name = os.environ.get("ADAM_RUNTIME_PROFILE", "default")
+    profile_name = startup.get("runtime_profile") or os.environ.get("ADAM_RUNTIME_PROFILE", "default")
     profile = _runtime_profile_overrides(profile_name, cfg, unified)
     if "reserve_ratio" in profile and os.environ.get("ADAM_RUNTIME_RESERVE_RATIO") is None:
         reserve_ratio = float(profile["reserve_ratio"])
-    rows_per_group = max(
-        1,
-        _env_int(
-            "ADAM_GPU_FUSED_ROWS_PER_GROUP",
-            int(profile.get("gpu_fused_rows_per_group", FAST_LM_ROWS_PER_GROUP)),
-        ),
-    )
+    rows_default = int(profile.get("gpu_fused_rows_per_group", FAST_LM_ROWS_PER_GROUP))
+    rows_per_group = max(1, int(startup.get("gpu_fused_rows_per_group") or _env_int("ADAM_GPU_FUSED_ROWS_PER_GROUP", rows_default)))
+    approx_default = profile.get("gpu_approx_rerank", False)
     approx_rerank = bool(
-        _env_flag("ADAM_GPU_APPROX_RERANK", profile.get("gpu_approx_rerank", False))
+        startup["gpu_approx_rerank"] if "gpu_approx_rerank" in startup and startup.get("gpu_approx_rerank") is not None
+        else _env_flag("ADAM_GPU_APPROX_RERANK", approx_default)
     )
+    trace_default = profile.get("trace_decode", False)
     trace_decode = bool(
-        _env_flag("ADAM_TRACE_DECODE", profile.get("trace_decode", False))
+        startup["trace_decode"] if "trace_decode" in startup and startup.get("trace_decode") is not None
+        else _env_flag("ADAM_TRACE_DECODE", trace_default)
     )
     host_avail = int(host.get("available_bytes") or 0)
     device_free = int(device.get("free_budget_bytes") or device.get("budget_bytes") or device.get("heap_bytes") or 0)
@@ -420,10 +541,10 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
         usable_device = min(usable_device or host_avail, int(host_avail * (1.0 - reserve_ratio)))
 
     kv_cap_env = os.environ.get("ADAM_KV_CAP")
-    kv_cap = int(kv_cap_env) if kv_cap_env else engine_cls.KV_CAP_DEFAULT
-    if unified and kv_cap_env is None:
+    kv_cap = int(startup["kv_cap"]) if startup.get("kv_cap") is not None else (int(kv_cap_env) if kv_cap_env else engine_cls.KV_CAP_DEFAULT)
+    if unified and kv_cap_env is None and startup.get("kv_cap") is None:
         kv_cap = min(kv_cap, 512)
-    if kv_cap_env is None and profile.get("kv_cap_max") is not None:
+    if kv_cap_env is None and startup.get("kv_cap") is None and profile.get("kv_cap_max") is not None:
         kv_cap = min(kv_cap, int(profile["kv_cap_max"]))
     while True:
         gpu_est = engine_cls.estimate_persistent_gpu_bytes(
@@ -579,7 +700,7 @@ def init_gpu_backend(adamah_mod, runtime_plan=None):
             continue
     raise RuntimeError(f"GPU init failed after fallback attempts: {last_err}")
 
-def load_model(model_path):
+def load_model(model_path, startup=None):
     """Load GGUF model with ADAMAH GPU backend via ADAM."""
     ensure_runtime()
     from adam.loaders.gguf import GGUFLoader
@@ -593,7 +714,7 @@ def load_model(model_path):
 
     # Auto-detect config from GGUF metadata (works for any architecture)
     cfg = ModelConfig.from_gguf_metadata(loader.metadata, verbose=True)
-    runtime_plan = build_runtime_plan(adamah_mod, loader, cfg, ADAMEngine)
+    runtime_plan = build_runtime_plan(adamah_mod, loader, cfg, ADAMEngine, startup=startup)
     print_runtime_plan(runtime_plan)
 
     if runtime_plan["stream_load"]:
@@ -971,7 +1092,7 @@ def _build_reasoning_draft(engine, tokenizer, cfg, GenConfig, history,
     return draft or None, trace
 
 
-def chat_loop(engine, tokenizer, cfg, GenConfig):
+def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
     """Main interactive chat loop."""
     # Collect EOS token IDs: the main EOS plus any type-3 "end-of-turn" specials.
     # Gemma3 ends turns with <end_of_turn> (token 106) before <eos> (token 1).
@@ -980,10 +1101,13 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
     for tok_str, tok_id in tokenizer._specials.items():
         if 'end' in tok_str.lower() or 'eot' in tok_str.lower():
             eos_ids.add(tok_id)
-    gen_cfg = GenConfig(max_tokens=128, temperature=0.7, top_k=40, top_p=0.95, seed=42,
+    startup = startup or {}
+    gen_cfg = GenConfig(max_tokens=int(startup.get("max_tokens", 256)), temperature=float(startup.get("temperature", 0.7)),
+                        top_k=int(startup.get("top_k", 40)), top_p=float(startup.get("top_p", 0.95)),
+                        repeat_penalty=float(startup.get("repeat_penalty", 1.08)), seed=42,
                         eos_token_ids=tuple(eos_ids))
     history = []
-    reasoning_cycles = _reasoning_cycles_from_env()
+    reasoning_cycles = int(startup.get("reasoning_cycles", _reasoning_cycles_from_env()))
     reasoning_trace = _reasoning_trace_from_env()
     decode_trace = bool(getattr(engine, "_trace_decode", False))
     context_compaction = bool(_env_flag("ADAM_CONTEXT_COMPACTION", True))
@@ -1201,8 +1325,11 @@ def main():
 
     models = scan_models()
     model_path = select_model(models)
-    engine, tokenizer, cfg, GenConfig = load_model(model_path)
-    chat_loop(engine, tokenizer, cfg, GenConfig)
+    startup = {}
+    if sys.stdin.isatty() and not _env_flag("ADAM_CHAT_NO_SETUP", False):
+        startup = prompt_startup_config(model_info_short(model_path))
+    engine, tokenizer, cfg, GenConfig = load_model(model_path, startup=startup)
+    chat_loop(engine, tokenizer, cfg, GenConfig, startup=startup)
 
 if __name__ == '__main__':
     main()
