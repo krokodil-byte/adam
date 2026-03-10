@@ -3075,6 +3075,13 @@ static int init_pipelines(void) {
       strncpy(ctx.shader_path, paths[i], 511);
       break;
     }
+    snprintf(test, sizeof(test), "%s/f32/map_op1.spv", paths[i]);
+    f = fopen(test, "rb");
+    if (f) {
+      fclose(f);
+      snprintf(ctx.shader_path, sizeof(ctx.shader_path), "%s/f32", paths[i]);
+      break;
+    }
   }
 
   if (!ctx.shader_path[0]) {
@@ -3278,8 +3285,18 @@ static int init_dtype_pipelines(uint32_t dtype) {
   strncpy(saved_path, ctx.shader_path, 511);
   saved_path[511] = '\0';
 
+  char base_path[512];
+  strncpy(base_path, saved_path, 511);
+  base_path[511] = '\0';
+  size_t base_len = strlen(base_path);
+  if (base_len >= 4 &&
+      (strcmp(base_path + base_len - 4, "/f32") == 0 ||
+       strcmp(base_path + base_len - 4, "\\f32") == 0)) {
+    base_path[base_len - 4] = '\0';
+  }
+
   char dtype_path[600];
-  snprintf(dtype_path, sizeof(dtype_path), "%s/%s", saved_path,
+  snprintf(dtype_path, sizeof(dtype_path), "%s/%s", base_path,
            dtype_names[dtype]);
 
   // Check if dtype shaders exist
