@@ -1,7 +1,9 @@
 #version 450
 
-#ifdef ADAMAH_PROFILE_BROADCOM_V3DV
+#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
 #define WG_SIZE 32
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+#define WG_SIZE 64
 #else
 #define WG_SIZE 128
 #endif

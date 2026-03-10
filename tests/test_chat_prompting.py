@@ -8,7 +8,16 @@ for p in [ROOT, os.path.join(ROOT, "adamah-MAIN")]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from adamah_chat import prepare_chat_prompt, prepare_chat_messages
+from adamah_chat import (
+    _auto_compaction_enabled,
+    _build_compaction_seed_message,
+    _build_reasoning_request,
+    _build_session_system_prompt,
+    _reasoning_enabled,
+    _reasoning_stage_name,
+    prepare_chat_prompt,
+    prepare_chat_messages,
+)
 
 
 class DummyTokenizer:
@@ -58,6 +67,31 @@ def main():
     assert "<|user|>\nhow are you?</s>" in convo
     assert convo.rstrip().endswith("<|assistant|>")
     assert add_bos is True
+
+    assert _build_session_system_prompt() is None
+    assert _build_session_system_prompt("remember this") == (
+        "Use the following working notes privately to answer the user's latest message. "
+        "Do not mention the notes themselves unless the user explicitly asks for them.\n\n"
+        "Working notes for the next reply:\nremember this"
+    )
+    seed = _build_compaction_seed_message("goal: ship the app")
+    assert seed["role"] == "system"
+    assert "Context from a previous conversation:" in seed["content"]
+    assert "goal: ship the app" in seed["content"]
+    assert _reasoning_stage_name(0, 4) == "task framing"
+    assert _reasoning_stage_name(1, 4) == "answer plan"
+    assert _reasoning_stage_name(3, 4) == "final polish"
+    req0 = _build_reasoning_request("write a reply", "User: hi", None, 0, 3)
+    assert "User request:\nwrite a reply" in req0
+    assert "Recent conversation context:\nUser: hi" in req0
+    assert "Return notes only." in req0
+    req1 = _build_reasoning_request("write a reply", "User: hi", "draft v1", 1, 3)
+    assert "Current working notes:\ndraft v1" in req1
+    assert "Focus:" in req1
+    assert _reasoning_enabled(0) is False
+    assert _reasoning_enabled(3) is True
+    assert _auto_compaction_enabled(True, 0) is True
+    assert _auto_compaction_enabled(True, 2) is True
 
     print("PASS adaptive chat template rendering")
     return 0

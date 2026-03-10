@@ -28,7 +28,9 @@ def shader_compile_args():
     profile = get_shader_profile()
     args = []
     if profile == 'broadcom_v3dv':
-        args.append('-DADAMAH_PROFILE_BROADCOM_V3DV=1')
+        args.append('-DADAMAH_PROFILE_BROADCOM_V3DV_BALANCED=1')
+    elif profile == 'broadcom_v3dv_narrow':
+        args.append('-DADAMAH_PROFILE_BROADCOM_V3DV_NARROW=1')
     return args
 
 

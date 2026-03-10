@@ -1,8 +1,11 @@
 #version 450
 
-#ifdef ADAMAH_PROFILE_BROADCOM_V3DV
+#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
 #define WG_SIZE 32
 #define TILE_K 64
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+#define WG_SIZE 64
+#define TILE_K 128
 #else
 #define WG_SIZE 128
 #define TILE_K 128

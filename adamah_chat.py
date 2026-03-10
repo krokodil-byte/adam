@@ -158,16 +158,12 @@ def _mb_str(value_bytes):
     return f"{int(value_bytes) / (1024 * 1024):.0f}MB"
 
 
-def _build_session_system_prompt(memory_summary: str | None,
-                                 reasoning_notes: str | None = None) -> str | None:
+def _build_session_system_prompt(reasoning_notes: str | None = None) -> str | None:
     parts = []
-    if memory_summary:
-        parts.append(
-            "Conversation memory summary:\n"
-            f"{memory_summary.strip()}"
-        )
     if reasoning_notes:
         parts.append(
+            "Use the following working notes privately to answer the user's latest message. "
+            "Do not mention the notes themselves unless the user explicitly asks for them.\n\n"
             "Working notes for the next reply:\n"
             f"{reasoning_notes.strip()}"
         )
@@ -181,6 +177,119 @@ def _reasoning_cycles_from_env() -> int:
     if value is not None:
         return max(0, int(value))
     return 2 if _env_flag("ADAM_REASONING", False) else 0
+
+
+def _reasoning_trace_from_env() -> bool:
+    return bool(_env_flag("ADAM_REASONING_TRACE", False))
+
+
+def _reasoning_enabled(reasoning_cycles: int) -> bool:
+    return reasoning_cycles > 0
+
+
+def _auto_compaction_enabled(configured: bool, reasoning_cycles: int) -> bool:
+    return configured
+
+
+def _is_compaction_seed_message(msg: dict) -> bool:
+    return (
+        msg.get("role") == "system"
+        and isinstance(msg.get("content"), str)
+        and msg["content"].startswith("Context from a previous conversation:")
+    )
+
+
+def _build_compaction_seed_message(summary: str) -> dict:
+    return {
+        "role": "system",
+        "content": (
+            "Context from a previous conversation:\n"
+            f"{summary.strip()}\n\n"
+            "You are continuing the same conversation. Use this summary as background "
+            "context and answer the user's next messages naturally."
+        ),
+    }
+
+
+def _history_to_transcript(history) -> str:
+    transcript = []
+    for msg in history:
+        role = msg.get("role", "user").capitalize()
+        transcript.append(f"{role}: {msg.get('content', '').strip()}")
+    return "\n".join(transcript).strip()
+
+
+def _reasoning_stage_name(cycle_idx: int, total_cycles: int) -> str:
+    if cycle_idx == 0:
+        return "task framing"
+    if cycle_idx + 1 == total_cycles:
+        return "final polish"
+    if cycle_idx == 1:
+        return "answer plan"
+    return "refinement"
+
+
+def _build_reasoning_request(user_prompt: str, context_text: str,
+                             draft: str | None, cycle_idx: int,
+                             total_cycles: int) -> str:
+    stage = _reasoning_stage_name(cycle_idx, total_cycles)
+    base = [f"User request:\n{user_prompt.strip()}"]
+    if context_text:
+        base.append(f"Recent conversation context:\n{context_text}")
+
+    if cycle_idx == 0 or not draft:
+        base.append(
+            "Create compact working notes for the next reasoning pass. "
+            "Capture the task, hard constraints, likely answer shape, and the main risks. "
+            "Do not answer the user directly. Return notes only."
+        )
+        return "\n\n".join(base)
+
+    focus = {
+        "answer plan": (
+            "Transform the notes into a stronger answer plan. Keep the strongest points, "
+            "remove fluff, and make the structure easier for the next pass to use."
+        ),
+        "refinement": (
+            "Improve these notes for the next pass. Fix weak parts, tighten logic, "
+            "remove repetition, and preserve only what helps the final answer."
+        ),
+        "final polish": (
+            "Polish these notes into the smallest useful answer blueprint. "
+            "Keep them sharp, concrete, and ready for a direct final response."
+        ),
+    }[stage]
+    base.append(f"Current working notes:\n{draft.strip()}")
+    base.append(f"Improve the notes. Focus: {focus}\nReturn notes only.")
+    return "\n\n".join(base)
+
+
+def _build_reasoning_context_text(history, user_prompt: str) -> str:
+    convo = list(history) + [{"role": "user", "content": user_prompt}]
+    return _history_to_transcript(convo)
+
+
+def _run_reasoning_stage(engine, tokenizer, cfg, GenConfig, instruction: str,
+                         seed=None, temperature: float = 0.2,
+                         max_tokens: int = 128) -> str:
+    prompt, add_bos = prepare_chat_messages(
+        [{"role": "user", "content": instruction}],
+        cfg.arch,
+        tokenizer,
+        chat_template=getattr(cfg, "chat_template", None),
+        system_prompt=None,
+    )
+    tokens = tokenizer.encode(prompt, add_bos=add_bos)
+    scratch_cfg = GenConfig(
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_k=20,
+        top_p=0.9,
+        seed=seed,
+        eos_token_ids=(tokenizer.eos_id,),
+    )
+    out_tokens, _ = engine.generate(tokens, scratch_cfg, stream=False)
+    return tokenizer.decode(out_tokens).strip()
 
 
 def _runtime_profile_overrides(profile_name, cfg, unified):
@@ -202,6 +311,30 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
     if name == "broadcom_v3dv":
         return {
             "name": "broadcom_v3dv",
+            "reserve_ratio": 0.15,
+            "kv_cap_max": 256,
+            "stream_load": True,
+            "stream_chunk_mb": 8,
+            "gpu_approx_rerank": False,
+            "gpu_fused_rows_per_group": 256,
+            "pool_hot_mb_max": 64,
+            "pool_cold_mb_max": 32,
+        }
+    if name == "broadcom_v3dv_approx":
+        return {
+            "name": "broadcom_v3dv_approx",
+            "reserve_ratio": 0.15,
+            "kv_cap_max": 256,
+            "stream_load": True,
+            "stream_chunk_mb": 8,
+            "gpu_approx_rerank": cfg.n_vocab >= 131072,
+            "gpu_fused_rows_per_group": 128,
+            "pool_hot_mb_max": 64,
+            "pool_cold_mb_max": 32,
+        }
+    if name == "broadcom_v3dv_narrow":
+        return {
+            "name": "broadcom_v3dv_narrow",
             "reserve_ratio": 0.15,
             "kv_cap_max": 256,
             "stream_load": True,
@@ -482,8 +615,9 @@ def print_help():
   {CYAN}/info{RESET}    — Show model info
   {CYAN}/reset{RESET}   — Clear chat history and KV cache
   {CYAN}/clear{RESET}   — Alias for /reset
-  {CYAN}/compact{RESET} — Summarize old history into compact memory
+  {CYAN}/compact{RESET} — Roll history into one carry-over summary
   {CYAN}/reason N{RESET} — Set reasoning refinement cycles (e.g. /reason 3, /reason off)
+  {CYAN}/reasonshow on|off{RESET} — Show reasoning passes in dim text
   {CYAN}/temp N{RESET}  — Set temperature (e.g. /temp 0.7)
   {CYAN}/topk N{RESET}  — Set top-k (e.g. /topk 40)
   {CYAN}/topp P{RESET}  — Set top-p (e.g. /topp 0.95)
@@ -689,21 +823,23 @@ def _trim_messages_to_fit(engine, tokenizer, cfg, messages, gen_cfg, system_prom
 
 
 def _summarize_history(engine, tokenizer, cfg, GenConfig, history, seed=None):
-    transcript = []
-    for msg in history:
-        role = msg.get("role", "user").capitalize()
-        transcript.append(f"{role}: {msg.get('content', '').strip()}")
-    transcript_text = "\n".join(transcript).strip()
-    if not transcript_text:
+    if not history:
         return None
 
     summary_request = (
-        "Summarize this conversation into a compact memory for future turns. "
-        "Keep only durable facts: user goals, preferences, constraints, decisions, "
-        "and unresolved tasks. Omit filler. Return plain text only.\n\n"
-        f"{transcript_text}"
+        "Summarize the conversation above into a compact carry-over context for the next chat window. "
+        "Keep only durable facts: goals, preferences, constraints, decisions, and unresolved tasks. "
+        "Omit filler and transient phrasing. Return plain text only."
     )
-    summary_messages = [{"role": "user", "content": summary_request}]
+    summary_messages = list(history) + [{"role": "user", "content": summary_request}]
+    summary_cfg = GenConfig(
+        max_tokens=192,
+        temperature=0.2,
+        top_k=20,
+        top_p=0.9,
+        seed=seed,
+        eos_token_ids=(tokenizer.eos_id,),
+    )
     prompt, add_bos = prepare_chat_messages(
         summary_messages,
         cfg.arch,
@@ -715,72 +851,86 @@ def _summarize_history(engine, tokenizer, cfg, GenConfig, history, seed=None):
         ),
     )
     tokens = tokenizer.encode(prompt, add_bos=add_bos)
-    summary_cfg = GenConfig(
-        max_tokens=192,
-        temperature=0.2,
-        top_k=20,
-        top_p=0.9,
-        seed=seed,
-        eos_token_ids=(tokenizer.eos_id,),
-    )
+    kv_cap = getattr(engine, "_kv_cap", 0)
+    if kv_cap > 0 and len(tokens) + summary_cfg.max_tokens > kv_cap:
+        transcript_text = _history_to_transcript(history)
+        if not transcript_text:
+            return None
+        prompt, add_bos = prepare_chat_messages(
+            [{
+                "role": "user",
+                "content": (
+                    "Summarize the conversation below into a compact carry-over context for the next chat window. "
+                    "Keep only durable facts: goals, preferences, constraints, decisions, and unresolved tasks. "
+                    "Omit filler and transient phrasing. Return plain text only.\n\n"
+                    f"{transcript_text}"
+                ),
+            }],
+            cfg.arch,
+            tokenizer,
+            chat_template=getattr(cfg, "chat_template", None),
+            system_prompt=(
+                "You compress chat history into short reusable memory. "
+                "Be faithful and concise."
+            ),
+        )
+        tokens = tokenizer.encode(prompt, add_bos=add_bos)
     out_tokens, _ = engine.generate(tokens, summary_cfg, stream=False)
     text = tokenizer.decode(out_tokens).strip()
     return text or None
 
 
 def _build_reasoning_draft(engine, tokenizer, cfg, GenConfig, history,
-                           memory_summary, user_prompt, cycles, seed=None):
+                           user_prompt, cycles, seed=None):
     if cycles <= 0:
-        return None
+        return None, []
 
-    recent = []
-    for msg in history[-4:]:
-        role = msg.get("role", "user").capitalize()
-        content = msg.get("content", "").strip()
-        if content:
-            recent.append(f"{role}: {content[:400]}")
-    context_text = "\n".join(recent).strip()
-    base_system = _build_session_system_prompt(memory_summary)
-
+    context_text = _build_reasoning_context_text(history, user_prompt)
     draft = None
+    trace = []
     for i in range(int(cycles)):
-        if i == 0 or not draft:
-            req = (
-                f"User request:\n{user_prompt.strip()}\n\n"
-                "Write short working notes that help answer the request well. "
-                "Do not answer the user directly. Return notes only."
-            )
-            if context_text:
-                req += f"\n\nRecent conversation context:\n{context_text}"
-        else:
-            req = (
-                f"User request:\n{user_prompt.strip()}\n\n"
-                f"Current working notes:\n{draft}\n\n"
-                "Refine and improve these notes. Fix mistakes, sharpen weak parts, "
-                "and keep them concise. Return notes only."
-            )
+        summary_req = (
+            f"Conversation transcript:\n{context_text}\n\n"
+            "Write a compact working summary for answering the latest user message. "
+            "Keep only the task, constraints, useful prior context, and likely answer direction. "
+            "Do not answer the user directly. Return notes only."
+        )
+        if draft:
+            summary_req += f"\n\nPrevious refined notes:\n{draft}"
+        summary = _run_reasoning_stage(
+            engine, tokenizer, cfg, GenConfig, summary_req, seed=seed, max_tokens=128
+        )
+        if not summary:
+            break
+        trace.append((f"cycle {i + 1}: summary", summary))
 
-        prompt, add_bos = prepare_chat_messages(
-            [{"role": "user", "content": req}],
-            cfg.arch,
-            tokenizer,
-            chat_template=getattr(cfg, "chat_template", None),
-            system_prompt=base_system,
+        critique_req = (
+            f"User request:\n{user_prompt.strip()}\n\n"
+            f"Working summary:\n{summary}\n\n"
+            "Critique these notes. Find weak assumptions, missing constraints, unclear steps, "
+            "or likely failure points. Return concise critique notes only."
         )
-        tokens = tokenizer.encode(prompt, add_bos=add_bos)
-        scratch_cfg = GenConfig(
-            max_tokens=96,
-            temperature=0.2,
-            top_k=20,
-            top_p=0.9,
-            seed=seed,
-            eos_token_ids=(tokenizer.eos_id,),
+        critique = _run_reasoning_stage(
+            engine, tokenizer, cfg, GenConfig, critique_req, seed=seed, max_tokens=96
         )
-        out_tokens, _ = engine.generate(tokens, scratch_cfg, stream=False)
-        draft = tokenizer.decode(out_tokens).strip()
+        if not critique:
+            break
+        trace.append((f"cycle {i + 1}: critique", critique))
+
+        refine_req = (
+            f"User request:\n{user_prompt.strip()}\n\n"
+            f"Working summary:\n{summary}\n\n"
+            f"Critique:\n{critique}\n\n"
+            "Produce improved working notes for the final answer. "
+            "Keep them concise, concrete, and immediately usable. Return notes only."
+        )
+        draft = _run_reasoning_stage(
+            engine, tokenizer, cfg, GenConfig, refine_req, seed=seed, max_tokens=128
+        )
         if not draft:
             break
-    return draft or None
+        trace.append((f"cycle {i + 1}: refine", draft))
+    return draft or None, trace
 
 
 def chat_loop(engine, tokenizer, cfg, GenConfig):
@@ -795,8 +945,8 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
     gen_cfg = GenConfig(max_tokens=128, temperature=0.7, top_k=40, top_p=0.95, seed=42,
                         eos_token_ids=tuple(eos_ids))
     history = []
-    memory_summary = None
     reasoning_cycles = _reasoning_cycles_from_env()
+    reasoning_trace = _reasoning_trace_from_env()
     context_compaction = bool(_env_flag("ADAM_CONTEXT_COMPACTION", True))
 
     print(f"\n{GREEN}Ready!{RESET} Type {CYAN}/help{RESET} for commands.\n")
@@ -827,9 +977,16 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                 print(f"  FF: {cfg.n_ff}, Vocab: {cfg.n_vocab}")
                 print(f"  Context: {cfg.n_ctx}, RoPE base: {cfg.rope_base_global}")
                 print(f"  Conversation messages: {len(history)}")
-                print(f"  Memory summary: {'yes' if memory_summary else 'no'}")
+                print(
+                    f"  Compacted carry-over: "
+                    f"{'yes' if history and _is_compaction_seed_message(history[0]) else 'no'}"
+                )
                 print(f"  Reasoning cycles: {reasoning_cycles}")
-                print(f"  Context compaction: {'on' if context_compaction else 'off'}")
+                print(f"  Reasoning trace: {'on' if reasoning_trace else 'off'}")
+                print(
+                    f"  Context compaction: "
+                    f"{'on' if _auto_compaction_enabled(context_compaction, reasoning_cycles) else 'off'}"
+                )
                 print(f"{BOLD}Gen config:{RESET} temp={gen_cfg.temperature}, max={gen_cfg.max_tokens}, top_k={gen_cfg.top_k}, top_p={gen_cfg.top_p}, repeat={gen_cfg.repeat_penalty}, seed={gen_cfg.seed}")
                 mode = ("gpu_approx_rerank" if getattr(engine, "_gpu_approx_rerank", False)
                         else "gpu_fused_topk")
@@ -837,7 +994,6 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                 print(f"{BOLD}GPU path:{RESET} {mode} rows_per_group={rows}")
             elif cmd[0] in ('/reset', '/clear'):
                 history.clear()
-                memory_summary = None
                 engine.reset()
                 print(f"{YELLOW}Chat history and KV cache cleared.{RESET}")
             elif cmd[0] == '/compact':
@@ -846,10 +1002,9 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                 else:
                     summary = _summarize_history(engine, tokenizer, cfg, GenConfig, history, seed=gen_cfg.seed)
                     if summary:
-                        memory_summary = summary
-                        history = []
+                        history = [_build_compaction_seed_message(summary)]
                         engine.reset()
-                        print(f"{GREEN}Conversation compacted into memory summary.{RESET}")
+                        print(f"{GREEN}Conversation compacted into carry-over summary.{RESET}")
                     else:
                         print(f"{RED}Compaction failed to produce a summary.{RESET}")
             elif cmd[0] == '/reason' and len(cmd) > 1:
@@ -866,6 +1021,16 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                         print(f"{GREEN}Reasoning cycles → {reasoning_cycles}{RESET}")
                     except ValueError:
                         print(f"{RED}Usage: /reason 3  or  /reason off{RESET}")
+            elif cmd[0] == '/reasonshow' and len(cmd) > 1:
+                value = cmd[1].lower()
+                if value in ('on', '1', 'true'):
+                    reasoning_trace = True
+                    print(f"{GREEN}Reasoning trace → on{RESET}")
+                elif value in ('off', '0', 'false'):
+                    reasoning_trace = False
+                    print(f"{GREEN}Reasoning trace → off{RESET}")
+                else:
+                    print(f"{RED}Usage: /reasonshow on  or  /reasonshow off{RESET}")
             elif cmd[0] == '/temp' and len(cmd) > 1:
                 try:
                     gen_cfg.temperature = float(cmd[1])
@@ -906,33 +1071,35 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                 print(f"{RED}Unknown command. Type /help{RESET}")
             continue
 
-        system_prompt = _build_session_system_prompt(memory_summary)
+        system_prompt = None
         pending_messages = history + [{"role": "user", "content": prompt}]
         pending_messages, templated, add_bos, tokens, dropped = _trim_messages_to_fit(
             engine, tokenizer, cfg, pending_messages, gen_cfg, system_prompt=system_prompt
         )
-        if dropped and context_compaction and history:
+        if dropped and _auto_compaction_enabled(context_compaction, reasoning_cycles) and history:
             try:
                 summary = _summarize_history(engine, tokenizer, cfg, GenConfig, history, seed=gen_cfg.seed)
             except Exception:
                 summary = None
             if summary:
-                memory_summary = summary
-                history = []
+                history = [_build_compaction_seed_message(summary)]
                 engine.reset()
-                system_prompt = _build_session_system_prompt(memory_summary)
                 pending_messages = history + [{"role": "user", "content": prompt}]
                 pending_messages, templated, add_bos, tokens, dropped = _trim_messages_to_fit(
                     engine, tokenizer, cfg, pending_messages, gen_cfg, system_prompt=system_prompt
                 )
-                print(f"{DIM}[context compacted into memory summary]{RESET}")
-        if reasoning_cycles > 0:
-            draft = _build_reasoning_draft(
-                engine, tokenizer, cfg, GenConfig, history, memory_summary,
+                print(f"{DIM}[context compacted into carry-over summary]{RESET}")
+        if _reasoning_enabled(reasoning_cycles):
+            draft, reasoning_steps = _build_reasoning_draft(
+                engine, tokenizer, cfg, GenConfig, history,
                 prompt, reasoning_cycles, seed=gen_cfg.seed,
             )
             if draft:
-                system_prompt = _build_session_system_prompt(memory_summary, draft)
+                if reasoning_trace:
+                    for idx, (stage, notes) in enumerate(reasoning_steps, 1):
+                        print(f"{DIM}[reason {idx}/{reasoning_cycles} | {stage}]{RESET}")
+                        print(f"{DIM}{notes}{RESET}")
+                system_prompt = _build_session_system_prompt(draft)
                 pending_messages, templated, add_bos, tokens, dropped_after_reason = _trim_messages_to_fit(
                     engine, tokenizer, cfg, pending_messages, gen_cfg, system_prompt=system_prompt
                 )
