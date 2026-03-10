@@ -1451,6 +1451,9 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
                     f"sample {trace_summary.get('sample_ms_avg', 0.0):.2f}ms | "
                     f"forward {trace_summary.get('forward_ms_avg', 0.0):.2f}ms | "
                     f"lm_head {trace_summary.get('lm_head_ms_avg', 0.0):.2f}ms | "
+                    f"core_batch {trace_summary.get('core_batch_ms_avg', 0.0):.2f}ms | "
+                    f"lm_batch {trace_summary.get('lm_head_batch_ms_avg', 0.0):.2f}ms | "
+                    f"rerank {trace_summary.get('rerank_batch_ms_avg', 0.0):.2f}ms | "
                     f"attn {trace_summary.get('attn_ms_avg', 0.0):.2f}ms | "
                     f"ffn {trace_summary.get('ffn_ms_avg', 0.0):.2f}ms]{RESET}\n"
                 )

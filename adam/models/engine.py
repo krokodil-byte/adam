@@ -1848,11 +1848,13 @@ class ADAMEngine:
             g.scatter(ws_id, self._lo_locs, logits_cpu)
 
         if not return_logits:
-            self.timing['lm_head'] += time.perf_counter() - t0
+            if not trace_split:
+                self.timing['lm_head'] += time.perf_counter() - t0
             return None
 
         logits = g.gather(ws_id, self._lo_locs).view(np.float32)
-        self.timing['lm_head'] += time.perf_counter() - t0
+        if not trace_split:
+            self.timing['lm_head'] += time.perf_counter() - t0
         return logits
 
     # ============================================================
