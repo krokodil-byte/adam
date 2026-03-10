@@ -20,6 +20,7 @@ from adamah_chat import (
     _max_tokens_soft_cap,
     _reasoning_enabled,
     _reasoning_stage_name,
+    _resolve_runtime_profile_name,
     _runtime_preset_defaults,
     _runtime_profile_overrides,
     prepare_chat_prompt,
@@ -82,9 +83,11 @@ def main():
         "Do not mention the notes themselves unless the user explicitly asks for them.\n\n"
         "Working notes for the next reply:\nremember this"
     )
+    assert _runtime_preset_defaults("fast")["runtime_mode"] == "fast"
+    assert _runtime_preset_defaults("trace")["trace_decode"] is True
     assert _runtime_preset_defaults("desktop_long")["kv_cap"] == 16384
     assert _runtime_preset_defaults("broadcom_fast")["kv_cap"] == 256
-    assert _runtime_preset_defaults("broadcom_trace")["runtime_profile"] == "broadcom_v3dv_trace"
+    assert _runtime_preset_defaults("broadcom_trace")["runtime_profile"] == "broadcom_v3dv"
     assert _max_tokens_soft_cap(256) == 128
     assert _max_tokens_hard_cap(256) == 224
     assert _clamp_default_max_tokens(256, 256) == 128
@@ -137,11 +140,14 @@ def main():
     assert trace_summary["step_ms_avg"] == 12.0
     assert trace_summary["sample_ms_avg"] == 3.0
     assert trace_summary["attn_ms_avg"] == 4.0
-    small_prof = _runtime_profile_overrides("broadcom_v3dv", ModelConfig(), unified=True)
+    assert _resolve_runtime_profile_name("default", unified=False) == "default"
+    assert _resolve_runtime_profile_name("default", unified=True) == "broadcom_v3dv"
+    assert _resolve_runtime_profile_name("trace", unified=True) == "broadcom_v3dv"
+    small_prof = _runtime_profile_overrides("default", ModelConfig(), unified=True)
     assert small_prof["gpu_approx_rerank"] is False
     assert small_prof["gpu_fused_rows_per_group"] == 128
     gemma_prof = _runtime_profile_overrides(
-        "broadcom_v3dv",
+        "default",
         ModelConfig(n_vocab=262144),
         unified=True,
     )

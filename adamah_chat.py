@@ -34,11 +34,8 @@ BOX_TL = "╔"; BOX_TR = "╗"; BOX_BL = "╚"; BOX_BR = "╝"
 BOX_H = "═"; BOX_V = "║"
 FAST_LM_ROWS_PER_GROUP = 256
 RUNTIME_PRESET_CHOICES = [
-    ("auto", "Auto"),
-    ("desktop_long", "Desktop long context"),
-    ("broadcom_fast", "Broadcom fast"),
-    ("broadcom_trace", "Broadcom trace"),
-    ("broadcom_exact", "Broadcom exact"),
+    ("fast", "Fast (auto)"),
+    ("trace", "Trace (auto)"),
 ]
 GEN_PRESET_CHOICES = [
     ("balanced", "Balanced"),
@@ -96,15 +93,24 @@ def _prompt_int_optional(prompt: str, default=None, minimum=None):
 
 def _runtime_preset_defaults(name: str) -> dict:
     name = (name or "auto").strip().lower()
+    if name in ("fast", "auto", "default"):
+        return {"runtime_mode": "fast"}
+    if name == "trace":
+        return {"runtime_mode": "trace", "trace_decode": True}
     if name == "desktop_long":
-        return {"runtime_profile": "default", "kv_cap": 16384}
+        return {"runtime_mode": "fast", "kv_cap": 16384}
     if name == "broadcom_fast":
-        return {"runtime_profile": "broadcom_v3dv", "kv_cap": 256}
+        return {"runtime_mode": "fast", "runtime_profile": "broadcom_v3dv", "kv_cap": 256}
     if name == "broadcom_trace":
-        return {"runtime_profile": "broadcom_v3dv_trace", "trace_decode": True, "kv_cap": 256}
+        return {
+            "runtime_mode": "trace",
+            "runtime_profile": "broadcom_v3dv",
+            "trace_decode": True,
+            "kv_cap": 256,
+        }
     if name == "broadcom_exact":
-        return {"runtime_profile": "broadcom_v3dv_exact", "kv_cap": 256}
-    return {"runtime_profile": "default"}
+        return {"runtime_mode": "fast", "runtime_profile": "broadcom_v3dv_exact", "kv_cap": 256}
+    return {"runtime_mode": "fast"}
 
 
 def _gen_preset_defaults(name: str) -> dict:
@@ -160,7 +166,7 @@ def prompt_startup_config(model_info: dict | None = None) -> dict:
         arch = model_info.get("arch", "?")
         name = model_info.get("model_name", model_info.get("name", "model"))
         print(f"{DIM}{name} | {arch} | {model_info.get('size_gb', 0.0):.1f}GB{RESET}")
-    runtime_preset = _choose_preset("Runtime preset", RUNTIME_PRESET_CHOICES, "auto")
+    runtime_preset = _choose_preset("Runtime preset", RUNTIME_PRESET_CHOICES, "fast")
     runtime = _runtime_preset_defaults(runtime_preset)
     gen_preset = _choose_preset("Reply preset", GEN_PRESET_CHOICES, "balanced")
     gen = _gen_preset_defaults(gen_preset)
@@ -178,6 +184,7 @@ def prompt_startup_config(model_info: dict | None = None) -> dict:
     return {
         "runtime_preset": runtime_preset,
         "gen_preset": gen_preset,
+        "runtime_mode": runtime.get("runtime_mode", "fast"),
         "runtime_profile": runtime.get("runtime_profile"),
         "kv_cap": kv_cap,
         "trace_decode": runtime.get("trace_decode"),
@@ -439,8 +446,11 @@ def _run_reasoning_stage(engine, tokenizer, cfg, GenConfig, instruction: str,
 
 def _runtime_profile_overrides(profile_name, cfg, unified):
     name = (profile_name or "").strip().lower()
-    if not name or name in ("default", "auto"):
-        return {"name": "default"}
+    if not name or name in ("default", "auto", "fast"):
+        if unified:
+            name = "broadcom_v3dv"
+        else:
+            return {"name": "default"}
     if name == "unified_small_gpu":
         return {
             "name": "unified_small_gpu",
@@ -521,6 +531,15 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
     return {"name": name}
 
 
+def _resolve_runtime_profile_name(profile_name, unified):
+    name = (profile_name or "").strip().lower()
+    if not name or name in ("default", "auto", "fast"):
+        return "broadcom_v3dv" if unified else "default"
+    if name == "trace":
+        return "broadcom_v3dv" if unified else "default"
+    return name
+
+
 def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
     reserve_ratio = min(max(float(os.environ.get("ADAM_RUNTIME_RESERVE_RATIO", "0.10")), 0.0), 0.5)
     startup = startup or {}
@@ -542,7 +561,9 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
         device = {}
 
     unified = bool(device.get("is_unified_memory")) or arm_like
-    profile_name = startup.get("runtime_profile") or os.environ.get("ADAM_RUNTIME_PROFILE", "default")
+    runtime_mode = (startup.get("runtime_mode") or os.environ.get("ADAM_RUNTIME_MODE") or "fast").strip().lower()
+    requested_profile = startup.get("runtime_profile") or os.environ.get("ADAM_RUNTIME_PROFILE", "")
+    profile_name = _resolve_runtime_profile_name(requested_profile, unified)
     profile = _runtime_profile_overrides(profile_name, cfg, unified)
     if "reserve_ratio" in profile and os.environ.get("ADAM_RUNTIME_RESERVE_RATIO") is None:
         reserve_ratio = float(profile["reserve_ratio"])
@@ -553,7 +574,7 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
         startup["gpu_approx_rerank"] if "gpu_approx_rerank" in startup and startup.get("gpu_approx_rerank") is not None
         else _env_flag("ADAM_GPU_APPROX_RERANK", approx_default)
     )
-    trace_default = profile.get("trace_decode", False)
+    trace_default = bool(profile.get("trace_decode", False) or runtime_mode == "trace")
     trace_decode = bool(
         startup["trace_decode"] if "trace_decode" in startup and startup.get("trace_decode") is not None
         else _env_flag("ADAM_TRACE_DECODE", trace_default)
