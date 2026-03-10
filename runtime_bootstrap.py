@@ -73,6 +73,11 @@ def _compile_shaders(pkg_dir: Path) -> None:
         return
     glslang = shutil.which("glslangValidator")
     if not glslang:
+        if not _has_essential_shaders(pkg_dir):
+            raise RuntimeError(
+                "glslangValidator not found and essential precompiled shaders are missing. "
+                "Install glslang-tools or restore adamah-MAIN/adamah/shaders from git."
+            )
         return
     compile_args = _shader_compile_args()
     profile = _shader_profile() or "default"
@@ -90,6 +95,11 @@ def _compile_shaders(pkg_dir: Path) -> None:
     if f32_dir.is_dir():
         for spv in f32_dir.glob("*.spv"):
             shutil.copy2(spv, root_dir / spv.name)
+    if not _has_essential_shaders(pkg_dir):
+        raise RuntimeError(
+            "Shader compilation finished without producing essential SPIR-V files. "
+            "Expected adamah-MAIN/adamah/shaders/map_op1.spv and shaders/f32/map_op1.spv."
+        )
     SHADER_PROFILE_STAMP.parent.mkdir(parents=True, exist_ok=True)
     SHADER_PROFILE_STAMP.write_text(profile, encoding="utf-8")
 
@@ -227,6 +237,12 @@ def ensure_native_adamah(force_rebuild: bool = False, rebuild_shaders: bool = Fa
         for name in candidates:
             path = pkg_dir / name
             if path.exists():
+                if not _has_essential_shaders(pkg_dir):
+                    raise RuntimeError(
+                        "ADAMAH native library exists but essential shaders are missing. "
+                        "Run `git restore adamah-MAIN/adamah/shaders` or "
+                        "`python install_runtime.py --rebuild-shaders` after installing glslang-tools."
+                    )
                 return path
     _compile_shaders(pkg_dir)
     _sync_root_shader_copies(pkg_dir)

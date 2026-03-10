@@ -41,11 +41,20 @@ def compile_shaders(pkg_dir):
         print("ADAMAH: No shader sources found, using precompiled .spv")
         return True
 
+    root_op1 = os.path.join(pkg_dir, 'shaders', 'map_op1.spv')
+    f32_op1 = os.path.join(pkg_dir, 'shaders', 'f32', 'map_op1.spv')
+    has_essential = os.path.exists(root_op1) and os.path.exists(f32_op1)
+
     glslang = shutil.which('glslangValidator')
     if not glslang:
-        print("WARNING: glslangValidator not found. Using precompiled shaders.")
+        if has_essential:
+            print("WARNING: glslangValidator not found. Using precompiled shaders.")
+            print("  Install with: sudo apt install glslang-tools")
+            return True
+        print("ERROR: glslangValidator not found and essential precompiled shaders are missing.")
         print("  Install with: sudo apt install glslang-tools")
-        return True  # Non-fatal, precompiled .spv should be there
+        print("  Or restore: git restore adamah-MAIN/adamah/shaders")
+        return False
 
     profile = get_shader_profile() or 'default'
     extra_args = shader_compile_args()
@@ -86,6 +95,11 @@ def compile_shaders(pkg_dir):
     profile_stamp = os.path.join(shaders_dir, '.profile')
     with open(profile_stamp, 'w', encoding='utf-8') as f:
         f.write(profile)
+
+    if not (os.path.exists(root_op1) and os.path.exists(f32_op1)):
+        print("ERROR: Shader compilation did not produce essential base SPIR-V files.")
+        print(f"  Missing: {root_op1} or {f32_op1}")
+        return False
 
     return ok
 

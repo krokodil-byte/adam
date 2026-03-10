@@ -136,6 +136,19 @@ def _ensure_base_shader_copies():
             shutil.copy2(src, dst)
 
 
+def _ensure_essential_shaders_present():
+    shader_root = os.path.join(ADAMAH_DIR, "adamah", "shaders")
+    root_op1 = os.path.join(shader_root, "map_op1.spv")
+    f32_op1 = os.path.join(shader_root, "f32", "map_op1.spv")
+    if os.path.exists(root_op1) and os.path.exists(f32_op1):
+        return
+    raise RuntimeError(
+        "Essential ADAMAH shaders are missing. "
+        "Run `git restore adamah-MAIN/adamah/shaders` to restore tracked SPIR-V files, "
+        "or install glslang-tools and run `python install_runtime.py --rebuild-shaders`."
+    )
+
+
 def _gen_preset_defaults(name: str) -> dict:
     name = (name or "balanced").strip().lower()
     if name == "factual":
@@ -786,6 +799,7 @@ def load_model(model_path, startup=None):
     os.environ["ADAMAH_SHADER_PROFILE"] = desired_profile
     os.environ["ADAMAH_SHADER_PATH"] = os.path.join(ADAMAH_DIR, "adamah", "shaders")
     ensure_runtime(rebuild_shaders=(compiled_shader_profile() != desired_profile))
+    _ensure_essential_shaders_present()
     from adam.loaders.gguf import GGUFLoader
     from adam.tokenizers.gguf_tok import GGUFTokenizer
     from adam.models.engine import ADAMEngine, ModelConfig, GenerationConfig
