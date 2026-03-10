@@ -15,9 +15,11 @@ from adamah_chat import (
     _build_session_system_prompt,
     _reasoning_enabled,
     _reasoning_stage_name,
+    _runtime_profile_overrides,
     prepare_chat_prompt,
     prepare_chat_messages,
 )
+from adam.models.engine import ADAMEngine, GenerationConfig, ModelConfig
 
 
 class DummyTokenizer:
@@ -92,6 +94,32 @@ def main():
     assert _reasoning_enabled(3) is True
     assert _auto_compaction_enabled(True, 0) is True
     assert _auto_compaction_enabled(True, 2) is True
+    engine = ADAMEngine.__new__(ADAMEngine)
+    cfg = GenerationConfig(repeat_penalty=1.1)
+    assert engine._repeat_history([1, 2, 3], [], cfg) is None
+    assert engine._repeat_history([1, 2, 3], [7, 8], cfg) == [7, 8]
+    cfg.repeat_on_prompt = True
+    assert engine._repeat_history([1, 2, 3], [7, 8], cfg) == [1, 2, 3, 7, 8]
+    trace_summary = engine._summarize_decode_trace([
+        {
+            "step_ms": 10.0,
+            "sample_ms": 2.0,
+            "forward_ms": 8.0,
+            "timing_ms": {"attn": 3.0, "ffn": 2.0, "lm_head": 1.0},
+        },
+        {
+            "step_ms": 14.0,
+            "sample_ms": 4.0,
+            "forward_ms": 10.0,
+            "timing_ms": {"attn": 5.0, "ffn": 3.0, "lm_head": 2.0},
+        },
+    ])
+    assert trace_summary["step_ms_avg"] == 12.0
+    assert trace_summary["sample_ms_avg"] == 3.0
+    assert trace_summary["attn_ms_avg"] == 4.0
+    prof = _runtime_profile_overrides("broadcom_v3dv_trace", ModelConfig(), unified=True)
+    assert prof["trace_decode"] is True
+    assert prof["gpu_approx_rerank"] is False
 
     print("PASS adaptive chat template rendering")
     return 0

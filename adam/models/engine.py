@@ -20,6 +20,7 @@ from dataclasses import dataclass
 class GenerationConfig:
     max_tokens: int = 128; temperature: float = 0.8; top_k: int = 40
     top_p: float = 0.95; repeat_penalty: float = 1.1; seed: Optional[int] = None
+    repeat_on_prompt: bool = False
     eos_token_ids: tuple = (1,)  # Token IDs that stop generation
 
 @dataclass
@@ -1696,6 +1697,29 @@ class ADAMEngine:
             m = np.zeros_like(p); m[si[:co]] = p[si[:co]]; p = m / m.sum()
         return int(np.random.choice(len(p), p=p))
 
+    def _repeat_history(self, prompt_tokens, generated_tokens, cfg):
+        if cfg.repeat_penalty == 1.0:
+            return None
+        if cfg.repeat_on_prompt:
+            hist = list(prompt_tokens) + list(generated_tokens)
+        else:
+            hist = list(generated_tokens)
+        return hist if hist else None
+
+    def _summarize_decode_trace(self, trace_steps):
+        if not trace_steps:
+            return {}
+        denom = float(len(trace_steps))
+        stage_keys = ('embed', 'norm', 'qkv', 'qk_norm', 'rope', 'attn', 'attn_out', 'ffn', 'lm_head')
+        summary = {
+            'step_ms_avg': sum(t['step_ms'] for t in trace_steps) / denom,
+            'sample_ms_avg': sum(t['sample_ms'] for t in trace_steps) / denom,
+            'forward_ms_avg': sum(t['forward_ms'] for t in trace_steps) / denom,
+        }
+        for key in stage_keys:
+            summary[f'{key}_ms_avg'] = sum(t['timing_ms'].get(key, 0.0) for t in trace_steps) / denom
+        return summary
+
     # ============================================================
     # Generate
     # ============================================================
@@ -1703,6 +1727,7 @@ class ADAMEngine:
         if config is None: config = GenerationConfig()
         if config.seed is not None: np.random.seed(config.seed)
         progress_interval_s = float(kw.get('progress_interval_s', 0.25))
+        trace_decode = bool(kw.get('trace_decode', False))
         gpu_argmax = self._can_gpu_argmax_sample(config)
         gpu_approx_rerank = (not gpu_argmax) and self._can_gpu_approx_rerank_sample(config)
         gpu_fused_topk = ((not gpu_argmax) and (not gpu_approx_rerank) and
@@ -1733,15 +1758,19 @@ class ADAMEngine:
             sample_mode = sampling_mode if (
                 i == last_prompt_idx and
                 sampling_mode in ('gpu_fused_topk', 'gpu_approx_rerank')) else None
+            repeat_prev = self._repeat_history(token_ids, out_tok, config) if sample_mode else None
             logits = self._forward(t, i, return_logits=need_logits,
                                    sample_mode=sample_mode, sample_cfg=config,
-                                   sample_prev=all_tok if sample_mode else None)
+                                   sample_prev=repeat_prev)
         t_pre = time.perf_counter() - tp
 
         td = time.perf_counter(); ttimes = []
         last_progress = td
+        trace_steps = []
         for step in range(config.max_tokens):
             t0 = time.perf_counter()
+            repeat_prev = self._repeat_history(token_ids, out_tok, config)
+            t_sample0 = time.perf_counter()
             if sampling_mode == 'gpu_approx_rerank':
                 nt = self._sample_gpu_approx_rerank(config)
             elif sampling_mode == 'gpu_fused_topk':
@@ -1749,16 +1778,35 @@ class ADAMEngine:
             elif gpu_argmax:
                 nt = self._sample_gpu_argmax()
             elif gpu_topk:
-                nt = self._sample_gpu_topk(config, all_tok)
+                nt = self._sample_gpu_topk(config, repeat_prev)
             else:
-                nt = self._sample(logits, config, all_tok)
+                nt = self._sample(logits, config, repeat_prev)
+            sample_dt = time.perf_counter() - t_sample0
             if nt in config.eos_token_ids: break
             all_tok.append(nt); out_tok.append(nt)
             sample_mode = sampling_mode if sampling_mode in ('gpu_fused_topk', 'gpu_approx_rerank') else None
+            repeat_prev = self._repeat_history(token_ids, out_tok, config) if sample_mode else None
+            timing_before = dict(self.timing) if trace_decode else None
+            t_forward0 = time.perf_counter()
             logits = self._forward(nt, len(token_ids) + step, return_logits=(sampling_mode == 'cpu'),
                                    sample_mode=sample_mode, sample_cfg=config,
-                                   sample_prev=all_tok if sample_mode else None)
+                                   sample_prev=repeat_prev)
+            forward_dt = time.perf_counter() - t_forward0
             dt = time.perf_counter() - t0; ttimes.append(dt)
+            if trace_decode:
+                timing_after = dict(self.timing)
+                delta = {
+                    key: max(0.0, (timing_after.get(key, 0.0) - timing_before.get(key, 0.0))) * 1000.0
+                    for key in timing_after
+                }
+                trace_steps.append({
+                    'step': step,
+                    'token_id': int(nt),
+                    'step_ms': dt * 1000.0,
+                    'sample_ms': sample_dt * 1000.0,
+                    'forward_ms': forward_dt * 1000.0,
+                    'timing_ms': delta,
+                })
             now = time.perf_counter()
             if stream and (now - last_progress >= progress_interval_s or step + 1 == config.max_tokens):
                 sys.stdout.write(f"\r  [{step+1}/{config.max_tokens}] {1/dt:.1f} tok/s")
@@ -1777,6 +1825,8 @@ class ADAMEngine:
             'avg_ms': np.mean(ttimes)*1000 if ttimes else 0,
             'sampling_mode': sampling_mode,
             'timing': dict(self.timing),
+            'trace_summary': self._summarize_decode_trace(trace_steps) if trace_decode else {},
+            'trace_steps': trace_steps if trace_decode else [],
         }
 
     def reset(self):

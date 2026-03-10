@@ -317,6 +317,20 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
             "stream_chunk_mb": 8,
             "gpu_approx_rerank": False,
             "gpu_fused_rows_per_group": 256,
+            "trace_decode": False,
+            "pool_hot_mb_max": 64,
+            "pool_cold_mb_max": 32,
+        }
+    if name == "broadcom_v3dv_exact":
+        return {
+            "name": "broadcom_v3dv_exact",
+            "reserve_ratio": 0.15,
+            "kv_cap_max": 256,
+            "stream_load": True,
+            "stream_chunk_mb": 8,
+            "gpu_approx_rerank": False,
+            "gpu_fused_rows_per_group": 256,
+            "trace_decode": False,
             "pool_hot_mb_max": 64,
             "pool_cold_mb_max": 32,
         }
@@ -329,6 +343,20 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
             "stream_chunk_mb": 8,
             "gpu_approx_rerank": cfg.n_vocab >= 131072,
             "gpu_fused_rows_per_group": 128,
+            "trace_decode": False,
+            "pool_hot_mb_max": 64,
+            "pool_cold_mb_max": 32,
+        }
+    if name == "broadcom_v3dv_trace":
+        return {
+            "name": "broadcom_v3dv_trace",
+            "reserve_ratio": 0.15,
+            "kv_cap_max": 256,
+            "stream_load": True,
+            "stream_chunk_mb": 8,
+            "gpu_approx_rerank": False,
+            "gpu_fused_rows_per_group": 256,
+            "trace_decode": True,
             "pool_hot_mb_max": 64,
             "pool_cold_mb_max": 32,
         }
@@ -341,6 +369,7 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
             "stream_chunk_mb": 8,
             "gpu_approx_rerank": cfg.n_vocab >= 131072,
             "gpu_fused_rows_per_group": 128,
+            "trace_decode": False,
             "pool_hot_mb_max": 64,
             "pool_cold_mb_max": 32,
         }
@@ -380,6 +409,9 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
     )
     approx_rerank = bool(
         _env_flag("ADAM_GPU_APPROX_RERANK", profile.get("gpu_approx_rerank", False))
+    )
+    trace_decode = bool(
+        _env_flag("ADAM_TRACE_DECODE", profile.get("trace_decode", False))
     )
     host_avail = int(host.get("available_bytes") or 0)
     device_free = int(device.get("free_budget_bytes") or device.get("budget_bytes") or device.get("heap_bytes") or 0)
@@ -464,6 +496,7 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls):
         "kv_cap": int(kv_cap),
         "gpu_approx_rerank": approx_rerank,
         "gpu_fused_rows_per_group": int(rows_per_group),
+        "trace_decode": trace_decode,
     }
 
 
@@ -495,7 +528,8 @@ def print_runtime_plan(plan):
           f"stream={'on' if plan.get('stream_load') else 'off'} "
           f"chunk={plan.get('stream_chunk_mb', 0)}MB "
           f"sampler={'approx_rerank' if plan.get('gpu_approx_rerank') else 'exact_fused_topk'} "
-          f"rows={plan.get('gpu_fused_rows_per_group', FAST_LM_ROWS_PER_GROUP)}")
+          f"rows={plan.get('gpu_fused_rows_per_group', FAST_LM_ROWS_PER_GROUP)} "
+          f"trace={'on' if plan.get('trace_decode') else 'off'}")
 
 
 def init_gpu_backend(adamah_mod, runtime_plan=None):
@@ -601,10 +635,13 @@ def load_model(model_path):
         gpu_approx_rerank=runtime_plan["gpu_approx_rerank"],
         gpu_tied_lm_head=True,
     )
+    engine._runtime_profile = runtime_plan["profile"]
+    engine._trace_decode = bool(runtime_plan.get("trace_decode", False))
     sampler_name = ("gpu_approx_rerank" if runtime_plan["gpu_approx_rerank"]
                     else "exact gpu_fused_topk")
     print(f"{GREEN}Chat fast path:{RESET} {sampler_name}, "
-          f"rows_per_group={runtime_plan['gpu_fused_rows_per_group']}, production_mode=on")
+          f"rows_per_group={runtime_plan['gpu_fused_rows_per_group']}, "
+          f"trace={'on' if runtime_plan.get('trace_decode') else 'off'}, production_mode=on")
 
     return engine, tokenizer, cfg, GenerationConfig
 
@@ -618,6 +655,7 @@ def print_help():
   {CYAN}/compact{RESET} — Roll history into one carry-over summary
   {CYAN}/reason N{RESET} — Set reasoning refinement cycles (e.g. /reason 3, /reason off)
   {CYAN}/reasonshow on|off{RESET} — Show reasoning passes in dim text
+  {CYAN}/trace on|off{RESET} — Show per-token decode trace summary
   {CYAN}/temp N{RESET}  — Set temperature (e.g. /temp 0.7)
   {CYAN}/topk N{RESET}  — Set top-k (e.g. /topk 40)
   {CYAN}/topp P{RESET}  — Set top-p (e.g. /topp 0.95)
@@ -947,6 +985,7 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
     history = []
     reasoning_cycles = _reasoning_cycles_from_env()
     reasoning_trace = _reasoning_trace_from_env()
+    decode_trace = bool(getattr(engine, "_trace_decode", False))
     context_compaction = bool(_env_flag("ADAM_CONTEXT_COMPACTION", True))
 
     print(f"\n{GREEN}Ready!{RESET} Type {CYAN}/help{RESET} for commands.\n")
@@ -983,6 +1022,7 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                 )
                 print(f"  Reasoning cycles: {reasoning_cycles}")
                 print(f"  Reasoning trace: {'on' if reasoning_trace else 'off'}")
+                print(f"  Decode trace: {'on' if decode_trace else 'off'}")
                 print(
                     f"  Context compaction: "
                     f"{'on' if _auto_compaction_enabled(context_compaction, reasoning_cycles) else 'off'}"
@@ -991,7 +1031,8 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                 mode = ("gpu_approx_rerank" if getattr(engine, "_gpu_approx_rerank", False)
                         else "gpu_fused_topk")
                 rows = getattr(engine, "_gpu_fused_rows_per_group", FAST_LM_ROWS_PER_GROUP)
-                print(f"{BOLD}GPU path:{RESET} {mode} rows_per_group={rows}")
+                profile = getattr(engine, "_runtime_profile", "default")
+                print(f"{BOLD}GPU path:{RESET} {mode} rows_per_group={rows} profile={profile}")
             elif cmd[0] in ('/reset', '/clear'):
                 history.clear()
                 engine.reset()
@@ -1031,6 +1072,16 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                     print(f"{GREEN}Reasoning trace → off{RESET}")
                 else:
                     print(f"{RED}Usage: /reasonshow on  or  /reasonshow off{RESET}")
+            elif cmd[0] == '/trace' and len(cmd) > 1:
+                value = cmd[1].lower()
+                if value in ('on', '1', 'true'):
+                    decode_trace = True
+                    print(f"{GREEN}Decode trace → on{RESET}")
+                elif value in ('off', '0', 'false'):
+                    decode_trace = False
+                    print(f"{GREEN}Decode trace → off{RESET}")
+                else:
+                    print(f"{RED}Usage: /trace on  or  /trace off{RESET}")
             elif cmd[0] == '/temp' and len(cmd) > 1:
                 try:
                     gen_cfg.temperature = float(cmd[1])
@@ -1111,7 +1162,7 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
         t0 = time.perf_counter()
 
         try:
-            out_tokens, stats = engine.generate(tokens, gen_cfg, stream=False)
+            out_tokens, stats = engine.generate(tokens, gen_cfg, stream=False, trace_decode=decode_trace)
             elapsed = time.perf_counter() - t0
             text = tokenizer.decode(out_tokens)
             history = pending_messages + [{"role": "assistant", "content": text}]
@@ -1128,6 +1179,16 @@ def chat_loop(engine, tokenizer, cfg, GenConfig):
                 f"total {total_tps:.1f} tok/s | prefill {prefill_s:.2f}s | "
                 f"decode {decode_s:.2f}s | {mode}]{RESET}\n"
             )
+            trace_summary = stats.get('trace_summary') or {}
+            if decode_trace and trace_summary:
+                print(
+                    f"{DIM}[trace avg/token: total {trace_summary.get('step_ms_avg', 0.0):.2f}ms | "
+                    f"sample {trace_summary.get('sample_ms_avg', 0.0):.2f}ms | "
+                    f"forward {trace_summary.get('forward_ms_avg', 0.0):.2f}ms | "
+                    f"lm_head {trace_summary.get('lm_head_ms_avg', 0.0):.2f}ms | "
+                    f"attn {trace_summary.get('attn_ms_avg', 0.0):.2f}ms | "
+                    f"ffn {trace_summary.get('ffn_ms_avg', 0.0):.2f}ms]{RESET}\n"
+                )
         except Exception as e:
             print(f"{RED}Error: {e}{RESET}")
             import traceback
