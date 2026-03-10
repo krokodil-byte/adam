@@ -1457,6 +1457,7 @@ class ADAMEngine:
         c = self.cfg; g = self.gpu; ws_id = self.ws_map_id
         q_dim = c.n_head * c.head_dim; k_dim = c.n_head_kv * c.head_dim_kv
         seq_len = pos + 1
+        trace_split = bool(getattr(self, "_trace_decode", False))
 
         # ---- Embedding lookup / prep ----
         t0 = time.perf_counter()
@@ -1626,6 +1627,12 @@ class ADAMEngine:
         self._gpu_rmsnorm(hid_h, 'output_norm.weight', normed_final_h, 1, c.n_embd, c.norm_eps)
         self.timing['norm'] += time.perf_counter() - t0
 
+        if trace_split:
+            t_batch = time.perf_counter()
+            g.batch_end()
+            self.timing['core_batch'] += time.perf_counter() - t_batch
+            g.batch_begin()
+
         # ---- LM head: stays inside batch so we only pay one fence wait ----
         t0 = time.perf_counter()
         lo_h, _ = self._wsh('logits')
@@ -1723,8 +1730,15 @@ class ADAMEngine:
             # multiply on CPU, scatter result.  One gather + one scatter per token.
             pass  # handled after batch_end below
 
-        # ---- End batch: one fence wait for ALL layer + LM-head GPU ops ----
-        g.batch_end()
+        if trace_split:
+            self.timing['lm_head'] += time.perf_counter() - t0
+            t_batch = time.perf_counter()
+            g.batch_end()
+            self.timing['lm_head_batch'] += time.perf_counter() - t_batch
+        else:
+            # ---- End batch: one fence wait for ALL layer + LM-head GPU ops ----
+            g.batch_end()
+            self.timing['lm_head'] += time.perf_counter() - t0
 
         if self._lm_wt_name and sample_mode == 'gpu_approx_rerank':
             shortlist_n = 0
@@ -1762,7 +1776,12 @@ class ADAMEngine:
                                 float(sample_cfg.repeat_penalty),
                             )
                         finally:
-                            g.batch_end()
+                            if trace_split:
+                                t_batch = time.perf_counter()
+                                g.batch_end()
+                                self.timing['rerank_batch'] += time.perf_counter() - t_batch
+                            else:
+                                g.batch_end()
                         self._sample_rerank_n = shortlist_n
                 else:
                     partial_vals = g.gather(
@@ -1809,7 +1828,12 @@ class ADAMEngine:
                                     float(sample_cfg.repeat_penalty),
                                 )
                         finally:
-                            g.batch_end()
+                            if trace_split:
+                                t_batch = time.perf_counter()
+                                g.batch_end()
+                                self.timing['rerank_batch'] += time.perf_counter() - t_batch
+                            else:
+                                g.batch_end()
                         self._sample_rerank_n = shortlist_n
 
         if not self._lm_wt_name:
@@ -1867,7 +1891,10 @@ class ADAMEngine:
         if not trace_steps:
             return {}
         denom = float(len(trace_steps))
-        stage_keys = ('embed', 'norm', 'qkv', 'qk_norm', 'rope', 'attn', 'attn_out', 'ffn', 'lm_head')
+        stage_keys = (
+            'embed', 'norm', 'qkv', 'qk_norm', 'rope', 'attn', 'attn_out',
+            'ffn', 'lm_head', 'core_batch', 'lm_head_batch', 'rerank_batch'
+        )
         summary = {
             'step_ms_avg': sum(t['step_ms'] for t in trace_steps) / denom,
             'sample_ms_avg': sum(t['sample_ms'] for t in trace_steps) / denom,
@@ -2000,4 +2027,4 @@ class ADAMEngine:
     def _reset_timing(self):
         self.timing = {k: 0.0 for k in [
             'embed', 'norm', 'qkv', 'qk_norm', 'rope', 'attn', 'attn_out',
-            'ffn', 'lm_head']}
+            'ffn', 'lm_head', 'core_batch', 'lm_head_batch', 'rerank_batch']}
