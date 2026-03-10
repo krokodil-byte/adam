@@ -1690,13 +1690,17 @@ int adamah_init(void) {
     hot  = 128ull * 1024 * 1024;  // 128 MB
     cold =  64ull * 1024 * 1024;  //  64 MB
   } else if (vram >= 8ull * 1024 * 1024 * 1024) {
-    // 8 GB+ discrete: 25% hot, 12.5% cold
-    hot  = vram / 4;
+    // 8 GB+ discrete: target roughly 75% total allocator budget before staging,
+    // which leaves ~15-20% effective headroom once the shared staging pool is
+    // included.  This is much better aligned with LLM workloads than the old
+    // 2 GB / 1 GB style defaults on 8 GB cards.
+    hot  = (vram * 5ull) / 8ull;  // 62.5%
     cold = vram / 8;
   } else if (vram >= 4ull * 1024 * 1024 * 1024) {
-    // 4-8 GB discrete: allocate ~2 GB hot, ~1 GB cold
-    hot  = vram / 2;
-    cold = vram / 4;
+    // 4-8 GB discrete: still keep a generous allocator, but with more margin
+    // than the 8 GB+ tier.
+    hot  = (vram * 9ull) / 16ull; // 56.25%
+    cold = vram / 8;              // 12.5%
   } else {
     // <4 GB discrete: conservative
     hot  = 512ull * 1024 * 1024;

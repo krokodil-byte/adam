@@ -275,14 +275,22 @@ def recommend_pool_sizes(working_set_bytes: int = 0,
 
     working_set_bytes = max(0, int(working_set_bytes))
     misc_overhead = 64 * 1024 * 1024
-    headroom = max(0, usable_device - working_set_bytes - misc_overhead)
+    usable_for_pools = max(0, usable_device - misc_overhead)
+    headroom = max(0, usable_for_pools - working_set_bytes)
 
     if unified:
         target_total = min(headroom, 256 * 1024 * 1024)
         target_total = max(target_total, 96 * 1024 * 1024 if headroom >= 96 * 1024 * 1024 else headroom)
     else:
-        target_total = min(headroom // 2 if headroom > 0 else 0, 1024 * 1024 * 1024)
-        target_total = max(target_total, 192 * 1024 * 1024 if headroom >= 192 * 1024 * 1024 else headroom)
+        if working_set_bytes > 0 and usable_for_pools > 0:
+            elasticity = max(256 * 1024 * 1024, min(1024 * 1024 * 1024, working_set_bytes // 6))
+            target_total = min(usable_for_pools, working_set_bytes + elasticity)
+            target_floor = min(usable_for_pools, 1536 * 1024 * 1024)
+            if target_total < target_floor:
+                target_total = target_floor
+        else:
+            target_total = min(usable_for_pools, int(usable_device * 0.75))
+            target_total = max(target_total, min(usable_for_pools, 1024 * 1024 * 1024))
 
     min_hot_mb = 32 if unified else 64
     min_cold_mb = 16 if unified else 32
@@ -290,12 +298,14 @@ def recommend_pool_sizes(working_set_bytes: int = 0,
         hot_bytes = min_hot_mb * 1024 * 1024
         cold_bytes = min_cold_mb * 1024 * 1024
     else:
-        hot_bytes = _align_mb_floor(int(target_total * 0.55), min_hot_mb)
+        hot_ratio = 0.55 if unified else 0.80
+        cold_ratio = 0.25 if unified else 0.20
+        hot_bytes = _align_mb_floor(int(target_total * hot_ratio), min_hot_mb)
         staging = _staging_bytes_for_hot(hot_bytes)
-        cold_budget = max(0, headroom - hot_bytes - staging)
-        cold_bytes = _align_mb_floor(min(int(target_total * 0.25), cold_budget), min_cold_mb)
+        cold_budget = max(0, usable_for_pools - hot_bytes - staging)
+        cold_bytes = _align_mb_floor(min(int(target_total * cold_ratio), cold_budget), min_cold_mb)
 
-        while hot_bytes + cold_bytes + _staging_bytes_for_hot(hot_bytes) > headroom:
+        while hot_bytes + cold_bytes + _staging_bytes_for_hot(hot_bytes) > usable_for_pools:
             if hot_bytes > cold_bytes and hot_bytes > min_hot_mb * 1024 * 1024:
                 hot_bytes -= 16 * 1024 * 1024
             elif cold_bytes > min_cold_mb * 1024 * 1024:
