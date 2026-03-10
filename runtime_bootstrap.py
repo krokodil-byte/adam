@@ -94,6 +94,18 @@ def _compile_shaders(pkg_dir: Path) -> None:
     SHADER_PROFILE_STAMP.write_text(profile, encoding="utf-8")
 
 
+def _sync_root_shader_copies(pkg_dir: Path) -> None:
+    f32_dir = pkg_dir / "shaders" / "f32"
+    root_dir = pkg_dir / "shaders"
+    if not f32_dir.is_dir():
+        return
+    root_dir.mkdir(parents=True, exist_ok=True)
+    for spv in f32_dir.glob("*.spv"):
+        dst = root_dir / spv.name
+        if not dst.exists():
+            shutil.copy2(spv, dst)
+
+
 def _write_shader_header(pkg_dir: Path) -> Path:
     shader_hdr = pkg_dir / "_shader_path.h"
     shader_hdr.write_text(f'#define SHADER_PATH "{pkg_dir / "shaders"}"\n', encoding="utf-8")
@@ -199,14 +211,17 @@ def _build_windows_gnu(pkg_dir: Path, force_rebuild: bool = False) -> Path:
 def ensure_native_adamah(force_rebuild: bool = False, rebuild_shaders: bool = False) -> Path:
     pkg_dir = ADAMAH_PKG
     candidates = ["adamah_opt.dll", "adamah_new.dll", "adamah.dll"] if os.name == "nt" else ["adamah.so"]
+    _sync_root_shader_copies(pkg_dir)
     if rebuild_shaders:
         _compile_shaders(pkg_dir)
+        _sync_root_shader_copies(pkg_dir)
     if not force_rebuild:
         for name in candidates:
             path = pkg_dir / name
             if path.exists():
                 return path
     _compile_shaders(pkg_dir)
+    _sync_root_shader_copies(pkg_dir)
     if os.name == "nt":
         built = _build_windows_msvc(pkg_dir, force_rebuild=force_rebuild)
         if built is not None:
