@@ -288,6 +288,8 @@ static struct {
   Pipeline argmax_pipe;
   Pipeline topk_pipe;
   Pipeline topp_pipe;
+  Pipeline resolve_idx_pipe;
+  Pipeline sample_categorical_pipe;
 
   // Cross-map (dual-buffer) pipelines
   Pipeline matmul_x_pipe;
@@ -1075,6 +1077,8 @@ void batch_end(void) {
   reset_pipeline_desc_pool(&ctx.argmax_pipe);
   reset_pipeline_desc_pool(&ctx.topk_pipe);
   reset_pipeline_desc_pool(&ctx.topp_pipe);
+  reset_pipeline_desc_pool(&ctx.resolve_idx_pipe);
+  reset_pipeline_desc_pool(&ctx.sample_categorical_pipe);
   reset_pipeline_desc_pool(&ctx.matmul_x_pipe);
   reset_pipeline_desc_pool(&ctx.matmul_t_x_pipe);
   reset_pipeline_desc_pool(&ctx.rmsnorm_x_pipe);
@@ -1124,6 +1128,8 @@ void adamah_sync(void) {
     reset_pipeline_desc_pool(&ctx.argmax_pipe);
     reset_pipeline_desc_pool(&ctx.topk_pipe);
     reset_pipeline_desc_pool(&ctx.topp_pipe);
+    reset_pipeline_desc_pool(&ctx.resolve_idx_pipe);
+    reset_pipeline_desc_pool(&ctx.sample_categorical_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq4_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq8_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_rerank_t_xq8_pipe);
@@ -1168,6 +1174,8 @@ void adamah_synchronize(uint64_t ticket) {
     reset_pipeline_desc_pool(&ctx.argmax_pipe);
     reset_pipeline_desc_pool(&ctx.topk_pipe);
     reset_pipeline_desc_pool(&ctx.topp_pipe);
+    reset_pipeline_desc_pool(&ctx.resolve_idx_pipe);
+    reset_pipeline_desc_pool(&ctx.sample_categorical_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq4_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq8_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_rerank_t_xq8_pipe);
@@ -1210,6 +1218,8 @@ void adamah_synchronize_all(void) {
     reset_pipeline_desc_pool(&ctx.argmax_pipe);
     reset_pipeline_desc_pool(&ctx.topk_pipe);
     reset_pipeline_desc_pool(&ctx.topp_pipe);
+    reset_pipeline_desc_pool(&ctx.resolve_idx_pipe);
+    reset_pipeline_desc_pool(&ctx.sample_categorical_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq4_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq8_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_rerank_t_xq8_pipe);
@@ -3181,6 +3191,14 @@ static int init_pipelines(void) {
   if (create_pipeline(&ctx.topp_pipe, "map_topp.spv", 3, 12) != 0) {
     fprintf(stderr, "ADAMAH: Warning - topp shader not found\n");
   }
+  // Resolve shortlist positions into actual token ids stored in a map buffer.
+  if (create_pipeline(&ctx.resolve_idx_pipe, "map_resolve_idx.spv", 4, 4) != 0) {
+    fprintf(stderr, "ADAMAH: Warning - resolve_idx shader not found\n");
+  }
+  // Draw one token id from a shortlist of token ids + probabilities.
+  if (create_pipeline(&ctx.sample_categorical_pipe, "map_sample_categorical.spv", 5, 4) != 0) {
+    fprintf(stderr, "ADAMAH: Warning - sample_categorical shader not found\n");
+  }
 
   // Cross-map matmul: M,K,N,n_ops = 16 bytes, 5 bindings (act,wt,a,b,c)
   if (create_pipeline(&ctx.matmul_x_pipe, "map_matmul_x.spv", 5, 16) != 0) {
@@ -5100,6 +5118,195 @@ int map_topp_dev(uint32_t map_id, uint32_t locs_src_handle,
   cmd_submit();
   res_unpin(locs_src_handle);
   res_unpin(locs_dst_handle);
+  return ADAMAH_OK;
+}
+
+// ============================================
+// Resolve shortlist positions into actual token ids stored in a map buffer.
+// base_locs[0] contains the base map location of the token-id buffer.
+// sel_locs[i] points to a map location containing a shortlist position.
+// Writes token ids into dst_locs[i].
+// ============================================
+int map_resolve_idx_dev(uint32_t map_id, uint32_t base_locs_handle,
+                        uint32_t sel_locs_handle, uint32_t dst_locs_handle,
+                        uint32_t n) {
+  int fret = fusion_flush_pending_for_immediate();
+  if (fret != ADAMAH_OK)
+    return fret;
+  if (map_id >= MAX_MAPS || !ctx.maps[map_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (n == 0)
+    return ADAMAH_OK;
+  if (!ctx.resolve_idx_pipe.pipeline && init_pipelines() != 0)
+    return ADAMAH_ERR_VULKAN;
+  if (!ctx.resolve_idx_pipe.pipeline)
+    return ADAMAH_ERR_INVALID;
+
+  Map *m = &ctx.maps[map_id];
+  if (m->dtype != DTYPE_F32 || m->pack_size != 1)
+    return ADAMAH_ERR_INVALID;
+
+  ResEntry *base_res = res_get(base_locs_handle);
+  ResEntry *sel_res = res_get(sel_locs_handle);
+  ResEntry *dst_res = res_get(dst_locs_handle);
+  if (!base_res || !sel_res || !dst_res)
+    return ADAMAH_ERR_INVALID;
+  if (base_res->size_bytes < 4 || (VkDeviceSize)n * 4 > sel_res->size_bytes ||
+      (VkDeviceSize)n * 4 > dst_res->size_bytes)
+    return ADAMAH_ERR_INVALID;
+
+  res_pin(base_locs_handle);
+  res_pin(sel_locs_handle);
+  res_pin(dst_locs_handle);
+  VkDeviceSize base_off = 0, sel_off = 0, dst_off = 0;
+  if (res_require_hot(base_locs_handle, &base_off) != 0 ||
+      res_require_hot(sel_locs_handle, &sel_off) != 0 ||
+      res_require_hot(dst_locs_handle, &dst_off) != 0) {
+    res_unpin(base_locs_handle);
+    res_unpin(sel_locs_handle);
+    res_unpin(dst_locs_handle);
+    return ADAMAH_ERR_INVALID;
+  }
+
+  VkDescriptorSet ds = alloc_desc_set(&ctx.resolve_idx_pipe);
+  if (ds == VK_NULL_HANDLE) {
+    res_unpin(base_locs_handle);
+    res_unpin(sel_locs_handle);
+    res_unpin(dst_locs_handle);
+    return ADAMAH_ERR_VULKAN;
+  }
+
+  VkDescriptorBufferInfo buf_infos[4] = {
+      {.buffer = m->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = ctx.hot_pool->buf, .offset = base_off, .range = base_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = sel_off, .range = sel_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = dst_off, .range = dst_res->size_bytes},
+  };
+  VkWriteDescriptorSet writes[4];
+  for (int i = 0; i < 4; i++) {
+    writes[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = ds,
+        .dstBinding = i,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &buf_infos[i]};
+  }
+  vkUpdateDescriptorSets(ctx.device, 4, writes, 0, NULL);
+
+  cmd_begin();
+  vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    ctx.resolve_idx_pipe.pipeline);
+  vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ctx.resolve_idx_pipe.pipe_layout, 0, 1, &ds, 0, NULL);
+  vkCmdPushConstants(ctx.cmd, ctx.resolve_idx_pipe.pipe_layout,
+                     VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &n);
+  vkCmdDispatch(ctx.cmd, (n + 63) / 64, 1, 1);
+  cmd_barrier_after_dispatch();
+  cmd_submit();
+
+  res_unpin(base_locs_handle);
+  res_unpin(sel_locs_handle);
+  res_unpin(dst_locs_handle);
+  return ADAMAH_OK;
+}
+
+// ============================================
+// Sample one token id from token-id + probability shortlist entries.
+// Writes the chosen token id into dst_loc[0].
+// ============================================
+int map_sample_categorical_dev(uint32_t map_id, uint32_t locs_idx_handle,
+                               uint32_t locs_prob_handle,
+                               uint32_t rand_loc_handle,
+                               uint32_t dst_loc_handle, uint32_t n) {
+  int fret = fusion_flush_pending_for_immediate();
+  if (fret != ADAMAH_OK)
+    return fret;
+  if (map_id >= MAX_MAPS || !ctx.maps[map_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (n == 0)
+    return ADAMAH_OK;
+  if (n > 64)
+    return ADAMAH_ERR_INVALID;
+  if (!ctx.sample_categorical_pipe.pipeline && init_pipelines() != 0)
+    return ADAMAH_ERR_VULKAN;
+  if (!ctx.sample_categorical_pipe.pipeline)
+    return ADAMAH_ERR_INVALID;
+
+  Map *m = &ctx.maps[map_id];
+  if (m->dtype != DTYPE_F32 || m->pack_size != 1)
+    return ADAMAH_ERR_INVALID;
+
+  ResEntry *idx_res = res_get(locs_idx_handle);
+  ResEntry *prob_res = res_get(locs_prob_handle);
+  ResEntry *rand_res = res_get(rand_loc_handle);
+  ResEntry *dst_res = res_get(dst_loc_handle);
+  if (!idx_res || !prob_res || !rand_res || !dst_res)
+    return ADAMAH_ERR_INVALID;
+  if ((VkDeviceSize)n * 4 > idx_res->size_bytes ||
+      (VkDeviceSize)n * 4 > prob_res->size_bytes ||
+      rand_res->size_bytes < 4 || dst_res->size_bytes < 4)
+    return ADAMAH_ERR_INVALID;
+
+  res_pin(locs_idx_handle);
+  res_pin(locs_prob_handle);
+  res_pin(rand_loc_handle);
+  res_pin(dst_loc_handle);
+  VkDeviceSize idx_off = 0, prob_off = 0, rand_off = 0, dst_off = 0;
+  if (res_require_hot(locs_idx_handle, &idx_off) != 0 ||
+      res_require_hot(locs_prob_handle, &prob_off) != 0 ||
+      res_require_hot(rand_loc_handle, &rand_off) != 0 ||
+      res_require_hot(dst_loc_handle, &dst_off) != 0) {
+    res_unpin(locs_idx_handle);
+    res_unpin(locs_prob_handle);
+    res_unpin(rand_loc_handle);
+    res_unpin(dst_loc_handle);
+    return ADAMAH_ERR_INVALID;
+  }
+
+  VkDescriptorSet ds = alloc_desc_set(&ctx.sample_categorical_pipe);
+  if (ds == VK_NULL_HANDLE) {
+    res_unpin(locs_idx_handle);
+    res_unpin(locs_prob_handle);
+    res_unpin(rand_loc_handle);
+    res_unpin(dst_loc_handle);
+    return ADAMAH_ERR_VULKAN;
+  }
+
+  VkDescriptorBufferInfo buf_infos[5] = {
+      {.buffer = m->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = ctx.hot_pool->buf, .offset = idx_off, .range = idx_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = prob_off, .range = prob_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = rand_off, .range = rand_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = dst_off, .range = dst_res->size_bytes},
+  };
+  VkWriteDescriptorSet writes[5];
+  for (int i = 0; i < 5; i++) {
+    writes[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = ds,
+        .dstBinding = i,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &buf_infos[i]};
+  }
+  vkUpdateDescriptorSets(ctx.device, 5, writes, 0, NULL);
+
+  cmd_begin();
+  vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    ctx.sample_categorical_pipe.pipeline);
+  vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ctx.sample_categorical_pipe.pipe_layout, 0, 1, &ds, 0, NULL);
+  vkCmdPushConstants(ctx.cmd, ctx.sample_categorical_pipe.pipe_layout,
+                     VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &n);
+  vkCmdDispatch(ctx.cmd, 1, 1, 1);
+  cmd_barrier_after_dispatch();
+  cmd_submit();
+
+  res_unpin(locs_idx_handle);
+  res_unpin(locs_prob_handle);
+  res_unpin(rand_loc_handle);
+  res_unpin(dst_loc_handle);
   return ADAMAH_OK;
 }
 

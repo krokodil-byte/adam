@@ -204,6 +204,7 @@ class ADAMEngine:
             'ffn_out': cfg.n_embd,
             'logits': cfg.n_vocab,
             'sample_token': 1,
+            'sample_rand': 1,
             'sample_topk_idx': cls.SAMPLE_TOPK_MAX,
             'sample_topk_val': cls.SAMPLE_TOPK_MAX,
             'sample_topk_prob': cls.SAMPLE_TOPK_MAX,
@@ -713,6 +714,7 @@ class ADAMEngine:
             'ffn_out':  c.n_embd,
             'logits':   c.n_vocab,
             'sample_token': 1,
+            'sample_rand': 1,
             'sample_topk_idx': self.SAMPLE_TOPK_MAX,
             'sample_topk_val': self.SAMPLE_TOPK_MAX,
             'sample_topk_prob': self.SAMPLE_TOPK_MAX,
@@ -839,6 +841,7 @@ class ADAMEngine:
                                   self._ws_slots['logits'][2] + c.n_vocab,
                                   dtype=np.uint32)
         self._sample_locs = np.array([self._ws_slots['sample_token'][2]], dtype=np.uint32)
+        self._sample_rand_locs = np.array([self._ws_slots['sample_rand'][2]], dtype=np.uint32)
         self._sample_topk_idx_locs = np.arange(
             self._ws_slots['sample_topk_idx'][2],
             self._ws_slots['sample_topk_idx'][2] + self.SAMPLE_TOPK_MAX,
@@ -881,9 +884,12 @@ class ADAMEngine:
         )
         self._sample_repeat_ids_arr = np.zeros(self.SAMPLE_REPEAT_MAX, dtype=np.uint32)
         self._sample_short_sel_arr = np.zeros(self.SAMPLE_APPROX_SHORTLIST_MAX, dtype=np.float32)
+        self._sample_rand_arr = np.zeros(1, dtype=np.float32)
         self._sample_repeat_ids_h, _ = g.upload_dev(self._sample_repeat_ids_arr)
         self._sample_fused_base_h, _ = g.upload_dev(
             np.array([self._ws_slots['sample_fused_idx'][2]], dtype=np.uint32))
+        self._sample_exact_base_h, _ = g.upload_dev(
+            np.array([self._ws_slots['sample_exact_idx'][2]], dtype=np.uint32))
         self._sample_short_sel_chunk_h = []
         self._sample_exact_idx_chunk_h = []
         self._sample_exact_val_chunk_h = []
@@ -1094,6 +1100,20 @@ class ADAMEngine:
         self.gpu.upload_dev(self._sample_repeat_ids_arr, handle=self._sample_repeat_ids_h)
         return len(recent)
 
+    def _can_gpu_categorical_sample(self) -> bool:
+        return bool(getattr(self.gpu, '_has_map_sample_categorical_dev', False))
+
+    def _can_gpu_resolve_idx(self) -> bool:
+        return bool(getattr(self.gpu, '_has_map_resolve_idx_dev', False))
+
+    def _gpu_write_sample_rand(self):
+        self._sample_rand_arr[0] = np.float32(np.random.random())
+        self.gpu.scatter(self.ws_map_id, self._sample_rand_locs, self._sample_rand_arr)
+
+    def _gpu_read_sample_token(self) -> int:
+        tok = self.gpu.gather(self.ws_map_id, self._sample_locs).view(np.float32)
+        return int(tok[0]) if tok.size else 0
+
     def _sample_gpu_argmax(self) -> int:
         """Sample next token by reducing the GPU logits buffer to one scalar index."""
         g = self.gpu; ws_id = self.ws_map_id
@@ -1129,7 +1149,21 @@ class ADAMEngine:
                     adj[~pos] *= np.float32(cfg.repeat_penalty)
                     g.scatter(ws_id, locs, adj.astype(np.float32))
 
-        g.map_topk_dev(ws_id, lo_h, idx_h, val_h, self.cfg.n_vocab, top_k)
+        can_dev_sample = self._can_gpu_categorical_sample()
+        if can_dev_sample:
+            rand_h, _ = self._wsh('sample_rand')
+            tok_h, _ = self._wsh('sample_token')
+            g.batch_begin()
+            try:
+                g.map_topk_dev(ws_id, lo_h, idx_h, val_h, self.cfg.n_vocab, top_k)
+                if cfg.temperature > 0.0:
+                    g.map_topp_dev(ws_id, val_h, prob_h, top_k, float(cfg.temperature), float(cfg.top_p))
+                    self._gpu_write_sample_rand()
+                    g.map_sample_categorical_dev(ws_id, idx_h, prob_h, rand_h, tok_h, top_k)
+            finally:
+                g.batch_end()
+            if cfg.temperature > 0.0:
+                return self._gpu_read_sample_token()
 
         idx = g.gather(ws_id, self._sample_topk_idx_locs[:top_k]).view(np.float32).astype(np.int32)
         vals = g.gather(ws_id, self._sample_topk_val_locs[:top_k]).view(np.float32)
@@ -1142,7 +1176,8 @@ class ADAMEngine:
         if cfg.temperature <= 0.0:
             return int(idx[0])
 
-        g.map_topp_dev(ws_id, val_h, prob_h, len(idx), float(cfg.temperature), float(cfg.top_p))
+        if not can_dev_sample:
+            g.map_topp_dev(ws_id, val_h, prob_h, len(idx), float(cfg.temperature), float(cfg.top_p))
         p = g.gather(ws_id, self._sample_topk_prob_locs[:len(idx)]).view(np.float32)
         keep = p > 0.0
         if not np.any(keep):
@@ -1157,12 +1192,48 @@ class ADAMEngine:
         n = self._sample_rerank_n
         if n <= 0:
             return 0
-        idx = self.gpu.gather(
-            self.ws_map_id, self._sample_exact_idx_locs[:n]).view(np.float32).astype(np.int32)
-        vals = self.gpu.gather(
-            self.ws_map_id, self._sample_exact_val_locs[:n]).view(np.float32)
         self._sample_rerank_n = 0
+        g = self.gpu; ws_id = self.ws_map_id
+        exact_idx_h, _ = self._wsh('sample_exact_idx')
+        exact_val_h, _ = self._wsh('sample_exact_val')
+        topk_idx_h, _ = self._wsh('sample_topk_idx')
+        topk_val_h, _ = self._wsh('sample_topk_val')
+        prob_h, _ = self._wsh('sample_topk_prob')
+        tok_h, _ = self._wsh('sample_token')
+        resolved_h, _ = self._wsh('sample_short_sel')
+        top_k = min(n, self.SAMPLE_TOPK_MAX) if cfg.top_k <= 0 else min(int(cfg.top_k), n, self.SAMPLE_TOPK_MAX)
+        can_dev_sample = self._can_gpu_categorical_sample()
+        can_resolve = self._can_gpu_resolve_idx()
+        use_dev_path = can_resolve and (cfg.temperature <= 0.0 or can_dev_sample)
 
+        if use_dev_path:
+            rand_h, _ = self._wsh('sample_rand')
+            g.batch_begin()
+            try:
+                g.map_topk_dev(ws_id, exact_val_h, topk_idx_h, topk_val_h, n, top_k)
+                if self.cfg.final_softcap > 0:
+                    fcap_h, _ = self._wsh('final_softcap')
+                    g.map_broadcast_dev(ws_id, self.A.OP_DIV, topk_val_h, fcap_h, topk_val_h, top_k)
+                    g.map_op1_dev(ws_id, self.A.OP_TANH, topk_val_h, topk_val_h, top_k)
+                    g.map_broadcast_dev(ws_id, self.A.OP_MUL, topk_val_h, fcap_h, topk_val_h, top_k)
+                if cfg.temperature <= 0.0:
+                    g.map_resolve_idx_dev(ws_id, self._sample_exact_base_h, topk_idx_h, tok_h, 1)
+                else:
+                    g.map_resolve_idx_dev(ws_id, self._sample_exact_base_h, topk_idx_h, resolved_h, top_k)
+                    if can_dev_sample:
+                        g.map_topp_dev(ws_id, topk_val_h, prob_h, top_k,
+                                       float(cfg.temperature), float(cfg.top_p))
+                        self._gpu_write_sample_rand()
+                        g.map_sample_categorical_dev(ws_id, resolved_h, prob_h, rand_h, tok_h, top_k)
+            finally:
+                g.batch_end()
+            if cfg.temperature <= 0.0:
+                return self._gpu_read_sample_token()
+            if can_dev_sample:
+                return self._gpu_read_sample_token()
+
+        idx = g.gather(ws_id, self._sample_exact_idx_locs[:n]).view(np.float32).astype(np.int32)
+        vals = g.gather(ws_id, self._sample_exact_val_locs[:n]).view(np.float32)
         valid = np.isfinite(vals)
         if not np.any(valid):
             return 0
@@ -1198,17 +1269,42 @@ class ADAMEngine:
         top_k = self._sample_fused_topk_n
         if top_k <= 0:
             return 0
-        pos = self.gpu.gather(self.ws_map_id, self._sample_topk_idx_locs[:top_k]).view(np.float32).astype(np.int32)
+        g = self.gpu; ws_id = self.ws_map_id
+        pos_h, _ = self._wsh('sample_topk_idx')
+        prob_h, _ = self._wsh('sample_topk_prob')
+        tok_h, _ = self._wsh('sample_token')
+        resolved_h, _ = self._wsh('sample_short_sel')
+        can_resolve = self._can_gpu_resolve_idx()
+        can_dev_sample = self._can_gpu_categorical_sample()
+        self._sample_fused_topk_n = 0
+
+        if can_resolve:
+            rand_h, _ = self._wsh('sample_rand')
+            g.batch_begin()
+            try:
+                if cfg.temperature <= 0.0:
+                    g.map_resolve_idx_dev(ws_id, self._sample_fused_base_h, pos_h, tok_h, 1)
+                else:
+                    g.map_resolve_idx_dev(ws_id, self._sample_fused_base_h, pos_h, resolved_h, top_k)
+                    if can_dev_sample:
+                        self._gpu_write_sample_rand()
+                        g.map_sample_categorical_dev(ws_id, resolved_h, prob_h, rand_h, tok_h, top_k)
+            finally:
+                g.batch_end()
+            if cfg.temperature <= 0.0:
+                return self._gpu_read_sample_token()
+            if can_dev_sample:
+                return self._gpu_read_sample_token()
+
+        pos = g.gather(ws_id, self._sample_topk_idx_locs[:top_k]).view(np.float32).astype(np.int32)
         pos = np.clip(pos, 0, max(self._sample_fused_partial_n - 1, 0))
         tok_locs = self._sample_fused_idx_locs[pos]
-        idx = self.gpu.gather(self.ws_map_id, tok_locs).view(np.float32).astype(np.int32)
+        idx = g.gather(ws_id, tok_locs).view(np.float32).astype(np.int32)
         if cfg.temperature <= 0.0:
-            self._sample_fused_topk_n = 0
             return int(idx[0]) if idx.size else 0
 
-        p = self.gpu.gather(self.ws_map_id, self._sample_topk_prob_locs[:top_k]).view(np.float32)
+        p = g.gather(ws_id, self._sample_topk_prob_locs[:top_k]).view(np.float32)
         keep = p > 0.0
-        self._sample_fused_topk_n = 0
         if not np.any(keep):
             return int(idx[0]) if idx.size else 0
         idx = idx[keep]

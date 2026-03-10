@@ -646,6 +646,24 @@ class Adamah:
                                            ctypes.c_uint32, ctypes.c_uint32,
                                            ctypes.c_uint32, ctypes.c_float, ctypes.c_float]
         self._lib.map_topp_dev.restype = ctypes.c_int
+        try:
+            self._lib.map_resolve_idx_dev.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32,
+            ]
+            self._lib.map_resolve_idx_dev.restype = ctypes.c_int
+            self._has_map_resolve_idx_dev = True
+        except AttributeError:
+            self._has_map_resolve_idx_dev = False
+        try:
+            self._lib.map_sample_categorical_dev.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ]
+            self._lib.map_sample_categorical_dev.restype = ctypes.c_int
+            self._has_map_sample_categorical_dev = True
+        except AttributeError:
+            self._has_map_sample_categorical_dev = False
 
         # Transformer-specific ops
         self._lib.map_rmsnorm_dev.argtypes = [ctypes.c_uint32,
@@ -1749,6 +1767,40 @@ class Adamah:
         )
         if ret != 0:
             raise RuntimeError(f"map_topp_dev failed with code {ret}")
+
+    def map_resolve_idx_dev(self, map_id: int, base_locs_handle: int,
+                            sel_locs_handle: int, dst_locs_handle: int, n: int):
+        """Resolve shortlist positions into actual token ids stored in a map buffer."""
+        if not getattr(self, '_has_map_resolve_idx_dev', False):
+            raise NotImplementedError("map_resolve_idx_dev is not available in the loaded backend")
+        self._metrics['op_calls'] += 1
+        ret = self._lib.map_resolve_idx_dev(
+            ctypes.c_uint32(map_id),
+            ctypes.c_uint32(base_locs_handle),
+            ctypes.c_uint32(sel_locs_handle),
+            ctypes.c_uint32(dst_locs_handle),
+            ctypes.c_uint32(n),
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_resolve_idx_dev failed with code {ret}")
+
+    def map_sample_categorical_dev(self, map_id: int, locs_idx_handle: int,
+                                   locs_prob_handle: int, rand_loc_handle: int,
+                                   dst_loc_handle: int, n: int):
+        """Draw one token id from shortlist token-id and probability buffers."""
+        if not getattr(self, '_has_map_sample_categorical_dev', False):
+            raise NotImplementedError("map_sample_categorical_dev is not available in the loaded backend")
+        self._metrics['op_calls'] += 1
+        ret = self._lib.map_sample_categorical_dev(
+            ctypes.c_uint32(map_id),
+            ctypes.c_uint32(locs_idx_handle),
+            ctypes.c_uint32(locs_prob_handle),
+            ctypes.c_uint32(rand_loc_handle),
+            ctypes.c_uint32(dst_loc_handle),
+            ctypes.c_uint32(n),
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_sample_categorical_dev failed with code {ret}")
 
     # ============================================
     # Batching

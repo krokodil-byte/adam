@@ -1,0 +1,26 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint n_locs;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer { float map_data[]; };
+layout(set = 0, binding = 1) buffer BaseLocs  { uint base_locs[]; };
+layout(set = 0, binding = 2) buffer SelLocs   { uint sel_locs[]; };
+layout(set = 0, binding = 3) buffer DstLocs   { uint dst_locs[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_locs) return;
+
+    uint base = base_locs[0];
+    float sel_f = map_data[sel_locs[i]];
+    if (isnan(sel_f) || isinf(sel_f) || sel_f < 0.0) sel_f = 0.0;
+
+    uint sel_pos = uint(sel_f);
+    float tok_f = map_data[base + sel_pos];
+    if (isnan(tok_f) || isinf(tok_f) || tok_f < 0.0) tok_f = 0.0;
+
+    map_data[dst_locs[i]] = tok_f;
+}

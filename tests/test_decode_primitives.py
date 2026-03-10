@@ -65,6 +65,41 @@ def test_topp(u):
     return np.allclose(probs, expected, atol=1e-5)
 
 
+def test_resolve_idx_and_categorical(gpu, u):
+    if not getattr(gpu, '_has_map_resolve_idx_dev', False):
+        print("[resolve_idx/sample_categorical] skipped (backend primitive not available)")
+        return True
+    if not getattr(gpu, '_has_map_sample_categorical_dev', False):
+        print("[resolve_idx/sample_categorical] skipped (backend primitive not available)")
+        return True
+
+    u.array_init(16, 32, 4)
+    full = u.cache_locs(16, np.arange(32, dtype=np.uint32))
+    vals = np.zeros(32, dtype=np.float32)
+    vals[4:8] = np.array([11.0, 22.0, 33.0, 44.0], dtype=np.float32)
+    vals[8:10] = np.array([2.0, 0.0], dtype=np.float32)
+    vals[16:18] = np.array([0.25, 0.75], dtype=np.float32)
+    u.scatter(16, full, vals)
+
+    base_h, _ = gpu.upload_dev(np.array([4], dtype=np.uint32))
+    sel = u.cache_locs(16, np.array([8, 9], dtype=np.uint32))
+    resolved = u.cache_locs(16, np.array([12, 13], dtype=np.uint32))
+    probs = u.cache_locs(16, np.array([16, 17], dtype=np.uint32))
+    rand = u.cache_locs(16, np.array([20], dtype=np.uint32))
+    dst = u.cache_locs(16, np.array([21], dtype=np.uint32))
+    u.scatter(16, rand, np.array([0.6], dtype=np.float32))
+
+    gpu.batch_begin()
+    gpu.map_resolve_idx_dev(16, base_h, sel.handle, resolved.handle, 2)
+    gpu.map_sample_categorical_dev(16, resolved.handle, probs.handle, rand.handle, dst.handle, 2)
+    gpu.batch_end()
+
+    resolved_vals = u.gather(16, resolved).view(np.float32).astype(np.int32)
+    chosen = int(u.gather(16, dst).view(np.float32)[0])
+    print(f"[resolve_idx/sample_categorical] resolved={resolved_vals.tolist()} chosen={chosen}")
+    return resolved_vals.tolist() == [33, 11] and chosen == 11
+
+
 def test_softmax_abs(gpu, u):
     u.array_init(3, 16, 4)
     all_locs = u.cache_locs(3, np.arange(16, dtype=np.uint32))
@@ -456,6 +491,7 @@ def main():
         ok_argmax = test_argmax(u)
         ok_topk = test_topk(u)
         ok_topp = test_topp(u)
+        ok_resolve_sample = test_resolve_idx_and_categorical(gpu, u)
         ok_softmax_abs = test_softmax_abs(gpu, u)
         ok_attn_softmax_abs = test_attn_softmax_abs(gpu, u)
         ok_q8 = test_q8_gather_scatter(gpu, u)
@@ -473,7 +509,7 @@ def main():
         gpu.shutdown()
 
     ok = (
-        ok_argmax and ok_topk and ok_topp and ok_softmax_abs and ok_attn_softmax_abs and
+        ok_argmax and ok_topk and ok_topp and ok_resolve_sample and ok_softmax_abs and ok_attn_softmax_abs and
         ok_q8 and ok_row_gather and ok_matvec_q8 and ok_matvec_topk_q8 and
         ok_matvec_topk_q4 and ok_matvec_rerank_q8 and ok_matvec_q4 and
         ok_batch_gather and ok_row_copy and ok_state and ok_fusion

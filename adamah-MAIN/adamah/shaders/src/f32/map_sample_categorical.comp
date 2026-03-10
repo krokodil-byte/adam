@@ -1,0 +1,50 @@
+#version 450
+layout(local_size_x = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint n_locs;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer { float map_data[]; };
+layout(set = 0, binding = 1) buffer IdxLocs   { uint idx_locs[]; };
+layout(set = 0, binding = 2) buffer ProbLocs  { uint prob_locs[]; };
+layout(set = 0, binding = 3) buffer RandLoc   { uint rand_loc[]; };
+layout(set = 0, binding = 4) buffer DstLoc    { uint dst_loc[]; };
+
+void main() {
+    if (gl_GlobalInvocationID.x != 0u) return;
+
+    uint n = min(pc.n_locs, 64u);
+    if (n == 0u) return;
+
+    float total = 0.0;
+    for (uint i = 0u; i < n; ++i) {
+        float p = map_data[prob_locs[i]];
+        if (isnan(p) || isinf(p) || p < 0.0) p = 0.0;
+        total += p;
+    }
+
+    if (!(total > 0.0)) {
+        map_data[dst_loc[0]] = map_data[idx_locs[0]];
+        return;
+    }
+
+    float r = map_data[rand_loc[0]];
+    if (isnan(r) || isinf(r)) r = 0.0;
+    r = clamp(r, 0.0, 0.99999994);
+    float target = r * total;
+
+    float accum = 0.0;
+    uint chosen = n - 1u;
+    for (uint i = 0u; i < n; ++i) {
+        float p = map_data[prob_locs[i]];
+        if (isnan(p) || isinf(p) || p < 0.0) p = 0.0;
+        accum += p;
+        if (target < accum) {
+            chosen = i;
+            break;
+        }
+    }
+
+    map_data[dst_loc[0]] = map_data[idx_locs[chosen]];
+}
