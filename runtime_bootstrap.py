@@ -15,6 +15,7 @@ import sys
 ROOT = Path(__file__).resolve().parent
 ADAMAH_ROOT = ROOT / "adamah-MAIN"
 ADAMAH_PKG = ADAMAH_ROOT / "adamah"
+SHADER_PROFILE_STAMP = ADAMAH_PKG / "shaders" / ".profile"
 RUNTIME_REQUIREMENTS = (
     ("numpy", "numpy"),
     ("gguf", "gguf"),
@@ -38,6 +39,13 @@ def _shader_profile() -> str:
     return (os.environ.get("ADAMAH_SHADER_PROFILE")
             or os.environ.get("ADAM_RUNTIME_PROFILE")
             or "").strip().lower()
+
+
+def compiled_shader_profile() -> str:
+    try:
+        return SHADER_PROFILE_STAMP.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return ""
 
 
 def _shader_compile_args() -> list[str]:
@@ -82,6 +90,8 @@ def _compile_shaders(pkg_dir: Path) -> None:
     if f32_dir.is_dir():
         for spv in f32_dir.glob("*.spv"):
             shutil.copy2(spv, root_dir / spv.name)
+    SHADER_PROFILE_STAMP.parent.mkdir(parents=True, exist_ok=True)
+    SHADER_PROFILE_STAMP.write_text(profile, encoding="utf-8")
 
 
 def _write_shader_header(pkg_dir: Path) -> Path:

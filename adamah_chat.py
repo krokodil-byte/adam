@@ -3,7 +3,7 @@
 ADAMAH Chat — Universal LLM Inference TUI
 Pure Vulkan, zero CUDA. Loads any GGUF model via ADAM.
 """
-import os, sys, time, glob
+import os, sys, time, glob, platform
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -19,7 +19,7 @@ for p in [ROOT, ADAMAH_DIR]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from runtime_bootstrap import ensure_runtime
+from runtime_bootstrap import compiled_shader_profile, ensure_runtime
 
 # ── ANSI Colors ────────────────────────────────────────────
 BOLD = "\033[1m"
@@ -111,6 +111,14 @@ def _runtime_preset_defaults(name: str) -> dict:
     if name == "broadcom_exact":
         return {"runtime_mode": "fast", "runtime_profile": "broadcom_v3dv_exact", "kv_cap": 256}
     return {"runtime_mode": "fast"}
+
+
+def _machine_is_arm_like() -> bool:
+    try:
+        machine = os.uname().machine.lower()
+    except AttributeError:
+        machine = platform.machine().lower()
+    return machine in ("aarch64", "arm64", "armv7l", "armv6l")
 
 
 def _gen_preset_defaults(name: str) -> dict:
@@ -540,6 +548,15 @@ def _resolve_runtime_profile_name(profile_name, unified):
     return name
 
 
+def _desired_shader_profile(startup=None) -> str:
+    startup = startup or {}
+    runtime_mode = (startup.get("runtime_mode") or os.environ.get("ADAM_RUNTIME_MODE") or "fast").strip().lower()
+    requested_profile = startup.get("runtime_profile") or os.environ.get("ADAM_RUNTIME_PROFILE", "")
+    if not requested_profile:
+        requested_profile = "trace" if runtime_mode == "trace" else "fast"
+    return _resolve_runtime_profile_name(requested_profile, _machine_is_arm_like())
+
+
 def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
     reserve_ratio = min(max(float(os.environ.get("ADAM_RUNTIME_RESERVE_RATIO", "0.10")), 0.0), 0.5)
     startup = startup or {}
@@ -747,7 +764,11 @@ def init_gpu_backend(adamah_mod, runtime_plan=None):
 
 def load_model(model_path, startup=None):
     """Load GGUF model with ADAMAH GPU backend via ADAM."""
-    ensure_runtime()
+    startup = startup or {}
+    desired_profile = _desired_shader_profile(startup)
+    os.environ["ADAM_RUNTIME_PROFILE"] = desired_profile
+    os.environ["ADAMAH_SHADER_PROFILE"] = desired_profile
+    ensure_runtime(rebuild_shaders=(compiled_shader_profile() != desired_profile))
     from adam.loaders.gguf import GGUFLoader
     from adam.tokenizers.gguf_tok import GGUFTokenizer
     from adam.models.engine import ADAMEngine, ModelConfig, GenerationConfig
@@ -1390,7 +1411,6 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
             traceback.print_exc()
 
 def main():
-    ensure_runtime()
     box("ADAMAH Chat — Universal LLM Inference")
     print(f"{DIM}Pure Vulkan • Zero CUDA • Any GGUF model{RESET}\n")
 

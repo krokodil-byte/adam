@@ -11,6 +11,7 @@ for p in [ROOT, os.path.join(ROOT, "adamah-MAIN")]:
 from adamah_chat import (
     _auto_compaction_enabled,
     _build_compaction_seed_message,
+    _desired_shader_profile,
     _build_reasoning_request,
     _build_session_system_prompt,
     _clamp_default_max_tokens,
@@ -88,6 +89,7 @@ def main():
     assert _runtime_preset_defaults("desktop_long")["kv_cap"] == 16384
     assert _runtime_preset_defaults("broadcom_fast")["kv_cap"] == 256
     assert _runtime_preset_defaults("broadcom_trace")["runtime_profile"] == "broadcom_v3dv"
+    assert _desired_shader_profile({"runtime_mode": "fast", "runtime_profile": "default"}) in ("default", "broadcom_v3dv")
     assert _max_tokens_soft_cap(256) == 128
     assert _max_tokens_hard_cap(256) == 224
     assert _clamp_default_max_tokens(256, 256) == 128

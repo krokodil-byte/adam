@@ -83,6 +83,10 @@ def compile_shaders(pkg_dir):
             if spv.endswith('.spv'):
                 shutil.copy2(os.path.join(f32_dir, spv), os.path.join(shaders_dir, spv))
 
+    profile_stamp = os.path.join(shaders_dir, '.profile')
+    with open(profile_stamp, 'w', encoding='utf-8') as f:
+        f.write(profile)
+
     return ok
 
 
