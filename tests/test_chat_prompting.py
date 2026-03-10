@@ -13,7 +13,11 @@ from adamah_chat import (
     _build_compaction_seed_message,
     _build_reasoning_request,
     _build_session_system_prompt,
+    _clamp_default_max_tokens,
+    _clamp_requested_max_tokens,
     _gen_preset_defaults,
+    _max_tokens_hard_cap,
+    _max_tokens_soft_cap,
     _reasoning_enabled,
     _reasoning_stage_name,
     _runtime_preset_defaults,
@@ -79,7 +83,12 @@ def main():
         "Working notes for the next reply:\nremember this"
     )
     assert _runtime_preset_defaults("desktop_long")["kv_cap"] == 16384
+    assert _runtime_preset_defaults("broadcom_fast")["kv_cap"] == 256
     assert _runtime_preset_defaults("broadcom_trace")["runtime_profile"] == "broadcom_v3dv_trace"
+    assert _max_tokens_soft_cap(256) == 128
+    assert _max_tokens_hard_cap(256) == 224
+    assert _clamp_default_max_tokens(256, 256) == 128
+    assert _clamp_requested_max_tokens(512, 256) == 224
     factual = _gen_preset_defaults("factual")
     assert factual["top_k"] == 32
     assert factual["max_tokens"] == 256

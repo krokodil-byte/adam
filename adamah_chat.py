@@ -99,11 +99,11 @@ def _runtime_preset_defaults(name: str) -> dict:
     if name == "desktop_long":
         return {"runtime_profile": "default", "kv_cap": 16384}
     if name == "broadcom_fast":
-        return {"runtime_profile": "broadcom_v3dv"}
+        return {"runtime_profile": "broadcom_v3dv", "kv_cap": 256}
     if name == "broadcom_trace":
-        return {"runtime_profile": "broadcom_v3dv_trace", "trace_decode": True}
+        return {"runtime_profile": "broadcom_v3dv_trace", "trace_decode": True, "kv_cap": 256}
     if name == "broadcom_exact":
-        return {"runtime_profile": "broadcom_v3dv_exact"}
+        return {"runtime_profile": "broadcom_v3dv_exact", "kv_cap": 256}
     return {"runtime_profile": "default"}
 
 
@@ -134,6 +134,26 @@ def _gen_preset_defaults(name: str) -> dict:
     }
 
 
+def _max_tokens_soft_cap(kv_cap: int) -> int:
+    if kv_cap <= 0:
+        return 256
+    return max(64, kv_cap // 2)
+
+
+def _max_tokens_hard_cap(kv_cap: int) -> int:
+    if kv_cap <= 0:
+        return 256
+    return max(32, kv_cap - 32)
+
+
+def _clamp_default_max_tokens(max_tokens: int, kv_cap: int) -> int:
+    return min(int(max_tokens), _max_tokens_soft_cap(int(kv_cap)))
+
+
+def _clamp_requested_max_tokens(max_tokens: int, kv_cap: int) -> int:
+    return min(int(max_tokens), _max_tokens_hard_cap(int(kv_cap)))
+
+
 def prompt_startup_config(model_info: dict | None = None) -> dict:
     print(f"\n{BOLD}Launch setup{RESET}")
     if model_info:
@@ -145,7 +165,11 @@ def prompt_startup_config(model_info: dict | None = None) -> dict:
     gen_preset = _choose_preset("Reply preset", GEN_PRESET_CHOICES, "balanced")
     gen = _gen_preset_defaults(gen_preset)
     kv_default = runtime.get("kv_cap")
+    if kv_default is not None:
+        gen["max_tokens"] = _clamp_default_max_tokens(gen["max_tokens"], int(kv_default))
     kv_cap = _prompt_int_optional("KV cap override (blank = preset/auto)", default=kv_default, minimum=256)
+    if kv_cap is not None:
+        gen["max_tokens"] = _clamp_default_max_tokens(gen["max_tokens"], int(kv_cap))
     reasoning_cycles = _prompt_int_optional("Reasoning cycles (0 = off)", default=0, minimum=0)
     print(
         f"{DIM}Launch: runtime={runtime_preset}  reply={gen_preset}  "
@@ -1106,6 +1130,11 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
                         top_k=int(startup.get("top_k", 40)), top_p=float(startup.get("top_p", 0.95)),
                         repeat_penalty=float(startup.get("repeat_penalty", 1.08)), seed=42,
                         eos_token_ids=tuple(eos_ids))
+    kv_cap_runtime = int(getattr(engine, "_kv_cap", 0) or 0)
+    max_soft_cap = _max_tokens_soft_cap(kv_cap_runtime)
+    if gen_cfg.max_tokens > max_soft_cap:
+        gen_cfg.max_tokens = max_soft_cap
+        print(f"{DIM}[startup max tokens clamped to {gen_cfg.max_tokens} for kv_cap={kv_cap_runtime}]{RESET}")
     history = []
     reasoning_cycles = int(startup.get("reasoning_cycles", _reasoning_cycles_from_env()))
     reasoning_trace = _reasoning_trace_from_env()
@@ -1238,6 +1267,17 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
                     print(f"{RED}Usage: /seed 42{RESET}")
             elif cmd[0] == '/max' and len(cmd) > 1:
                 try:
+                    requested = max(1, int(cmd[1]))
+                    capped = _clamp_requested_max_tokens(requested, kv_cap_runtime)
+                    gen_cfg.max_tokens = capped
+                    if capped != requested:
+                        print(f"{YELLOW}Max tokens capped to {capped} for kv_cap={kv_cap_runtime}{RESET}")
+                    else:
+                        print(f"{GREEN}Max tokens -> {gen_cfg.max_tokens}{RESET}")
+                except ValueError:
+                    print(f"{RED}Usage: /max 128{RESET}")
+            elif False and cmd[0] == '/max' and len(cmd) > 1:
+                try:
                     gen_cfg.max_tokens = int(cmd[1])
                     print(f"{GREEN}Max tokens → {gen_cfg.max_tokens}{RESET}")
                 except ValueError:
@@ -1251,6 +1291,11 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
         pending_messages, templated, add_bos, tokens, dropped = _trim_messages_to_fit(
             engine, tokenizer, cfg, pending_messages, gen_cfg, system_prompt=system_prompt
         )
+        if kv_cap_runtime > 0 and len(tokens) + gen_cfg.max_tokens > kv_cap_runtime:
+            allowed = max(1, kv_cap_runtime - len(tokens))
+            if allowed < gen_cfg.max_tokens:
+                gen_cfg.max_tokens = allowed
+                print(f"{DIM}[max tokens reduced to {gen_cfg.max_tokens} to fit current context]{RESET}")
         if dropped and _auto_compaction_enabled(context_compaction, reasoning_cycles) and history:
             try:
                 summary = _summarize_history(engine, tokenizer, cfg, GenConfig, history, seed=gen_cfg.seed)
@@ -1278,6 +1323,11 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
                 pending_messages, templated, add_bos, tokens, dropped_after_reason = _trim_messages_to_fit(
                     engine, tokenizer, cfg, pending_messages, gen_cfg, system_prompt=system_prompt
                 )
+                if kv_cap_runtime > 0 and len(tokens) + gen_cfg.max_tokens > kv_cap_runtime:
+                    allowed = max(1, kv_cap_runtime - len(tokens))
+                    if allowed < gen_cfg.max_tokens:
+                        gen_cfg.max_tokens = allowed
+                        print(f"{DIM}[max tokens reduced to {gen_cfg.max_tokens} after reasoning to fit context]{RESET}")
                 if dropped_after_reason:
                     print(f"{DIM}[reasoning fit trimmed {dropped_after_reason} older message(s)]{RESET}")
                 print(f"{DIM}[reasoning refined in {reasoning_cycles} cycle(s)]{RESET}")
