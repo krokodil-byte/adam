@@ -3,7 +3,7 @@
 ADAMAH Chat — Universal LLM Inference TUI
 Pure Vulkan, zero CUDA. Loads any GGUF model via ADAM.
 """
-import os, sys, time, glob, platform
+import os, sys, time, glob, platform, shutil
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -119,6 +119,21 @@ def _machine_is_arm_like() -> bool:
     except AttributeError:
         machine = platform.machine().lower()
     return machine in ("aarch64", "arm64", "armv7l", "armv6l")
+
+
+def _ensure_base_shader_copies():
+    shader_root = os.path.join(ADAMAH_DIR, "adamah", "shaders")
+    f32_dir = os.path.join(shader_root, "f32")
+    if not os.path.isdir(f32_dir):
+        return
+    os.makedirs(shader_root, exist_ok=True)
+    for name in os.listdir(f32_dir):
+        if not name.endswith(".spv"):
+            continue
+        src = os.path.join(f32_dir, name)
+        dst = os.path.join(shader_root, name)
+        if not os.path.exists(dst):
+            shutil.copy2(src, dst)
 
 
 def _gen_preset_defaults(name: str) -> dict:
@@ -765,6 +780,7 @@ def init_gpu_backend(adamah_mod, runtime_plan=None):
 def load_model(model_path, startup=None):
     """Load GGUF model with ADAMAH GPU backend via ADAM."""
     startup = startup or {}
+    _ensure_base_shader_copies()
     desired_profile = _desired_shader_profile(startup)
     os.environ["ADAM_RUNTIME_PROFILE"] = desired_profile
     os.environ["ADAMAH_SHADER_PROFILE"] = desired_profile
