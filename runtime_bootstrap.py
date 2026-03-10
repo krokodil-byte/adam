@@ -110,6 +110,26 @@ def _has_essential_shaders(pkg_dir: Path) -> bool:
     return root_op1.exists() and f32_op1.exists()
 
 
+def _shader_outputs_stale(pkg_dir: Path) -> bool:
+    src_dir = pkg_dir / "shaders" / "src"
+    if not src_dir.is_dir():
+        return False
+    for dtype_dir in src_dir.iterdir():
+        if not dtype_dir.is_dir():
+            continue
+        out_dir = pkg_dir / "shaders" / dtype_dir.name
+        for comp_file in dtype_dir.glob("*.comp"):
+            dst = out_dir / (comp_file.stem + ".spv")
+            if not dst.exists():
+                return True
+            try:
+                if comp_file.stat().st_mtime > dst.stat().st_mtime:
+                    return True
+            except OSError:
+                return True
+    return False
+
+
 def _sync_root_shader_copies(pkg_dir: Path) -> None:
     f32_dir = pkg_dir / "shaders" / "f32"
     root_dir = pkg_dir / "shaders"
@@ -229,6 +249,8 @@ def ensure_native_adamah(force_rebuild: bool = False, rebuild_shaders: bool = Fa
     candidates = ["adamah_opt.dll", "adamah_new.dll", "adamah.dll"] if os.name == "nt" else ["adamah.so"]
     _sync_root_shader_copies(pkg_dir)
     if not _has_essential_shaders(pkg_dir):
+        rebuild_shaders = True
+    if _shader_outputs_stale(pkg_dir):
         rebuild_shaders = True
     if rebuild_shaders:
         _compile_shaders(pkg_dir)

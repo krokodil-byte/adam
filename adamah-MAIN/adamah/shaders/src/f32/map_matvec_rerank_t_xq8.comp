@@ -1,5 +1,17 @@
 #version 450
-layout(local_size_x = 128) in;
+
+#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
+#define WG_SIZE 32
+#define TILE_K 64
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+#define WG_SIZE 64
+#define TILE_K 128
+#else
+#define WG_SIZE 128
+#define TILE_K 128
+#endif
+
+layout(local_size_x = WG_SIZE) in;
 
 const uint INVALID_IDX = 0xffffffffu;
 const float NEG_INF = -3.402823466e+38;
@@ -23,7 +35,8 @@ layout(set = 0, binding = 7) buffer IdxDstLocs      { uint  locs_idx_dst[]; };
 layout(set = 0, binding = 8) buffer ValDstLocs      { uint  locs_val_dst[]; };
 layout(set = 0, binding = 9) buffer QParams         { float qparams[]; };
 
-shared float partial[128];
+shared float partial[WG_SIZE];
+shared float a_tile[TILE_K];
 
 float load_q8(uint idx) {
     uint word_idx = idx / 4u;
@@ -54,14 +67,24 @@ void main() {
     uint row_base = b_base + tok * pc.K;
     float sum = 0.0;
 
-    for (uint k = tid; k < pc.K; k += 128u) {
-        sum += map_act[a_base + k] * load_q8(row_base + k);
+    for (uint tile = 0u; tile < pc.K; tile += TILE_K) {
+        for (uint i = tid; i < TILE_K; i += uint(WG_SIZE)) {
+            uint k = tile + i;
+            a_tile[i] = (k < pc.K) ? map_act[a_base + k] : 0.0;
+        }
+        barrier();
+
+        uint tile_len = min(uint(TILE_K), pc.K - tile);
+        for (uint i = tid; i < tile_len; i += uint(WG_SIZE)) {
+            sum += a_tile[i] * load_q8(row_base + tile + i);
+        }
+        barrier();
     }
 
     partial[tid] = sum;
     barrier();
 
-    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+    for (uint stride = uint(WG_SIZE >> 1); stride > 0u; stride >>= 1u) {
         if (tid < stride) {
             partial[tid] += partial[tid + stride];
         }
