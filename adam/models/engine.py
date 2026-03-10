@@ -1630,29 +1630,35 @@ class ADAMEngine:
                     short_sel_h, _ = self._wsh('sample_short_sel')
                     idx_h, _ = self._wsh('sample_exact_idx')
                     val_h, _ = self._wsh('sample_exact_val')
-                    g.scatter(
-                        ws_id,
-                        self._sample_short_sel_locs[:shortlist_n],
-                        self._sample_short_sel_arr[:shortlist_n],
-                    )
-                    wt_mid = self.tensor_map_id[self._lm_wt_name]
-                    for chunk_i, start in enumerate(range(0, shortlist_n, self.SAMPLE_TOPK_MAX)):
-                        chunk_n = min(self.SAMPLE_TOPK_MAX, shortlist_n - start)
-                        g.map_matvec_rerank_t_xq8_dev(
+                    # Keep the rerank stage inside one GPU batch after shortlist selection
+                    # to avoid per-chunk submit/fence overhead on slower drivers.
+                    g.batch_begin()
+                    try:
+                        g.scatter(
                             ws_id,
-                            wt_mid,
-                            normed_final_h,
-                            self._wh[self._lm_wt_name],
-                            self._sample_fused_base_h,
-                            self._sample_short_sel_chunk_h[chunk_i],
-                            self._sample_repeat_ids_h,
-                            self._sample_exact_idx_chunk_h[chunk_i],
-                            self._sample_exact_val_chunk_h[chunk_i],
-                            c.n_embd,
-                            chunk_n,
-                            approx_penalty_n,
-                            float(sample_cfg.repeat_penalty),
+                            self._sample_short_sel_locs[:shortlist_n],
+                            self._sample_short_sel_arr[:shortlist_n],
                         )
+                        wt_mid = self.tensor_map_id[self._lm_wt_name]
+                        for chunk_i, start in enumerate(range(0, shortlist_n, self.SAMPLE_TOPK_MAX)):
+                            chunk_n = min(self.SAMPLE_TOPK_MAX, shortlist_n - start)
+                            g.map_matvec_rerank_t_xq8_dev(
+                                ws_id,
+                                wt_mid,
+                                normed_final_h,
+                                self._wh[self._lm_wt_name],
+                                self._sample_fused_base_h,
+                                self._sample_short_sel_chunk_h[chunk_i],
+                                self._sample_repeat_ids_h,
+                                self._sample_exact_idx_chunk_h[chunk_i],
+                                self._sample_exact_val_chunk_h[chunk_i],
+                                c.n_embd,
+                                chunk_n,
+                                approx_penalty_n,
+                                float(sample_cfg.repeat_penalty),
+                            )
+                    finally:
+                        g.batch_end()
                     self._sample_rerank_n = shortlist_n
 
         if not self._lm_wt_name:
