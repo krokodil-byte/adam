@@ -1216,6 +1216,10 @@ class ADAMEngine:
         p /= p.sum()
         return int(idx[np.random.choice(len(p), p=p)])
 
+    def _can_gpu_merge_approx_shortlist(self) -> bool:
+        profile = str(getattr(self, "_runtime_profile", ""))
+        return profile.startswith("broadcom_v3dv")
+
     # ============================================================
     # Workspace handle helpers
     # ============================================================
@@ -1517,6 +1521,7 @@ class ADAMEngine:
         lo_h, _ = self._wsh('logits')
         approx_partial_k = 0
         approx_penalty_n = 0
+        approx_partial_val_h = None
         if self._lm_wt_name:
             if sample_mode == 'gpu_approx_rerank':
                 approx_partial_k = min(self.SAMPLE_TOPK_MAX, self.cfg.n_vocab)
@@ -1524,6 +1529,7 @@ class ADAMEngine:
                     approx_penalty_n = self._prepare_repeat_ids(sample_prev)
                 partial_idx_h, _ = self._wsh('sample_fused_idx')
                 partial_val_h, _ = self._wsh('sample_fused_val')
+                approx_partial_val_h = partial_val_h
                 self._sample_fused_partial_n = self._sample_fused_groups * approx_partial_k
                 self._sample_rerank_n = 0
                 g.map_matvec_topk_t_xq4_ex_dev(
@@ -1614,52 +1620,87 @@ class ADAMEngine:
             shortlist_n = 0
             partial_n = self._sample_fused_partial_n
             if partial_n > 0:
-                partial_vals = g.gather(
-                    ws_id, self._sample_fused_val_locs[:partial_n]).view(np.float32)
-                valid_pos = np.flatnonzero(np.isfinite(partial_vals))
-                if valid_pos.size:
-                    shortlist_n = min(self.SAMPLE_APPROX_SHORTLIST_MAX, int(valid_pos.size))
-                    if shortlist_n < valid_pos.size:
-                        keep_rel = np.argpartition(
-                            partial_vals[valid_pos], -shortlist_n)[-shortlist_n:]
-                        keep_pos = valid_pos[keep_rel]
-                    else:
-                        keep_pos = valid_pos
-                    keep_pos = keep_pos[np.argsort(partial_vals[keep_pos])[::-1]]
-                    self._sample_short_sel_arr[:shortlist_n] = keep_pos.astype(np.float32, copy=False)
-                    short_sel_h, _ = self._wsh('sample_short_sel')
-                    idx_h, _ = self._wsh('sample_exact_idx')
-                    val_h, _ = self._wsh('sample_exact_val')
-                    # Keep the rerank stage inside one GPU batch after shortlist selection
-                    # to avoid per-chunk submit/fence overhead on slower drivers.
-                    g.batch_begin()
-                    try:
-                        g.scatter(
-                            ws_id,
-                            self._sample_short_sel_locs[:shortlist_n],
-                            self._sample_short_sel_arr[:shortlist_n],
-                        )
-                        wt_mid = self.tensor_map_id[self._lm_wt_name]
-                        for chunk_i, start in enumerate(range(0, shortlist_n, self.SAMPLE_TOPK_MAX)):
-                            chunk_n = min(self.SAMPLE_TOPK_MAX, shortlist_n - start)
+                if self._can_gpu_merge_approx_shortlist() and approx_partial_val_h is not None:
+                    shortlist_n = min(self.SAMPLE_TOPK_MAX, self.SAMPLE_APPROX_SHORTLIST_MAX, partial_n)
+                    if shortlist_n > 0:
+                        short_sel_h, _ = self._wsh('sample_short_sel')
+                        val_h, _ = self._wsh('sample_exact_val')
+                        g.batch_begin()
+                        try:
+                            g.map_topk_dev(
+                                ws_id,
+                                approx_partial_val_h,
+                                short_sel_h,
+                                val_h,
+                                partial_n,
+                                shortlist_n,
+                            )
+                            wt_mid = self.tensor_map_id[self._lm_wt_name]
                             g.map_matvec_rerank_t_xq8_dev(
                                 ws_id,
                                 wt_mid,
                                 normed_final_h,
                                 self._wh[self._lm_wt_name],
                                 self._sample_fused_base_h,
-                                self._sample_short_sel_chunk_h[chunk_i],
+                                self._sample_short_sel_chunk_h[0],
                                 self._sample_repeat_ids_h,
-                                self._sample_exact_idx_chunk_h[chunk_i],
-                                self._sample_exact_val_chunk_h[chunk_i],
+                                self._sample_exact_idx_chunk_h[0],
+                                self._sample_exact_val_chunk_h[0],
                                 c.n_embd,
-                                chunk_n,
+                                shortlist_n,
                                 approx_penalty_n,
                                 float(sample_cfg.repeat_penalty),
                             )
-                    finally:
-                        g.batch_end()
-                    self._sample_rerank_n = shortlist_n
+                        finally:
+                            g.batch_end()
+                        self._sample_rerank_n = shortlist_n
+                else:
+                    partial_vals = g.gather(
+                        ws_id, self._sample_fused_val_locs[:partial_n]).view(np.float32)
+                    valid_pos = np.flatnonzero(np.isfinite(partial_vals))
+                    if valid_pos.size:
+                        shortlist_n = min(self.SAMPLE_APPROX_SHORTLIST_MAX, int(valid_pos.size))
+                        if shortlist_n < valid_pos.size:
+                            keep_rel = np.argpartition(
+                                partial_vals[valid_pos], -shortlist_n)[-shortlist_n:]
+                            keep_pos = valid_pos[keep_rel]
+                        else:
+                            keep_pos = valid_pos
+                        keep_pos = keep_pos[np.argsort(partial_vals[keep_pos])[::-1]]
+                        self._sample_short_sel_arr[:shortlist_n] = keep_pos.astype(np.float32, copy=False)
+                        short_sel_h, _ = self._wsh('sample_short_sel')
+                        idx_h, _ = self._wsh('sample_exact_idx')
+                        val_h, _ = self._wsh('sample_exact_val')
+                        # Keep the rerank stage inside one GPU batch after shortlist selection
+                        # to avoid per-chunk submit/fence overhead on slower drivers.
+                        g.batch_begin()
+                        try:
+                            g.scatter(
+                                ws_id,
+                                self._sample_short_sel_locs[:shortlist_n],
+                                self._sample_short_sel_arr[:shortlist_n],
+                            )
+                            wt_mid = self.tensor_map_id[self._lm_wt_name]
+                            for chunk_i, start in enumerate(range(0, shortlist_n, self.SAMPLE_TOPK_MAX)):
+                                chunk_n = min(self.SAMPLE_TOPK_MAX, shortlist_n - start)
+                                g.map_matvec_rerank_t_xq8_dev(
+                                    ws_id,
+                                    wt_mid,
+                                    normed_final_h,
+                                    self._wh[self._lm_wt_name],
+                                    self._sample_fused_base_h,
+                                    self._sample_short_sel_chunk_h[chunk_i],
+                                    self._sample_repeat_ids_h,
+                                    self._sample_exact_idx_chunk_h[chunk_i],
+                                    self._sample_exact_val_chunk_h[chunk_i],
+                                    c.n_embd,
+                                    chunk_n,
+                                    approx_penalty_n,
+                                    float(sample_cfg.repeat_penalty),
+                                )
+                        finally:
+                            g.batch_end()
+                        self._sample_rerank_n = shortlist_n
 
         if not self._lm_wt_name:
             # CPU fallback (weight-tied models): gather from 'normed' slot

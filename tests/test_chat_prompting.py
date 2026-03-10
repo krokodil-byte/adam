@@ -100,6 +100,10 @@ def main():
     assert engine._repeat_history([1, 2, 3], [7, 8], cfg) == [7, 8]
     cfg.repeat_on_prompt = True
     assert engine._repeat_history([1, 2, 3], [7, 8], cfg) == [1, 2, 3, 7, 8]
+    engine._runtime_profile = "broadcom_v3dv_trace"
+    assert engine._can_gpu_merge_approx_shortlist() is True
+    engine._runtime_profile = "default"
+    assert engine._can_gpu_merge_approx_shortlist() is False
     trace_summary = engine._summarize_decode_trace([
         {
             "step_ms": 10.0,
