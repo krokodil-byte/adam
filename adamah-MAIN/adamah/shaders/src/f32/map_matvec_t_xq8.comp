@@ -1,5 +1,14 @@
 #version 450
-layout(local_size_x = 128) in;
+
+#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
+#define WG_SIZE 32
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+#define WG_SIZE 64
+#else
+#define WG_SIZE 128
+#endif
+
+layout(local_size_x = WG_SIZE) in;
 
 layout(push_constant) uniform PushConstants {
     uint K;
@@ -14,7 +23,7 @@ layout(set = 0, binding = 3) buffer LocsB      { uint  locs_b[];  };
 layout(set = 0, binding = 4) buffer LocsC      { uint  locs_c[];  };
 layout(set = 0, binding = 5) buffer QParams    { float qparams[]; };
 
-shared float partial[128];
+shared float partial[WG_SIZE];
 
 float load_q8(uint idx) {
     uint word_idx = idx / 4u;
@@ -34,14 +43,14 @@ void main() {
     uint c_base = locs_c[0];
     float sum = 0.0;
     uint row_base = b_base + row * pc.K;
-    for (uint k = lid; k < pc.K; k += 128u) {
+    for (uint k = lid; k < pc.K; k += uint(WG_SIZE)) {
         sum += map_act[a_base + k] * load_q8(row_base + k);
     }
 
     partial[lid] = sum;
     barrier();
 
-    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+    for (uint stride = uint(WG_SIZE >> 1); stride > 0u; stride >>= 1u) {
         if (lid < stride) {
             partial[lid] += partial[lid + stride];
         }
