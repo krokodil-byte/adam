@@ -117,9 +117,23 @@ def main():
     assert trace_summary["step_ms_avg"] == 12.0
     assert trace_summary["sample_ms_avg"] == 3.0
     assert trace_summary["attn_ms_avg"] == 4.0
-    prof = _runtime_profile_overrides("broadcom_v3dv_trace", ModelConfig(), unified=True)
+    small_prof = _runtime_profile_overrides("broadcom_v3dv", ModelConfig(), unified=True)
+    assert small_prof["gpu_approx_rerank"] is False
+    assert small_prof["gpu_fused_rows_per_group"] == 128
+    gemma_prof = _runtime_profile_overrides(
+        "broadcom_v3dv",
+        ModelConfig(n_vocab=262144),
+        unified=True,
+    )
+    assert gemma_prof["gpu_approx_rerank"] is True
+    assert gemma_prof["gpu_fused_rows_per_group"] == 128
+    prof = _runtime_profile_overrides(
+        "broadcom_v3dv_trace",
+        ModelConfig(n_vocab=262144),
+        unified=True,
+    )
     assert prof["trace_decode"] is True
-    assert prof["gpu_approx_rerank"] is False
+    assert prof["gpu_approx_rerank"] is True
 
     print("PASS adaptive chat template rendering")
     return 0
