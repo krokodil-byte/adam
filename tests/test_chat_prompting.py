@@ -147,14 +147,16 @@ def main():
     assert _resolve_runtime_profile_name("trace", unified=True) == "broadcom_v3dv"
     small_prof = _runtime_profile_overrides("default", ModelConfig(), unified=True)
     assert small_prof["gpu_approx_rerank"] is False
-    assert small_prof["gpu_fused_rows_per_group"] == 128
+    assert small_prof["gpu_fused_rows_per_group"] == 256
+    assert small_prof["gpu_approx_partial_k"] == 8
     gemma_prof = _runtime_profile_overrides(
         "default",
         ModelConfig(n_vocab=262144),
         unified=True,
     )
     assert gemma_prof["gpu_approx_rerank"] is True
-    assert gemma_prof["gpu_fused_rows_per_group"] == 128
+    assert gemma_prof["gpu_fused_rows_per_group"] == 256
+    assert gemma_prof["gpu_approx_partial_k"] == 8
     prof = _runtime_profile_overrides(
         "broadcom_v3dv_trace",
         ModelConfig(n_vocab=262144),
@@ -162,6 +164,7 @@ def main():
     )
     assert prof["trace_decode"] is True
     assert prof["gpu_approx_rerank"] is True
+    assert prof["gpu_approx_partial_k"] == 8
 
     print("PASS adaptive chat template rendering")
     return 0

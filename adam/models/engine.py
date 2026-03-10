@@ -123,9 +123,17 @@ class ADAMEngine:
                                       kv_cap: Optional[int] = None,
                                       gpu_tied_lm_head: bool = True,
                                       gpu_approx_rerank: bool = False,
+                                      gpu_approx_partial_k: Optional[int] = None,
                                       gpu_fused_rows_per_group: Optional[int] = None) -> Dict[str, int]:
         kv_cap = int(kv_cap if kv_cap is not None else cls.KV_CAP_DEFAULT)
         rows_per_group = int(gpu_fused_rows_per_group or cls.SAMPLE_FUSED_ROWS_PER_GROUP)
+        approx_partial_k = max(
+            1,
+            min(
+                cls.SAMPLE_TOPK_MAX,
+                int(gpu_approx_partial_k if gpu_approx_partial_k is not None else cls.SAMPLE_TOPK_MAX),
+            ),
+        )
         tied_lm_head = (
             gpu_tied_lm_head and
             'output.weight' not in tensor_shapes and
@@ -189,7 +197,9 @@ class ADAMEngine:
             pos += 1
 
         sample_fused_groups = (cfg.n_vocab + rows_per_group - 1) // rows_per_group
-        sample_fused_partial_cap = sample_fused_groups * cls.SAMPLE_TOPK_MAX
+        sample_fused_partial_cap = sample_fused_groups * (
+            approx_partial_k if gpu_approx_rerank else cls.SAMPLE_TOPK_MAX
+        )
         slots = {
             'hidden': cfg.n_embd,
             'normed': cfg.n_embd,
@@ -254,6 +264,9 @@ class ADAMEngine:
         self._gpu_tied_lm_head = bool(kw.get('gpu_tied_lm_head', True))
         self._gpu_approx_rerank = bool(kw.get('gpu_approx_rerank', False))
         self._gpu_fused_topk = bool(kw.get('gpu_fused_topk', True))
+        self._gpu_approx_partial_k = max(
+            1, min(self.SAMPLE_TOPK_MAX,
+                   int(kw.get('gpu_approx_partial_k', self.SAMPLE_TOPK_MAX))))
         self._gpu_fused_rows_per_group = max(
             1, int(kw.get('gpu_fused_rows_per_group', self.SAMPLE_FUSED_ROWS_PER_GROUP)))
         if self._production_mode and self._cpu_attention_fallback:
@@ -648,7 +661,8 @@ class ADAMEngine:
         gs = c.n_head // c.n_head_kv  # GQA group size
         self._sample_fused_groups = (
             c.n_vocab + self._gpu_fused_rows_per_group - 1) // self._gpu_fused_rows_per_group
-        self._sample_fused_partial_cap = self._sample_fused_groups * self.SAMPLE_TOPK_MAX
+        partial_k = self._gpu_approx_partial_k if self._gpu_approx_rerank else self.SAMPLE_TOPK_MAX
+        self._sample_fused_partial_cap = self._sample_fused_groups * partial_k
 
         # --- Scores at element 0 ---
         pos = 0
@@ -1620,7 +1634,7 @@ class ADAMEngine:
         approx_partial_val_h = None
         if self._lm_wt_name:
             if sample_mode == 'gpu_approx_rerank':
-                approx_partial_k = min(self.SAMPLE_TOPK_MAX, self.cfg.n_vocab)
+                approx_partial_k = min(self._gpu_approx_partial_k, self.cfg.n_vocab)
                 if sample_cfg.repeat_penalty != 1.0 and sample_prev:
                     approx_penalty_n = self._prepare_repeat_ids(sample_prev)
                 partial_idx_h, _ = self._wsh('sample_fused_idx')

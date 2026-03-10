@@ -495,7 +495,8 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
             "stream_load": True,
             "stream_chunk_mb": 8,
             "gpu_approx_rerank": cfg.n_vocab >= 131072,
-            "gpu_fused_rows_per_group": 128,
+            "gpu_approx_partial_k": 8,
+            "gpu_fused_rows_per_group": 256,
             "pool_hot_mb_max": 64,
             "pool_cold_mb_max": 32,
         }
@@ -507,7 +508,8 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
             "stream_load": True,
             "stream_chunk_mb": 8,
             "gpu_approx_rerank": cfg.n_vocab >= 131072,
-            "gpu_fused_rows_per_group": 128,
+            "gpu_approx_partial_k": 8,
+            "gpu_fused_rows_per_group": 256,
             "trace_decode": False,
             "pool_hot_mb_max": 64,
             "pool_cold_mb_max": 32,
@@ -533,7 +535,8 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
             "stream_load": True,
             "stream_chunk_mb": 8,
             "gpu_approx_rerank": cfg.n_vocab >= 131072,
-            "gpu_fused_rows_per_group": 128,
+            "gpu_approx_partial_k": 8,
+            "gpu_fused_rows_per_group": 256,
             "trace_decode": False,
             "pool_hot_mb_max": 64,
             "pool_cold_mb_max": 32,
@@ -546,7 +549,8 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
             "stream_load": True,
             "stream_chunk_mb": 8,
             "gpu_approx_rerank": cfg.n_vocab >= 131072,
-            "gpu_fused_rows_per_group": 128,
+            "gpu_approx_partial_k": 8,
+            "gpu_fused_rows_per_group": 256,
             "trace_decode": True,
             "pool_hot_mb_max": 64,
             "pool_cold_mb_max": 32,
@@ -559,6 +563,7 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
             "stream_load": True,
             "stream_chunk_mb": 8,
             "gpu_approx_rerank": cfg.n_vocab >= 131072,
+            "gpu_approx_partial_k": 8,
             "gpu_fused_rows_per_group": 128,
             "trace_decode": False,
             "pool_hot_mb_max": 64,
@@ -615,9 +620,17 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
     rows_default = int(profile.get("gpu_fused_rows_per_group", FAST_LM_ROWS_PER_GROUP))
     rows_per_group = max(1, int(startup.get("gpu_fused_rows_per_group") or _env_int("ADAM_GPU_FUSED_ROWS_PER_GROUP", rows_default)))
     approx_default = profile.get("gpu_approx_rerank", False)
+    approx_partial_k_default = int(profile.get("gpu_approx_partial_k", engine_cls.SAMPLE_TOPK_MAX))
     approx_rerank = bool(
         startup["gpu_approx_rerank"] if "gpu_approx_rerank" in startup and startup.get("gpu_approx_rerank") is not None
         else _env_flag("ADAM_GPU_APPROX_RERANK", approx_default)
+    )
+    approx_partial_k = max(
+        1,
+        min(
+            engine_cls.SAMPLE_TOPK_MAX,
+            int(startup.get("gpu_approx_partial_k") or _env_int("ADAM_GPU_APPROX_PARTIAL_K", approx_partial_k_default)),
+        ),
     )
     trace_default = bool(profile.get("trace_decode", False) or runtime_mode == "trace")
     trace_decode = bool(
@@ -644,6 +657,7 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
             kv_cap=kv_cap,
             gpu_tied_lm_head=True,
             gpu_approx_rerank=approx_rerank,
+            gpu_approx_partial_k=approx_partial_k,
             gpu_fused_rows_per_group=rows_per_group,
         )
         if kv_cap <= 256 or usable_device <= 0:
@@ -706,6 +720,7 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
         "stream_chunk_mb": int(stream_chunk_mb),
         "kv_cap": int(kv_cap),
         "gpu_approx_rerank": approx_rerank,
+        "gpu_approx_partial_k": int(approx_partial_k),
         "gpu_fused_rows_per_group": int(rows_per_group),
         "trace_decode": trace_decode,
     }
@@ -740,6 +755,7 @@ def print_runtime_plan(plan):
           f"chunk={plan.get('stream_chunk_mb', 0)}MB "
           f"sampler={'approx_rerank' if plan.get('gpu_approx_rerank') else 'exact_fused_topk'} "
           f"rows={plan.get('gpu_fused_rows_per_group', FAST_LM_ROWS_PER_GROUP)} "
+          f"partial_k={plan.get('gpu_approx_partial_k', 64)} "
           f"trace={'on' if plan.get('trace_decode') else 'off'}")
 
 
@@ -851,6 +867,7 @@ def load_model(model_path, startup=None):
         gpu_fused_topk=True,
         gpu_fused_rows_per_group=runtime_plan["gpu_fused_rows_per_group"],
         gpu_approx_rerank=runtime_plan["gpu_approx_rerank"],
+        gpu_approx_partial_k=runtime_plan["gpu_approx_partial_k"],
         gpu_tied_lm_head=True,
     )
     engine._runtime_profile = runtime_plan["profile"]
@@ -859,6 +876,7 @@ def load_model(model_path, startup=None):
                     else "exact gpu_fused_topk")
     print(f"{GREEN}Chat fast path:{RESET} {sampler_name}, "
           f"rows_per_group={runtime_plan['gpu_fused_rows_per_group']}, "
+          f"partial_k={runtime_plan['gpu_approx_partial_k']}, "
           f"trace={'on' if runtime_plan.get('trace_decode') else 'off'}, production_mode=on")
 
     return engine, tokenizer, cfg, GenerationConfig
