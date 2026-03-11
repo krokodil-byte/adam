@@ -1,17 +1,5 @@
 #version 450
-
-#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
-#define WG_SIZE 32
-#define TILE_K 64
-#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
-#define WG_SIZE 128
-#define TILE_K 128
-#else
-#define WG_SIZE 128
-#define TILE_K 128
-#endif
-
-layout(local_size_x = WG_SIZE) in;
+layout(local_size_x = 128) in;
 
 const uint INVALID_IDX = 0xffffffffu;
 const float NEG_INF = -3.402823466e+38;
@@ -35,8 +23,15 @@ layout(set = 0, binding = 7) buffer IdxDstLocs      { uint  locs_idx_dst[]; };
 layout(set = 0, binding = 8) buffer ValDstLocs      { uint  locs_val_dst[]; };
 layout(set = 0, binding = 9) buffer QParams         { float qparams[]; };
 
-shared float partial[WG_SIZE];
-shared float a_tile[TILE_K];
+shared float partial[128];
+
+float load_q8(uint idx) {
+    uint word_idx = idx / 4u;
+    uint sub_idx  = idx % 4u;
+    uint raw_uint = (map_wt[word_idx] >> (sub_idx * 8u)) & 0xFFu;
+    uint group = idx / pc.group_size;
+    return float(raw_uint) * qparams[group * 2u] + qparams[group * 2u + 1u];
+}
 
 bool row_is_penalized(uint row_idx) {
     for (uint i = 0u; i < pc.n_penalty; ++i) {
@@ -59,34 +54,14 @@ void main() {
     uint row_base = b_base + tok * pc.K;
     float sum = 0.0;
 
-    for (uint tile = 0u; tile < pc.K; tile += TILE_K) {
-        for (uint i = tid; i < TILE_K; i += uint(WG_SIZE)) {
-            uint k = tile + i;
-            a_tile[i] = (k < pc.K) ? map_act[a_base + k] : 0.0;
-        }
-        barrier();
-
-        uint tile_len = min(uint(TILE_K), pc.K - tile);
-        uint tile_words = (tile_len + 3u) >> 2;
-        for (uint w = tid; w < tile_words; w += uint(WG_SIZE)) {
-            uint base_i = w * 4u;
-            uint elem_idx = row_base + tile + base_i;
-            uint packed = map_wt[elem_idx / 4u];
-            for (uint s = 0u; s < 4u && (base_i + s) < tile_len; ++s) {
-                uint logical_idx = elem_idx + s;
-                uint group = logical_idx / pc.group_size;
-                uint raw_uint = (packed >> (s * 8u)) & 0xFFu;
-                sum += a_tile[base_i + s] *
-                    (float(raw_uint) * qparams[group * 2u] + qparams[group * 2u + 1u]);
-            }
-        }
-        barrier();
+    for (uint k = tid; k < pc.K; k += 128u) {
+        sum += map_act[a_base + k] * load_q8(row_base + k);
     }
 
     partial[tid] = sum;
     barrier();
 
-    for (uint stride = uint(WG_SIZE >> 1); stride > 0u; stride >>= 1u) {
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
         if (tid < stride) {
             partial[tid] += partial[tid + stride];
         }

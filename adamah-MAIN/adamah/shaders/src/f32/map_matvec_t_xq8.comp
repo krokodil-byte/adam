@@ -2,16 +2,10 @@
 
 #ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
 #define WG_SIZE 32
-#define TILE_K 64
-#define MAX_ROWS_PER_WG 4
 #elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
-#define WG_SIZE 128
-#define TILE_K 128
-#define MAX_ROWS_PER_WG 4
+#define WG_SIZE 64
 #else
 #define WG_SIZE 128
-#define TILE_K 128
-#define MAX_ROWS_PER_WG 4
 #endif
 
 layout(local_size_x = WG_SIZE) in;
@@ -20,7 +14,6 @@ layout(push_constant) uniform PushConstants {
     uint K;
     uint N;
     uint group_size;
-    uint rows_per_wg;
 } pc;
 
 layout(set = 0, binding = 0) buffer ActBuffer  { float map_act[]; };
@@ -30,75 +23,41 @@ layout(set = 0, binding = 3) buffer LocsB      { uint  locs_b[];  };
 layout(set = 0, binding = 4) buffer LocsC      { uint  locs_c[];  };
 layout(set = 0, binding = 5) buffer QParams    { float qparams[]; };
 
-shared float a_tile[TILE_K];
-shared float partial[MAX_ROWS_PER_WG * WG_SIZE];
+shared float partial[WG_SIZE];
+
+float load_q8(uint idx) {
+    uint word_idx = idx / 4u;
+    uint sub_idx  = idx % 4u;
+    uint raw_uint = (map_wt[word_idx] >> (sub_idx * 8u)) & 0xFFu;
+    uint group = idx / pc.group_size;
+    return float(raw_uint) * qparams[group * 2u] + qparams[group * 2u + 1u];
+}
 
 void main() {
-    uint base_row = gl_WorkGroupID.x * pc.rows_per_wg;
-    if (base_row >= pc.N) return;
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.N) return;
 
     uint lid = gl_LocalInvocationID.x;
     uint a_base = locs_a[0];
     uint b_base = locs_b[0];
     uint c_base = locs_c[0];
-    float sums[MAX_ROWS_PER_WG];
-    for (uint r = 0u; r < MAX_ROWS_PER_WG; ++r) {
-        sums[r] = 0.0;
+    float sum = 0.0;
+    uint row_base = b_base + row * pc.K;
+    for (uint k = lid; k < pc.K; k += uint(WG_SIZE)) {
+        sum += map_act[a_base + k] * load_q8(row_base + k);
     }
 
-    for (uint tile = 0u; tile < pc.K; tile += TILE_K) {
-        for (uint i = lid; i < TILE_K; i += uint(WG_SIZE)) {
-            uint k = tile + i;
-            a_tile[i] = (k < pc.K) ? map_act[a_base + k] : 0.0;
-        }
-        barrier();
-
-        uint tile_len = min(uint(TILE_K), pc.K - tile);
-        uint tile_words = (tile_len + 3u) >> 2;
-        for (uint r = 0u; r < pc.rows_per_wg && r < MAX_ROWS_PER_WG; ++r) {
-            uint row = base_row + r;
-            if (row >= pc.N) break;
-            uint row_base = b_base + row * pc.K;
-            for (uint w = lid; w < tile_words; w += uint(WG_SIZE)) {
-                uint base_i = w * 4u;
-                uint elem_idx = row_base + tile + base_i;
-                uint packed = map_wt[elem_idx / 4u];
-                for (uint s = 0u; s < 4u && (base_i + s) < tile_len; ++s) {
-                    uint logical_idx = elem_idx + s;
-                    uint group = logical_idx / pc.group_size;
-                    uint raw_uint = (packed >> (s * 8u)) & 0xFFu;
-                    sums[r] += a_tile[base_i + s] *
-                        (float(raw_uint) * qparams[group * 2u] + qparams[group * 2u + 1u]);
-                }
-            }
-        }
-        barrier();
-    }
-
-    for (uint r = 0u; r < pc.rows_per_wg && r < MAX_ROWS_PER_WG; ++r) {
-        uint row = base_row + r;
-        if (row >= pc.N) break;
-        partial[r * uint(WG_SIZE) + lid] = sums[r];
-    }
+    partial[lid] = sum;
     barrier();
 
     for (uint stride = uint(WG_SIZE >> 1); stride > 0u; stride >>= 1u) {
-        for (uint r = 0u; r < pc.rows_per_wg && r < MAX_ROWS_PER_WG; ++r) {
-            uint row = base_row + r;
-            if (row >= pc.N) break;
-            uint off = r * uint(WG_SIZE);
-            if (lid < stride) {
-                partial[off + lid] += partial[off + lid + stride];
-            }
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
         }
         barrier();
     }
 
     if (lid == 0u) {
-        for (uint r = 0u; r < pc.rows_per_wg && r < MAX_ROWS_PER_WG; ++r) {
-            uint row = base_row + r;
-            if (row >= pc.N) break;
-            map_act[c_base + row] = partial[r * uint(WG_SIZE)];
-        }
+        map_act[c_base + row] = partial[0];
     }
 }
