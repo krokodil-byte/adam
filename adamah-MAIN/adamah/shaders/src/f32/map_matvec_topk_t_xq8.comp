@@ -3,12 +3,15 @@
 #ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
 #define WG_SIZE 32
 #define TILE_K 64
+#define ROWS_PER_ITER 2
 #elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
-#define WG_SIZE 64
+#define WG_SIZE 128
 #define TILE_K 128
+#define ROWS_PER_ITER 4
 #else
 #define WG_SIZE 128
 #define TILE_K 128
+#define ROWS_PER_ITER 1
 #endif
 
 layout(local_size_x = WG_SIZE) in;
@@ -37,7 +40,7 @@ layout(set = 0, binding = 6) buffer ValDstLocs      { uint  locs_val_dst[]; };
 layout(set = 0, binding = 7) buffer QParams         { float qparams[]; };
 
 shared float a_tile[TILE_K];
-shared float partial[WG_SIZE];
+shared float partial[ROWS_PER_ITER * WG_SIZE];
 shared float top_vals[TOPK_MAX];
 shared uint  top_idxs[TOPK_MAX];
 
@@ -95,9 +98,11 @@ void main() {
     uint a_base = locs_a[0];
     uint b_base = locs_b[0];
 
-    for (uint row = row_start; row < row_end; ++row) {
-        uint row_base = b_base + row * pc.K;
-        float sum = 0.0;
+    for (uint row_block = row_start; row_block < row_end; row_block += ROWS_PER_ITER) {
+        float sums[ROWS_PER_ITER];
+        for (uint r = 0u; r < ROWS_PER_ITER; ++r) {
+            sums[r] = 0.0;
+        }
 
         for (uint tile = 0u; tile < pc.K; tile += TILE_K) {
             for (uint i = tid; i < TILE_K; i += uint(WG_SIZE)) {
@@ -107,27 +112,46 @@ void main() {
             barrier();
 
             uint tile_len = min(uint(TILE_K), pc.K - tile);
-            for (uint i = tid; i < tile_len; i += uint(WG_SIZE)) {
-                sum += a_tile[i] * load_q8(row_base + tile + i);
+            for (uint r = 0u; r < ROWS_PER_ITER; ++r) {
+                uint row = row_block + r;
+                if (row >= row_end) break;
+                uint row_base = b_base + row * pc.K;
+                for (uint i = tid; i < tile_len; i += uint(WG_SIZE)) {
+                    sums[r] += a_tile[i] * load_q8(row_base + tile + i);
+                }
             }
+            barrier();
         }
 
-        partial[tid] = sum;
+        for (uint r = 0u; r < ROWS_PER_ITER; ++r) {
+            uint row = row_block + r;
+            if (row >= row_end) break;
+            partial[r * uint(WG_SIZE) + tid] = sums[r];
+        }
         barrier();
 
         for (uint stride = uint(WG_SIZE >> 1); stride > 0u; stride >>= 1u) {
-            if (tid < stride) {
-                partial[tid] += partial[tid + stride];
+            for (uint r = 0u; r < ROWS_PER_ITER; ++r) {
+                uint row = row_block + r;
+                if (row >= row_end) break;
+                uint off = r * uint(WG_SIZE);
+                if (tid < stride) {
+                    partial[off + tid] += partial[off + tid + stride];
+                }
             }
             barrier();
         }
 
         if (tid == 0u) {
-            float val = partial[0];
-            if (pc.n_penalty > 0u && row_is_penalized(row)) {
-                val = (val > 0.0) ? (val / pc.repeat_penalty) : (val * pc.repeat_penalty);
+            for (uint r = 0u; r < ROWS_PER_ITER; ++r) {
+                uint row = row_block + r;
+                if (row >= row_end) break;
+                float val = partial[r * uint(WG_SIZE)];
+                if (pc.n_penalty > 0u && row_is_penalized(row)) {
+                    val = (val > 0.0) ? (val / pc.repeat_penalty) : (val * pc.repeat_penalty);
+                }
+                insert_topk(val, row, out_count);
             }
-            insert_topk(val, row, out_count);
         }
         barrier();
     }

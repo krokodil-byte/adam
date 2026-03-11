@@ -6298,10 +6298,7 @@ static int exec_matvec_t_xq_internal(Pipeline *pipe, uint32_t map_act_id,
                                      uint32_t locs_b_handle,
                                      uint32_t locs_c_handle, uint32_t K,
                                      uint32_t N) {
-  uint32_t rows_per_group = 1u;
-  if (gpu_caps.max_workgroup_size <= 256) {
-    rows_per_group = 4u;
-  }
+  uint32_t rows_per_group = 4u;
   if (rows_per_group > N)
     rows_per_group = N;
   if (rows_per_group == 0)
