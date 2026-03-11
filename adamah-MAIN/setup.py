@@ -34,6 +34,13 @@ def shader_compile_args():
     return args
 
 
+def shader_target_args():
+    profile = get_shader_profile()
+    if profile.startswith('broadcom_v3dv'):
+        return ['--target-env', 'vulkan1.1']
+    return []
+
+
 def compile_shaders(pkg_dir):
     """Compile all .comp GLSL shaders to .spv SPIR-V."""
     src_dir = os.path.join(pkg_dir, 'shaders', 'src')
@@ -58,6 +65,7 @@ def compile_shaders(pkg_dir):
 
     profile = get_shader_profile() or 'default'
     extra_args = shader_compile_args()
+    target_args = shader_target_args()
     print(f"ADAMAH: Compiling shaders for profile '{profile}'")
     ok = True
     for dtype_dir in sorted(os.listdir(src_dir)):
@@ -77,7 +85,7 @@ def compile_shaders(pkg_dir):
 
             print(f"  {dtype_dir}/{comp_file} -> {spv_name}")
             ret = subprocess.run(
-                [glslang, '-V', *extra_args, src_path, '-o', dst_path],
+                [glslang, '-V', *target_args, *extra_args, src_path, '-o', dst_path],
                 capture_output=True, text=True
             )
             if ret.returncode != 0:

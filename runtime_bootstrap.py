@@ -58,6 +58,13 @@ def _shader_compile_args() -> list[str]:
     return args
 
 
+def _shader_target_args() -> list[str]:
+    profile = _shader_profile()
+    if profile.startswith("broadcom_v3dv"):
+        return ["--target-env", "vulkan1.1"]
+    return []
+
+
 def ensure_python_deps(auto_install: bool = True) -> None:
     missing = [pkg for mod, pkg in RUNTIME_REQUIREMENTS if importlib.util.find_spec(mod) is None]
     if not missing:
@@ -80,6 +87,7 @@ def _compile_shaders(pkg_dir: Path) -> None:
             )
         return
     compile_args = _shader_compile_args()
+    target_args = _shader_target_args()
     profile = _shader_profile() or "default"
     print(f"ADAMAH: Compiling shaders for profile '{profile}'")
     for dtype_dir in sorted(src_dir.iterdir()):
@@ -89,7 +97,7 @@ def _compile_shaders(pkg_dir: Path) -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         for comp_file in sorted(dtype_dir.glob("*.comp")):
             dst = out_dir / (comp_file.stem + ".spv")
-            _run([glslang, "-V", *compile_args, str(comp_file), "-o", str(dst)], cwd=ROOT)
+            _run([glslang, "-V", *target_args, *compile_args, str(comp_file), "-o", str(dst)], cwd=ROOT)
     f32_dir = pkg_dir / "shaders" / "f32"
     root_dir = pkg_dir / "shaders"
     if f32_dir.is_dir():

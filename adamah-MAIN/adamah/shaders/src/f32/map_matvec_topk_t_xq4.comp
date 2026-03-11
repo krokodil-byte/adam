@@ -1,5 +1,13 @@
 #version 450
 
+#if defined(ADAMAH_PROFILE_BROADCOM_V3DV_NARROW) || defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#define ADAMAH_USE_SUBGROUP 1
+#else
+#define ADAMAH_USE_SUBGROUP 0
+#endif
+
 #ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
 #define WG_SIZE 32
 #define TILE_K 64
@@ -123,6 +131,36 @@ void main() {
             barrier();
         }
 
+#if ADAMAH_USE_SUBGROUP
+        uint subgroup_count = (uint(WG_SIZE) + gl_SubgroupSize - 1u) / gl_SubgroupSize;
+        for (uint r = 0u; r < ROWS_PER_ITER; ++r) {
+            uint row = row_block + r;
+            if (row >= row_end) break;
+            float subgroup_sum = subgroupAdd(sums[r]);
+            if (subgroupElect()) {
+                partial[r * uint(WG_SIZE) + gl_SubgroupID] = subgroup_sum;
+            }
+        }
+        barrier();
+
+        if (gl_SubgroupID == 0u) {
+            for (uint r = 0u; r < ROWS_PER_ITER; ++r) {
+                uint row = row_block + r;
+                if (row >= row_end) break;
+                float lane_val = (gl_SubgroupInvocationID < subgroup_count)
+                    ? partial[r * uint(WG_SIZE) + gl_SubgroupInvocationID]
+                    : 0.0;
+                float total = subgroupAdd(lane_val);
+                if (subgroupElect()) {
+                    float val = total;
+                    if (pc.n_penalty > 0u && row_is_penalized(row)) {
+                        val = (val > 0.0) ? (val / pc.repeat_penalty) : (val * pc.repeat_penalty);
+                    }
+                    insert_topk(val, row, out_count);
+                }
+            }
+        }
+#else
         for (uint r = 0u; r < ROWS_PER_ITER; ++r) {
             uint row = row_block + r;
             if (row >= row_end) break;
@@ -153,6 +191,7 @@ void main() {
                 insert_topk(val, row, out_count);
             }
         }
+#endif
         barrier();
     }
 

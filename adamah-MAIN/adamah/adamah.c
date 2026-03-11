@@ -109,6 +109,9 @@ typedef struct {
   uint32_t max_compute_units;  // Approximate compute units (from subgroup size)
   uint32_t fusion_max_ops;     // Dynamic fusion queue size
   uint32_t optimal_batch_size; // Optimal ops per batch
+  uint32_t subgroup_size;
+  uint32_t subgroup_supported_stages;
+  uint32_t subgroup_supported_ops;
 } GpuCaps;
 
 static GpuCaps gpu_caps = {0};
@@ -1334,6 +1337,25 @@ int adamah_init_ex(uint64_t hot_bytes, uint64_t cold_bytes) {
   gpu_caps.max_workgroup_size = props.limits.maxComputeWorkGroupSize[0];
   gpu_caps.max_workgroups = props.limits.maxComputeWorkGroupCount[0];
   gpu_caps.max_descriptor_sets = props.limits.maxBoundDescriptorSets;
+  gpu_caps.subgroup_size = 0;
+  gpu_caps.subgroup_supported_stages = 0;
+  gpu_caps.subgroup_supported_ops = 0;
+  {
+    PFN_vkGetPhysicalDeviceProperties2 get_props2 =
+        (PFN_vkGetPhysicalDeviceProperties2)vkGetInstanceProcAddr(
+            ctx.instance, "vkGetPhysicalDeviceProperties2");
+    if (get_props2) {
+      VkPhysicalDeviceSubgroupProperties subgroup_props = {
+          .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+      VkPhysicalDeviceProperties2 props2 = {
+          .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+          .pNext = &subgroup_props};
+      get_props2(ctx.phys, &props2);
+      gpu_caps.subgroup_size = subgroup_props.subgroupSize;
+      gpu_caps.subgroup_supported_stages = subgroup_props.supportedStages;
+      gpu_caps.subgroup_supported_ops = subgroup_props.supportedOperations;
+    }
+  }
 
   // Use maxComputeWorkGroupInvocations as primary indicator of GPU compute
   // power This is the max threads per workgroup - directly reflects GPU
@@ -1383,10 +1405,10 @@ int adamah_init_ex(uint64_t hot_bytes, uint64_t cold_bytes) {
 
   fprintf(stderr,
           "[ADAMAH] GPU Caps: VRAM=%.1fGB, maxInvocations=%u, "
-          "compute_units=%u, fusion_max_ops=%u, optimal_batch=%u\n",
+          "compute_units=%u, fusion_max_ops=%u, optimal_batch=%u, subgroup=%u\n",
           (double)gpu_caps.vram_bytes / (1024.0 * 1024.0 * 1024.0),
           max_invocations, gpu_caps.max_compute_units, gpu_caps.fusion_max_ops,
-          gpu_caps.optimal_batch_size);
+          gpu_caps.optimal_batch_size, gpu_caps.subgroup_size);
 
   // Find compute queue
   uint32_t qfc = 0;
