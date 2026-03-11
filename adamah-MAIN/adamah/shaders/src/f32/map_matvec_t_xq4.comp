@@ -33,14 +33,6 @@ layout(set = 0, binding = 5) buffer QParams    { float qparams[]; };
 shared float a_tile[TILE_K];
 shared float partial[MAX_ROWS_PER_WG * WG_SIZE];
 
-float load_q4(uint idx) {
-    uint word_idx = idx / 8u;
-    uint sub_idx  = idx % 8u;
-    uint raw = (map_wt[word_idx] >> (sub_idx * 4u)) & 0xFu;
-    uint group = idx / pc.group_size;
-    return float(raw) * qparams[group * 2u] + qparams[group * 2u + 1u];
-}
-
 void main() {
     uint base_row = gl_WorkGroupID.x * pc.rows_per_wg;
     if (base_row >= pc.N) return;
@@ -62,12 +54,22 @@ void main() {
         barrier();
 
         uint tile_len = min(uint(TILE_K), pc.K - tile);
+        uint tile_words = (tile_len + 7u) >> 3;
         for (uint r = 0u; r < pc.rows_per_wg && r < MAX_ROWS_PER_WG; ++r) {
             uint row = base_row + r;
             if (row >= pc.N) break;
             uint row_base = b_base + row * pc.K;
-            for (uint i = lid; i < tile_len; i += uint(WG_SIZE)) {
-                sums[r] += a_tile[i] * load_q4(row_base + tile + i);
+            for (uint w = lid; w < tile_words; w += uint(WG_SIZE)) {
+                uint base_i = w * 8u;
+                uint elem_idx = row_base + tile + base_i;
+                uint packed = map_wt[elem_idx / 8u];
+                for (uint s = 0u; s < 8u && (base_i + s) < tile_len; ++s) {
+                    uint logical_idx = elem_idx + s;
+                    uint group = logical_idx / pc.group_size;
+                    uint raw = (packed >> (s * 4u)) & 0xFu;
+                    sums[r] += a_tile[base_i + s] *
+                        (float(raw) * qparams[group * 2u] + qparams[group * 2u + 1u]);
+                }
             }
         }
         barrier();

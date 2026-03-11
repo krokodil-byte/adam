@@ -44,14 +44,6 @@ shared float a_tile[TILE_K];
 shared float top_vals[TOPK_MAX];
 shared uint  top_idxs[TOPK_MAX];
 
-float load_q4(uint idx) {
-    uint word_idx = idx / 8u;
-    uint sub_idx  = idx % 8u;
-    uint raw = (map_wt[word_idx] >> (sub_idx * 4u)) & 0xFu;
-    uint group = idx / pc.group_size;
-    return float(raw) * qparams[group * 2u] + qparams[group * 2u + 1u];
-}
-
 bool better(float cand_val, uint cand_idx, float best_val, uint best_idx) {
     if (best_idx == INVALID_IDX) return true;
     if (cand_idx == INVALID_IDX) return false;
@@ -112,12 +104,22 @@ void main() {
             barrier();
 
             uint tile_len = min(uint(TILE_K), pc.K - tile);
+            uint tile_words = (tile_len + 7u) >> 3;
             for (uint r = 0u; r < ROWS_PER_ITER; ++r) {
                 uint row = row_block + r;
                 if (row >= row_end) break;
                 uint row_base = b_base + row * pc.K;
-                for (uint i = tid; i < tile_len; i += uint(WG_SIZE)) {
-                    sums[r] += a_tile[i] * load_q4(row_base + tile + i);
+                for (uint w = tid; w < tile_words; w += uint(WG_SIZE)) {
+                    uint base_i = w * 8u;
+                    uint elem_idx = row_base + tile + base_i;
+                    uint packed = map_wt[elem_idx / 8u];
+                    for (uint s = 0u; s < 8u && (base_i + s) < tile_len; ++s) {
+                        uint logical_idx = elem_idx + s;
+                        uint group = logical_idx / pc.group_size;
+                        uint raw = (packed >> (s * 4u)) & 0xFu;
+                        sums[r] += a_tile[base_i + s] *
+                            (float(raw) * qparams[group * 2u] + qparams[group * 2u + 1u]);
+                    }
                 }
             }
             barrier();
