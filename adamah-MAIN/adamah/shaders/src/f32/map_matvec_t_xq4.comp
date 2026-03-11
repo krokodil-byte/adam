@@ -1,13 +1,5 @@
 #version 450
 
-#if defined(ADAMAH_PROFILE_BROADCOM_V3DV_NARROW) || defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
-#extension GL_KHR_shader_subgroup_basic : enable
-#extension GL_KHR_shader_subgroup_arithmetic : enable
-#define ADAMAH_USE_SUBGROUP 1
-#else
-#define ADAMAH_USE_SUBGROUP 0
-#endif
-
 #ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
 #define WG_SIZE 32
 #define TILE_K 64
@@ -81,32 +73,6 @@ void main() {
         barrier();
     }
 
-#if ADAMAH_USE_SUBGROUP
-    uint subgroup_count = (uint(WG_SIZE) + gl_SubgroupSize - 1u) / gl_SubgroupSize;
-    for (uint r = 0u; r < pc.rows_per_wg && r < MAX_ROWS_PER_WG; ++r) {
-        uint row = base_row + r;
-        if (row >= pc.N) break;
-        float subgroup_sum = subgroupAdd(sums[r]);
-        if (subgroupElect()) {
-            partial[r * uint(WG_SIZE) + gl_SubgroupID] = subgroup_sum;
-        }
-    }
-    barrier();
-
-    if (gl_SubgroupID == 0u) {
-        for (uint r = 0u; r < pc.rows_per_wg && r < MAX_ROWS_PER_WG; ++r) {
-            uint row = base_row + r;
-            if (row >= pc.N) break;
-            float lane_val = (gl_SubgroupInvocationID < subgroup_count)
-                ? partial[r * uint(WG_SIZE) + gl_SubgroupInvocationID]
-                : 0.0;
-            float total = subgroupAdd(lane_val);
-            if (subgroupElect()) {
-                map_act[c_base + row] = total;
-            }
-        }
-    }
-#else
     for (uint r = 0u; r < pc.rows_per_wg && r < MAX_ROWS_PER_WG; ++r) {
         uint row = base_row + r;
         if (row >= pc.N) break;
@@ -133,5 +99,4 @@ void main() {
             map_act[c_base + row] = partial[r * uint(WG_SIZE)];
         }
     }
-#endif
 }
