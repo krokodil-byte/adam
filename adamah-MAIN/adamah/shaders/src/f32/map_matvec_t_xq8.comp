@@ -5,7 +5,7 @@
 #define TILE_K 64
 #define MAX_ROWS_PER_WG 4
 #elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
-#define WG_SIZE 64
+#define WG_SIZE 128
 #define TILE_K 128
 #define MAX_ROWS_PER_WG 4
 #else
