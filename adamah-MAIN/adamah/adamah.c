@@ -3221,8 +3221,8 @@ static int init_pipelines(void) {
   if (create_pipeline(&ctx.rmsnorm_x_pipe, "map_rmsnorm_x.spv", 5, 12) != 0) {
     fprintf(stderr, "ADAMAH: Warning - rmsnorm_x shader not found\n");
   }
-  // Cross-map F32×Q4 matvec: K,N,group_size = 12 bytes, 6 bindings
-  if (create_pipeline(&ctx.matvec_t_xq4_pipe, "map_matvec_t_xq4.spv", 6, 12) != 0) {
+  // Cross-map F32×Q4 matvec: K,N,group_size,rows_per_wg = 16 bytes, 6 bindings
+  if (create_pipeline(&ctx.matvec_t_xq4_pipe, "map_matvec_t_xq4.spv", 6, 16) != 0) {
     fprintf(stderr, "ADAMAH: Warning - matvec_t_xq4 shader not found\n");
   }
   if (create_pipeline(&ctx.matvec_topk_t_xq4_pipe, "map_matvec_topk_t_xq4.spv", 8, 28) != 0) {
@@ -3236,7 +3236,7 @@ static int init_pipelines(void) {
   if (create_pipeline(&ctx.matmul_xq4_pipe, "map_matmul_xq4.spv", 6, 20) != 0) {
     fprintf(stderr, "ADAMAH: Warning - matmul_xq4 shader not found\n");
   }
-  if (create_pipeline(&ctx.matvec_t_xq8_pipe, "map_matvec_t_xq8.spv", 6, 12) != 0) {
+  if (create_pipeline(&ctx.matvec_t_xq8_pipe, "map_matvec_t_xq8.spv", 6, 16) != 0) {
     fprintf(stderr, "ADAMAH: Warning - matvec_t_xq8 shader not found\n");
   }
   if (create_pipeline(&ctx.matvec_topk_t_xq8_pipe, "map_matvec_topk_t_xq8.spv", 8, 28) != 0) {
@@ -6276,7 +6276,11 @@ static int exec_matvec_t_xq_internal(Pipeline *pipe, uint32_t map_act_id,
                                      uint32_t locs_b_handle,
                                      uint32_t locs_c_handle, uint32_t K,
                                      uint32_t N) {
-  const uint32_t rows_per_group = 1;
+  uint32_t rows_per_group = (gpu_caps.max_workgroup_size <= 256) ? 4u : 1u;
+  if (rows_per_group > N)
+    rows_per_group = N;
+  if (rows_per_group == 0)
+    rows_per_group = 1;
   if (map_act_id >= MAX_MAPS || !ctx.maps[map_act_id].active)
     return ADAMAH_ERR_INVALID;
   if (map_wt_id >= MAX_MAPS || !ctx.maps[map_wt_id].active)
@@ -6336,13 +6340,13 @@ static int exec_matvec_t_xq_internal(Pipeline *pipe, uint32_t map_act_id,
   }
   vkUpdateDescriptorSets(ctx.device, 6, writes, 0, NULL);
 
-  uint32_t push[3] = {K, N, m_wt->group_size};
+  uint32_t push[4] = {K, N, m_wt->group_size, rows_per_group};
   cmd_begin();
   vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->pipeline);
   vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                           pipe->pipe_layout, 0, 1, &ds, 0, NULL);
   vkCmdPushConstants(ctx.cmd, pipe->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                     12, push);
+                     16, push);
   vkCmdDispatch(ctx.cmd, (N + rows_per_group - 1) / rows_per_group, 1, 1);
   cmd_barrier_after_dispatch();
   cmd_submit();
