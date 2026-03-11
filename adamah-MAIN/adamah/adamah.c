@@ -6278,7 +6278,7 @@ static int exec_matvec_t_xq_internal(Pipeline *pipe, uint32_t map_act_id,
                                      uint32_t N) {
   uint32_t rows_per_group = 1u;
   if (gpu_caps.max_workgroup_size <= 256) {
-    rows_per_group = (gpu_caps.optimal_batch_size <= 128) ? 8u : 4u;
+    rows_per_group = 4u;
   }
   if (rows_per_group > N)
     rows_per_group = N;
