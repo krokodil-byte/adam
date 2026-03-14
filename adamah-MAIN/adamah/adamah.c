@@ -63,6 +63,10 @@
 #define FUSION_MAX_LEVELS 128
 #define FUSION_MAX_LOCS 8192
 
+#define FUSION_SCHEDULER_LEGACY 0
+#define FUSION_SCHEDULER_ALIAS_SAFE 1
+#define FUSION_SCHEDULER_LEVEL_BATCHED 2
+
 // Operation types for fusion
 #define FUSE_OP_UNARY 1
 #define FUSE_OP_BINARY 2
@@ -71,6 +75,19 @@
 #define FUSE_OP_SOFTMAX 5
 #define FUSE_OP_LAYERNORM 6
 #define FUSE_OP_BROADCAST 7
+#define FUSE_OP_RMSNORM 8
+#define FUSE_OP_RMSNORM_X 9
+#define FUSE_OP_ROPE 10
+#define FUSE_OP_ROW_COPY 11
+#define FUSE_OP_ATTN_SOFTMAX_ABS 12
+#define FUSE_OP_MATMUL_T 13
+#define FUSE_OP_MATMUL_T_X 14
+#define FUSE_OP_MATMUL_T_XQ4 15
+#define FUSE_OP_MATMUL_T_XQ8 16
+
+#define LOC_ALIAS_NONE 0
+#define LOC_ALIAS_CONTIG 1
+#define LOC_ALIAS_ROW_BASES 2
 
 // Forward declarations
 int map_destroy(uint32_t id);
@@ -83,11 +100,23 @@ int map_set_qparams(uint32_t map_id, const float *scales,
 int adamah_probe_device(uint64_t *heap_bytes, uint64_t *budget_bytes,
                         uint64_t *usage_bytes, uint32_t *device_type);
 
+typedef struct {
+  uint8_t valid;
+  uint8_t kind;
+  uint16_t reserved;
+  uint32_t map_id;
+  uint32_t start;
+  uint32_t count;
+  uint32_t stride;
+  uint32_t row_size;
+} LocAliasMeta;
+
 // Fusion operation entry
 typedef struct {
   int op_type;      // FUSE_OP_UNARY, FUSE_OP_BINARY, etc.
   uint32_t op_code; // specific op (EXP, ADD, etc.) or mode flag for fused ops
   uint32_t map_id;
+  uint32_t map_id2; // second map for cross-map ops (RMSNORM_X)
   uint32_t locs_src;  // handle
   uint32_t locs_src2; // handle (for binary ops)
   uint32_t locs_dst;  // handle
@@ -96,8 +125,11 @@ typedef struct {
   // Extra params for matmul, etc.
   uint32_t M, K, N;
   uint32_t locs_extra[4]; // for matmul: locs_a, locs_b, locs_c
-  float scalar;           // for ops with scalar
-  float eps;              // for layernorm
+  float scalar;           // for ops with scalar (scale for attn_softmax_abs)
+  float scalar2;          // second float param (cap for attn_softmax_abs, freq_base for rope)
+  float eps;              // for layernorm / rmsnorm
+  uint32_t u32_a, u32_b; // extra uint32 params (pos_offset, n_heads, etc.)
+  LocAliasMeta write_alias;
 } FuseOp;
 
 // GPU capabilities - set during init based on device properties
@@ -123,9 +155,101 @@ typedef struct {
   int loc_write_level[FUSION_MAX_LOCS]; // last write level for each loc handle
   int enabled;
   int max_level;
+  int scheduler_mode;
 } FusionCtx;
 
 static FusionCtx fusion = {0};
+
+typedef struct {
+  uint64_t dispatch_count;
+  uint64_t submit_count;
+  uint64_t barrier_count;
+  uint64_t fusion_flush_count;
+  uint64_t descriptor_set_update_count;
+  uint64_t descriptor_cache_hit_count;
+  uint64_t descriptor_cache_miss_count;
+  uint64_t alias_conflict_count;
+  uint64_t scheduler_mode;
+} AdamahStats;
+
+static AdamahStats native_stats = {0};
+static LocAliasMeta loc_alias_meta[MAX_RES + 1] = {0};
+
+void adamah_stats_reset(void) {
+  memset(&native_stats, 0, sizeof(native_stats));
+  native_stats.scheduler_mode = (uint64_t)fusion.scheduler_mode;
+}
+
+void adamah_stats_get(uint64_t *dispatch_count, uint64_t *submit_count,
+                      uint64_t *barrier_count, uint64_t *fusion_flush_count,
+                      uint64_t *descriptor_set_update_count,
+                      uint64_t *descriptor_cache_hit_count,
+                      uint64_t *descriptor_cache_miss_count,
+                      uint64_t *alias_conflict_count,
+                      uint64_t *scheduler_mode) {
+  if (dispatch_count)
+    *dispatch_count = native_stats.dispatch_count;
+  if (submit_count)
+    *submit_count = native_stats.submit_count;
+  if (barrier_count)
+    *barrier_count = native_stats.barrier_count;
+  if (fusion_flush_count)
+    *fusion_flush_count = native_stats.fusion_flush_count;
+  if (descriptor_set_update_count)
+    *descriptor_set_update_count = native_stats.descriptor_set_update_count;
+  if (descriptor_cache_hit_count)
+    *descriptor_cache_hit_count = native_stats.descriptor_cache_hit_count;
+  if (descriptor_cache_miss_count)
+    *descriptor_cache_miss_count = native_stats.descriptor_cache_miss_count;
+  if (alias_conflict_count)
+    *alias_conflict_count = native_stats.alias_conflict_count;
+  if (scheduler_mode)
+    *scheduler_mode = (uint64_t)fusion.scheduler_mode;
+}
+
+static void tracked_vkUpdateDescriptorSets(
+    VkDevice device, uint32_t descriptorWriteCount,
+    const VkWriteDescriptorSet *pDescriptorWrites,
+    uint32_t descriptorCopyCount,
+    const VkCopyDescriptorSet *pDescriptorCopies) {
+  native_stats.descriptor_set_update_count += 1;
+  vkUpdateDescriptorSets(device, descriptorWriteCount, pDescriptorWrites,
+                         descriptorCopyCount, pDescriptorCopies);
+}
+
+static VkResult tracked_vkQueueSubmit(VkQueue queue, uint32_t submitCount,
+                                      const VkSubmitInfo *pSubmits,
+                                      VkFence fence) {
+  native_stats.submit_count += (uint64_t)submitCount;
+  return vkQueueSubmit(queue, submitCount, pSubmits, fence);
+}
+
+static void tracked_vkCmdDispatch(VkCommandBuffer commandBuffer,
+                                  uint32_t groupCountX, uint32_t groupCountY,
+                                  uint32_t groupCountZ) {
+  native_stats.dispatch_count += 1;
+  vkCmdDispatch(commandBuffer, groupCountX, groupCountY, groupCountZ);
+}
+
+static void tracked_vkCmdPipelineBarrier(
+    VkCommandBuffer commandBuffer, VkPipelineStageFlags srcStageMask,
+    VkPipelineStageFlags dstStageMask, VkDependencyFlags dependencyFlags,
+    uint32_t memoryBarrierCount, const VkMemoryBarrier *pMemoryBarriers,
+    uint32_t bufferMemoryBarrierCount,
+    const VkBufferMemoryBarrier *pBufferMemoryBarriers,
+    uint32_t imageMemoryBarrierCount,
+    const VkImageMemoryBarrier *pImageMemoryBarriers) {
+  native_stats.barrier_count += 1;
+  vkCmdPipelineBarrier(commandBuffer, srcStageMask, dstStageMask,
+                       dependencyFlags, memoryBarrierCount, pMemoryBarriers,
+                       bufferMemoryBarrierCount, pBufferMemoryBarriers,
+                       imageMemoryBarrierCount, pImageMemoryBarriers);
+}
+
+#define vkUpdateDescriptorSets tracked_vkUpdateDescriptorSets
+#define vkQueueSubmit tracked_vkQueueSubmit
+#define vkCmdDispatch tracked_vkCmdDispatch
+#define vkCmdPipelineBarrier tracked_vkCmdPipelineBarrier
 
 // Forward declarations
 int adamah_fusion_flush(void);
@@ -142,6 +266,7 @@ typedef struct {
   VkBuffer buf;
   VkDeviceMemory mem;
   void *ptr; // Mapped if HOST_VISIBLE
+  VkMemoryPropertyFlags mem_props;
   VkDeviceSize bytes_capacity;
   uint32_t elem_size; // Bytes per element (for bookkeeping)
   int device_local;   // 1 = VRAM, 0 = HOST_VISIBLE
@@ -189,6 +314,9 @@ typedef struct {
   VkPipeline pipeline;
   VkDescriptorPool desc_pool;
   VkDescriptorSet desc_set;
+  uint32_t cache_binding_count;
+  uint8_t cache_valid;
+  VkDescriptorBufferInfo cache_infos[10];
 } Pipeline;
 
 typedef struct {
@@ -332,6 +460,121 @@ static struct {
   char shader_path[512];
 } ctx = {0};
 
+static void loc_alias_meta_reset_all(void) {
+  memset(loc_alias_meta, 0, sizeof(loc_alias_meta));
+}
+
+static LocAliasMeta *loc_alias_meta_mut(uint32_t handle) {
+  if (handle == 0 || handle > MAX_RES)
+    return NULL;
+  return &loc_alias_meta[handle];
+}
+
+static const LocAliasMeta *loc_alias_meta_get(uint32_t handle) {
+  if (handle == 0 || handle > MAX_RES)
+    return NULL;
+  if (!loc_alias_meta[handle].valid)
+    return NULL;
+  return &loc_alias_meta[handle];
+}
+
+void adamah_clear_loc_alias_meta(uint32_t handle) {
+  LocAliasMeta *meta = loc_alias_meta_mut(handle);
+  if (!meta)
+    return;
+  memset(meta, 0, sizeof(*meta));
+}
+
+int adamah_register_loc_span(uint32_t handle, uint32_t map_id, uint32_t start,
+                             uint32_t count) {
+  LocAliasMeta *meta = loc_alias_meta_mut(handle);
+  if (!meta || map_id >= MAX_MAPS || count == 0)
+    return ADAMAH_ERR_INVALID;
+  memset(meta, 0, sizeof(*meta));
+  meta->valid = 1;
+  meta->kind = LOC_ALIAS_CONTIG;
+  meta->map_id = map_id;
+  meta->start = start;
+  meta->count = count;
+  meta->stride = 1;
+  meta->row_size = 1;
+  return ADAMAH_OK;
+}
+
+int adamah_register_row_base_span(uint32_t handle, uint32_t map_id,
+                                  uint32_t start, uint32_t count,
+                                  uint32_t stride, uint32_t row_size) {
+  LocAliasMeta *meta = loc_alias_meta_mut(handle);
+  if (!meta || map_id >= MAX_MAPS || count == 0 || row_size == 0)
+    return ADAMAH_ERR_INVALID;
+  memset(meta, 0, sizeof(*meta));
+  meta->valid = 1;
+  meta->kind = LOC_ALIAS_ROW_BASES;
+  meta->map_id = map_id;
+  meta->start = start;
+  meta->count = count;
+  meta->stride = stride;
+  meta->row_size = row_size;
+  return ADAMAH_OK;
+}
+
+void adamah_fusion_set_scheduler_mode(int mode) {
+  if (mode < FUSION_SCHEDULER_LEGACY || mode > FUSION_SCHEDULER_LEVEL_BATCHED)
+    mode = FUSION_SCHEDULER_LEGACY;
+  if (fusion.n_ops > 0) {
+    adamah_fusion_flush();
+  }
+  fusion.scheduler_mode = mode;
+  native_stats.scheduler_mode = (uint64_t)mode;
+}
+
+int adamah_fusion_get_scheduler_mode(void) { return fusion.scheduler_mode; }
+
+static int desc_buf_info_equal(const VkDescriptorBufferInfo *a,
+                               const VkDescriptorBufferInfo *b) {
+  return a->buffer == b->buffer && a->offset == b->offset &&
+         a->range == b->range;
+}
+
+static VkDescriptorSet prepare_cached_desc_set(
+    Pipeline *p, const VkDescriptorBufferInfo *buf_infos, uint32_t n_infos) {
+  VkDescriptorSet ds = p->desc_set;
+  if (ds == VK_NULL_HANDLE)
+    return VK_NULL_HANDLE;
+
+  int needs_update = (!p->cache_valid) || (p->cache_binding_count != n_infos);
+  if (!needs_update) {
+    for (uint32_t i = 0; i < n_infos; ++i) {
+      if (!desc_buf_info_equal(&p->cache_infos[i], &buf_infos[i])) {
+        needs_update = 1;
+        break;
+      }
+    }
+  }
+
+  if (needs_update) {
+    native_stats.descriptor_cache_miss_count += 1;
+    VkWriteDescriptorSet writes[10];
+    for (uint32_t i = 0; i < n_infos; ++i) {
+      writes[i] = (VkWriteDescriptorSet){
+          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+          .dstSet = ds,
+          .dstBinding = i,
+          .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &buf_infos[i]};
+      p->cache_infos[i] = buf_infos[i];
+    }
+    vkUpdateDescriptorSets(ctx.device, n_infos, writes, 0, NULL);
+    p->cache_binding_count = n_infos;
+    p->cache_valid = 1;
+  } else {
+    native_stats.descriptor_cache_hit_count += 1;
+  }
+
+  return ds;
+}
+
 // ============================================
 // Vulkan Helpers
 // ============================================
@@ -457,6 +700,50 @@ static int create_buffer_ex(VkBuffer *buf, VkDeviceMemory *mem,
 static int create_buffer(VkBuffer *buf, VkDeviceMemory *mem, VkDeviceSize size,
                          VkBufferUsageFlags usage, int device_local) {
   return create_buffer_ex(buf, mem, size, usage, device_local, NULL);
+}
+
+static void flush_mapped_gpu_buf(GpuBuf *b, VkDeviceSize size) {
+  if (!b || !b->ptr)
+    return;
+  if (b->mem_props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    return;
+  VkDeviceSize flush_size = b->bytes_capacity;
+  if (size > 0 && size < flush_size) {
+    flush_size = size;
+    if (ctx.copy_align > 1)
+      flush_size =
+          ((flush_size + ctx.copy_align - 1) / ctx.copy_align) * ctx.copy_align;
+  }
+  if (flush_size > b->bytes_capacity)
+    flush_size = b->bytes_capacity;
+  VkMappedMemoryRange range = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = b->mem,
+      .offset = 0,
+      .size = flush_size};
+  vkFlushMappedMemoryRanges(ctx.device, 1, &range);
+}
+
+static void invalidate_mapped_gpu_buf(GpuBuf *b, VkDeviceSize size) {
+  if (!b || !b->ptr)
+    return;
+  if (b->mem_props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    return;
+  VkDeviceSize inv_size = b->bytes_capacity;
+  if (size > 0 && size < inv_size) {
+    inv_size = size;
+    if (ctx.copy_align > 1)
+      inv_size = ((inv_size + ctx.copy_align - 1) / ctx.copy_align) *
+                 ctx.copy_align;
+  }
+  if (inv_size > b->bytes_capacity)
+    inv_size = b->bytes_capacity;
+  VkMappedMemoryRange range = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = b->mem,
+      .offset = 0,
+      .size = inv_size};
+  vkInvalidateMappedMemoryRanges(ctx.device, 1, &range);
 }
 
 static void cmd_begin(void);
@@ -833,6 +1120,7 @@ static int cache_init(VkDeviceSize hot_bytes, VkDeviceSize cold_bytes) {
   ctx.hot_free_count = 0;
   hot_free_insert(0, ctx.hot_pool_bytes);
   memset(ctx.res, 0, sizeof(ctx.res));
+  loc_alias_meta_reset_all();
   ctx.res_count = 0;
   ctx.res_tick = 0;
   return 0;
@@ -890,6 +1178,8 @@ static void reset_pipeline_desc_pool(Pipeline *p) {
   if (!p->desc_pool)
     return;
   vkResetDescriptorPool(ctx.device, p->desc_pool, 0);
+  p->cache_valid = 0;
+  p->cache_binding_count = 0;
   VkDescriptorSetAllocateInfo dsai = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
       .descriptorPool = p->desc_pool,
@@ -1248,6 +1538,12 @@ void adamah_print_counters(void) {
 int adamah_init_ex(uint64_t hot_bytes, uint64_t cold_bytes) {
   if (ctx.initialized)
     return ADAMAH_OK;
+
+  fusion_reset();
+  fusion.enabled = 0;
+  fusion.scheduler_mode = FUSION_SCHEDULER_LEGACY;
+  loc_alias_meta_reset_all();
+  adamah_stats_reset();
 
   // Create instance
   VkApplicationInfo ai = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -1794,6 +2090,11 @@ void adamah_shutdown(void) {
     vkDestroyInstance(ctx.instance, NULL);
 
   memset(&ctx, 0, sizeof(ctx));
+  fusion_reset();
+  fusion.enabled = 0;
+  fusion.scheduler_mode = FUSION_SCHEDULER_LEGACY;
+  loc_alias_meta_reset_all();
+  adamah_stats_reset();
 }
 
 // ============================================
@@ -2050,6 +2351,7 @@ int map_scatter(uint32_t map_id, const uint32_t *locs, const void *data,
 
     memcpy(stage->ptr, data, (size_t)f32_bytes);
     memcpy((char *)stage->ptr + locs_off, locs, (size_t)locs_bytes);
+    flush_mapped_gpu_buf(stage, upload_sz);
 
     VkDescriptorBufferInfo infos[4] = {
         {.buffer = m->buf,        .range = VK_WHOLE_SIZE},
@@ -2176,6 +2478,7 @@ int map_scatter(uint32_t map_id, const uint32_t *locs, const void *data,
     memcpy((char *)stage_up->ptr, data, (size_t)data_size);
     memcpy((char *)stage_up->ptr + (size_t)locs_offset, locs,
            (size_t)locs_size);
+    flush_mapped_gpu_buf(stage_up, upload_size);
 
     // Update descriptor set
     VkDescriptorBufferInfo buf_infos[3] = {
@@ -2368,6 +2671,7 @@ int map_gather(uint32_t map_id, const uint32_t *locs, void *data,
       goto fallback;
 
     memcpy(stage_up->ptr, locs, (size_t)locs_size);
+    flush_mapped_gpu_buf(stage_up, locs_size);
 
     VkDescriptorBufferInfo buf_infos[3] = {
         {.buffer = m->buf, .range = VK_WHOLE_SIZE},
@@ -2416,6 +2720,7 @@ int map_gather(uint32_t map_id, const uint32_t *locs, void *data,
     vkCmdCopyBuffer(ctx.cmd, dst_buf->buf, stage_down->buf, 1, &dst_copy);
     cmd_submit();
 
+    invalidate_mapped_gpu_buf(stage_down, data_size);
     memcpy(data, stage_down->ptr, (size_t)data_size);
 
     return ADAMAH_OK;
@@ -2543,6 +2848,7 @@ uint64_t map_upload_dev(uint32_t handle, const void *data, uint32_t n_bytes) {
   if (copy_size > n_bytes) {
     memset((char *)stage->ptr + n_bytes, 0, (size_t)(copy_size - n_bytes));
   }
+  flush_mapped_gpu_buf(stage, copy_size);
 
   cmd_begin();
   VkBufferCopy copy = {.srcOffset = 0, .dstOffset = hot_off, .size = copy_size};
@@ -2590,6 +2896,7 @@ int map_download_dev(uint32_t handle, void *data, uint32_t n_bytes) {
   vkCmdCopyBuffer(ctx.cmd, ctx.hot_pool->buf, stage->buf, 1, &copy);
   cmd_submit();
 
+  invalidate_mapped_gpu_buf(stage, copy_size);
   memcpy(data, stage->ptr, n_bytes);
   return ADAMAH_OK;
 }
@@ -3494,23 +3801,120 @@ static int fusion_flush_pending_for_immediate(void) {
 }
 
 // Calculate level for an operation based on its source dependencies
-static int fusion_calc_level(uint32_t locs_src, uint32_t locs_src2) {
+static int fusion_handle_level(uint32_t handle) {
+  if (handle < FUSION_MAX_LOCS && fusion.loc_write_level[handle] >= 0) {
+    return fusion.loc_write_level[handle] + 1;
+  }
+  return 0;
+}
+
+static int fusion_range_overlaps(uint32_t start_a, uint32_t count_a,
+                                 uint32_t start_b, uint32_t count_b) {
+  uint64_t end_a = (uint64_t)start_a + (uint64_t)count_a;
+  uint64_t end_b = (uint64_t)start_b + (uint64_t)count_b;
+  return ((uint64_t)start_a < end_b) && ((uint64_t)start_b < end_a);
+}
+
+static int fusion_alias_overlaps(const LocAliasMeta *a, const LocAliasMeta *b) {
+  if (!a || !b || !a->valid || !b->valid || a->map_id != b->map_id) {
+    return 0;
+  }
+  if (a->kind == LOC_ALIAS_CONTIG && b->kind == LOC_ALIAS_CONTIG) {
+    return fusion_range_overlaps(a->start, a->count, b->start, b->count);
+  }
+  if (a->kind == LOC_ALIAS_ROW_BASES && b->kind == LOC_ALIAS_CONTIG) {
+    for (uint32_t i = 0; i < a->count; ++i) {
+      uint32_t row_start = a->start + i * a->stride;
+      if (fusion_range_overlaps(row_start, a->row_size, b->start, b->count)) {
+        return 1;
+      }
+    }
+    return 0;
+  }
+  if (a->kind == LOC_ALIAS_CONTIG && b->kind == LOC_ALIAS_ROW_BASES) {
+    return fusion_alias_overlaps(b, a);
+  }
+  if (a->kind == LOC_ALIAS_ROW_BASES && b->kind == LOC_ALIAS_ROW_BASES) {
+    for (uint32_t i = 0; i < a->count; ++i) {
+      uint32_t row_a = a->start + i * a->stride;
+      for (uint32_t j = 0; j < b->count; ++j) {
+        uint32_t row_b = b->start + j * b->stride;
+        if (fusion_range_overlaps(row_a, a->row_size, row_b, b->row_size)) {
+          return 1;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+static int fusion_assign_level(int dependency_level) {
+  if (fusion.scheduler_mode == FUSION_SCHEDULER_LEGACY) {
+    return fusion.n_ops;
+  }
+  return dependency_level;
+}
+
+static LocAliasMeta fusion_write_alias_for_handle(uint32_t handle) {
+  const LocAliasMeta *meta = loc_alias_meta_get(handle);
+  if (!meta) {
+    LocAliasMeta none = {0};
+    return none;
+  }
+  return *meta;
+}
+
+static int fusion_calc_level_handles(const uint32_t *read_handles, int n_reads,
+                                     const uint32_t *write_handles,
+                                     int n_writes) {
   int level = 0;
+  int any_alias_conflict = 0;
 
-  // Check first source
-  if (locs_src < FUSION_MAX_LOCS && fusion.loc_write_level[locs_src] >= 0) {
-    level = fusion.loc_write_level[locs_src] + 1;
+  for (int i = 0; i < n_reads; ++i) {
+    int dep = fusion_handle_level(read_handles[i]);
+    if (dep > level)
+      level = dep;
+  }
+  for (int i = 0; i < n_writes; ++i) {
+    int dep = fusion_handle_level(write_handles[i]);
+    if (dep > level)
+      level = dep;
   }
 
-  // Check second source (for binary ops)
-  if (locs_src2 != 0 && locs_src2 < FUSION_MAX_LOCS &&
-      fusion.loc_write_level[locs_src2] >= 0) {
-    int lvl2 = fusion.loc_write_level[locs_src2] + 1;
-    if (lvl2 > level)
-      level = lvl2;
+  if (fusion.scheduler_mode != FUSION_SCHEDULER_ALIAS_SAFE) {
+    return fusion_assign_level(level);
   }
 
-  return level;
+  for (int i = 0; i < fusion.n_ops; ++i) {
+    FuseOp *prior = &fusion.ops[i];
+    if (!prior->write_alias.valid)
+      continue;
+
+    int conflict = 0;
+    for (int j = 0; j < n_reads && !conflict; ++j) {
+      const LocAliasMeta *read_meta = loc_alias_meta_get(read_handles[j]);
+      if (fusion_alias_overlaps(read_meta, &prior->write_alias)) {
+        conflict = 1;
+      }
+    }
+    for (int j = 0; j < n_writes && !conflict; ++j) {
+      const LocAliasMeta *write_meta = loc_alias_meta_get(write_handles[j]);
+      if (fusion_alias_overlaps(write_meta, &prior->write_alias)) {
+        conflict = 1;
+      }
+    }
+    if (!conflict)
+      continue;
+    any_alias_conflict = 1;
+    if (prior->level + 1 > level) {
+      level = prior->level + 1;
+    }
+  }
+
+  if (any_alias_conflict) {
+    native_stats.alias_conflict_count += 1;
+  }
+  return fusion_assign_level(level);
 }
 
 // Mark destination as written at given level
@@ -3540,7 +3944,9 @@ static void fusion_auto_flush_if_needed(int new_level) {
 // Queue a unary operation
 static int fusion_queue_op1(uint32_t map_id, uint32_t op, uint32_t locs_src,
                             uint32_t locs_dst, uint32_t n) {
-  int level = fusion_calc_level(locs_src, 0);
+  uint32_t read_handles[1] = {locs_src};
+  uint32_t write_handles[1] = {locs_dst};
+  int level = fusion_calc_level_handles(read_handles, 1, write_handles, 1);
   fusion_auto_flush_if_needed(level);
 
   FuseOp *fop = &fusion.ops[fusion.n_ops++];
@@ -3552,6 +3958,7 @@ static int fusion_queue_op1(uint32_t map_id, uint32_t op, uint32_t locs_src,
   fop->locs_dst = locs_dst;
   fop->n = n;
   fop->level = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_dst);
   fusion_mark_write(locs_dst, fop->level);
 
   return ADAMAH_OK;
@@ -3560,7 +3967,9 @@ static int fusion_queue_op1(uint32_t map_id, uint32_t op, uint32_t locs_src,
 // Queue a binary operation
 static int fusion_queue_op2(uint32_t map_id, uint32_t op, uint32_t locs_a,
                             uint32_t locs_b, uint32_t locs_dst, uint32_t n) {
-  int level = fusion_calc_level(locs_a, locs_b);
+  uint32_t read_handles[2] = {locs_a, locs_b};
+  uint32_t write_handles[1] = {locs_dst};
+  int level = fusion_calc_level_handles(read_handles, 2, write_handles, 1);
   fusion_auto_flush_if_needed(level);
 
   FuseOp *fop = &fusion.ops[fusion.n_ops++];
@@ -3573,6 +3982,7 @@ static int fusion_queue_op2(uint32_t map_id, uint32_t op, uint32_t locs_a,
   fop->locs_dst = locs_dst;
   fop->n = n;
   fop->level = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_dst);
   fusion_mark_write(locs_dst, fop->level);
 
   return ADAMAH_OK;
@@ -3582,7 +3992,9 @@ static int fusion_queue_op2(uint32_t map_id, uint32_t op, uint32_t locs_a,
 static int fusion_queue_matmul(uint32_t map_id, uint32_t locs_a,
                                uint32_t locs_b, uint32_t locs_c, uint32_t M,
                                uint32_t K, uint32_t N, uint32_t n_ops) {
-  int level = fusion_calc_level(locs_a, locs_b);
+  uint32_t read_handles[2] = {locs_a, locs_b};
+  uint32_t write_handles[1] = {locs_c};
+  int level = fusion_calc_level_handles(read_handles, 2, write_handles, 1);
   fusion_auto_flush_if_needed(level);
 
   FuseOp *fop = &fusion.ops[fusion.n_ops++];
@@ -3602,10 +4014,75 @@ static int fusion_queue_matmul(uint32_t map_id, uint32_t locs_a,
   return ADAMAH_OK;
 }
 
+static int fusion_queue_matmul_t_common(int op_type, uint32_t map_id,
+                                        uint32_t map_id2, uint32_t locs_a,
+                                        uint32_t locs_b, uint32_t locs_c,
+                                        uint32_t M, uint32_t K, uint32_t N,
+                                        uint32_t n_ops) {
+  uint32_t read_handles[2] = {locs_a, locs_b};
+  uint32_t write_handles[1] = {locs_c};
+  int level = fusion_calc_level_handles(read_handles, 2, write_handles, 1);
+  fusion_auto_flush_if_needed(level);
+
+  FuseOp *fop = &fusion.ops[fusion.n_ops++];
+  memset(fop, 0, sizeof(*fop));
+  fop->op_type = op_type;
+  fop->map_id = map_id;
+  fop->map_id2 = map_id2;
+  fop->locs_extra[0] = locs_a;
+  fop->locs_extra[1] = locs_b;
+  fop->locs_extra[2] = locs_c;
+  fop->M = M;
+  fop->K = K;
+  fop->N = N;
+  fop->n = n_ops;
+  fop->level = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_c);
+  fusion_mark_write(locs_c, fop->level);
+
+  return ADAMAH_OK;
+}
+
+static int fusion_queue_matmul_t(uint32_t map_id, uint32_t locs_a,
+                                 uint32_t locs_b, uint32_t locs_c, uint32_t M,
+                                 uint32_t K, uint32_t N, uint32_t n_ops) {
+  return fusion_queue_matmul_t_common(FUSE_OP_MATMUL_T, map_id, 0, locs_a,
+                                      locs_b, locs_c, M, K, N, n_ops);
+}
+
+static int fusion_queue_matmul_t_x(uint32_t map_act_id, uint32_t map_wt_id,
+                                   uint32_t locs_a, uint32_t locs_b,
+                                   uint32_t locs_c, uint32_t M, uint32_t K,
+                                   uint32_t N, uint32_t n_ops) {
+  return fusion_queue_matmul_t_common(FUSE_OP_MATMUL_T_X, map_act_id,
+                                      map_wt_id, locs_a, locs_b, locs_c, M, K,
+                                      N, n_ops);
+}
+
+static int fusion_queue_matmul_t_xq4(uint32_t map_act_id, uint32_t map_wt_id,
+                                     uint32_t locs_a, uint32_t locs_b,
+                                     uint32_t locs_c, uint32_t M, uint32_t K,
+                                     uint32_t N, uint32_t n_ops) {
+  return fusion_queue_matmul_t_common(FUSE_OP_MATMUL_T_XQ4, map_act_id,
+                                      map_wt_id, locs_a, locs_b, locs_c, M, K,
+                                      N, n_ops);
+}
+
+static int fusion_queue_matmul_t_xq8(uint32_t map_act_id, uint32_t map_wt_id,
+                                     uint32_t locs_a, uint32_t locs_b,
+                                     uint32_t locs_c, uint32_t M, uint32_t K,
+                                     uint32_t N, uint32_t n_ops) {
+  return fusion_queue_matmul_t_common(FUSE_OP_MATMUL_T_XQ8, map_act_id,
+                                      map_wt_id, locs_a, locs_b, locs_c, M, K,
+                                      N, n_ops);
+}
+
 // Queue a reduce operation
 static int fusion_queue_reduce(uint32_t map_id, uint32_t op, uint32_t locs_src,
                                uint32_t locs_dst, uint32_t n) {
-  int level = fusion_calc_level(locs_src, 0);
+  uint32_t read_handles[1] = {locs_src};
+  uint32_t write_handles[1] = {locs_dst};
+  int level = fusion_calc_level_handles(read_handles, 1, write_handles, 1);
   fusion_auto_flush_if_needed(level);
 
   FuseOp *fop = &fusion.ops[fusion.n_ops++];
@@ -3617,6 +4094,7 @@ static int fusion_queue_reduce(uint32_t map_id, uint32_t op, uint32_t locs_src,
   fop->locs_dst = locs_dst;
   fop->n = n;
   fop->level = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_dst);
   fusion_mark_write(locs_dst, fop->level);
 
   return ADAMAH_OK;
@@ -3626,7 +4104,9 @@ static int fusion_queue_reduce(uint32_t map_id, uint32_t op, uint32_t locs_src,
 static int fusion_queue_softmax(uint32_t map_id, uint32_t locs_src,
                                 uint32_t locs_dst, uint32_t dim,
                                 uint32_t n_rows, uint32_t abs_base) {
-  int level = fusion_calc_level(locs_src, 0);
+  uint32_t read_handles[1] = {locs_src};
+  uint32_t write_handles[1] = {locs_dst};
+  int level = fusion_calc_level_handles(read_handles, 1, write_handles, 1);
   fusion_auto_flush_if_needed(level);
 
   FuseOp *fop = &fusion.ops[fusion.n_ops++];
@@ -3639,6 +4119,7 @@ static int fusion_queue_softmax(uint32_t map_id, uint32_t locs_src,
   fop->M = dim; // reuse M for dim
   fop->n = n_rows;
   fop->level = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_dst);
   fusion_mark_write(locs_dst, fop->level);
 
   return ADAMAH_OK;
@@ -3649,18 +4130,9 @@ static int fusion_queue_layernorm(uint32_t map_id, uint32_t locs_src,
                                   uint32_t locs_dst, uint32_t locs_gamma,
                                   uint32_t locs_beta, uint32_t dim,
                                   uint32_t n_rows, float eps) {
-  // Layernorm reads src, gamma, beta
-  int level = fusion_calc_level(locs_src, 0);
-  if (locs_gamma < FUSION_MAX_LOCS && fusion.loc_write_level[locs_gamma] >= 0) {
-    int lvl = fusion.loc_write_level[locs_gamma] + 1;
-    if (lvl > level)
-      level = lvl;
-  }
-  if (locs_beta < FUSION_MAX_LOCS && fusion.loc_write_level[locs_beta] >= 0) {
-    int lvl = fusion.loc_write_level[locs_beta] + 1;
-    if (lvl > level)
-      level = lvl;
-  }
+  uint32_t read_handles[3] = {locs_src, locs_gamma, locs_beta};
+  uint32_t write_handles[1] = {locs_dst};
+  int level = fusion_calc_level_handles(read_handles, 3, write_handles, 1);
   fusion_auto_flush_if_needed(level);
 
   FuseOp *fop = &fusion.ops[fusion.n_ops++];
@@ -3675,6 +4147,7 @@ static int fusion_queue_layernorm(uint32_t map_id, uint32_t locs_src,
   fop->n = n_rows;
   fop->eps = eps;
   fop->level = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_dst);
   fusion_mark_write(locs_dst, fop->level);
 
   return ADAMAH_OK;
@@ -3684,7 +4157,9 @@ static int fusion_queue_layernorm(uint32_t map_id, uint32_t locs_src,
 static int fusion_queue_broadcast(uint32_t map_id, uint32_t op, uint32_t locs_a,
                                   uint32_t locs_scalar, uint32_t locs_dst,
                                   uint32_t n) {
-  int level = fusion_calc_level(locs_a, locs_scalar);
+  uint32_t read_handles[2] = {locs_a, locs_scalar};
+  uint32_t write_handles[1] = {locs_dst};
+  int level = fusion_calc_level_handles(read_handles, 2, write_handles, 1);
   fusion_auto_flush_if_needed(level);
 
   FuseOp *fop = &fusion.ops[fusion.n_ops++];
@@ -3697,8 +4172,134 @@ static int fusion_queue_broadcast(uint32_t map_id, uint32_t op, uint32_t locs_a,
   fop->locs_dst = locs_dst;
   fop->n = n;
   fop->level = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_dst);
   fusion_mark_write(locs_dst, fop->level);
 
+  return ADAMAH_OK;
+}
+
+// Queue rmsnorm (same-map)
+static int fusion_queue_rmsnorm(uint32_t map_id, uint32_t locs_src,
+                                uint32_t locs_wt, uint32_t locs_dst,
+                                uint32_t n_rows, uint32_t dim, float eps) {
+  uint32_t read_handles[2] = {locs_src, locs_wt};
+  uint32_t write_handles[1] = {locs_dst};
+  int level = fusion_calc_level_handles(read_handles, 2, write_handles, 1);
+  fusion_auto_flush_if_needed(level);
+  FuseOp *fop = &fusion.ops[fusion.n_ops++];
+  memset(fop, 0, sizeof(*fop));
+  fop->op_type  = FUSE_OP_RMSNORM;
+  fop->map_id   = map_id;
+  fop->locs_src = locs_src;
+  fop->locs_src2= locs_wt;
+  fop->locs_dst = locs_dst;
+  fop->M        = n_rows;
+  fop->K        = dim;
+  fop->eps      = eps;
+  fop->level    = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_dst);
+  fusion_mark_write(locs_dst, fop->level);
+  return ADAMAH_OK;
+}
+
+// Queue cross-map rmsnorm (act from map_id, weights from map_id2)
+static int fusion_queue_rmsnorm_x(uint32_t map_act_id, uint32_t map_wt_id,
+                                   uint32_t locs_src, uint32_t locs_wt,
+                                   uint32_t locs_dst, uint32_t n_rows,
+                                   uint32_t dim, float eps) {
+  uint32_t read_handles[2] = {locs_src, locs_wt};
+  uint32_t write_handles[1] = {locs_dst};
+  int level = fusion_calc_level_handles(read_handles, 2, write_handles, 1);
+  fusion_auto_flush_if_needed(level);
+  FuseOp *fop = &fusion.ops[fusion.n_ops++];
+  memset(fop, 0, sizeof(*fop));
+  fop->op_type  = FUSE_OP_RMSNORM_X;
+  fop->map_id   = map_act_id;
+  fop->map_id2  = map_wt_id;
+  fop->locs_src = locs_src;
+  fop->locs_src2= locs_wt;
+  fop->locs_dst = locs_dst;
+  fop->M        = n_rows;
+  fop->K        = dim;
+  fop->eps      = eps;
+  fop->level    = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_dst);
+  fusion_mark_write(locs_dst, fop->level);
+  return ADAMAH_OK;
+}
+
+// Queue RoPE
+static int fusion_queue_rope(uint32_t map_id, uint32_t locs_src,
+                              uint32_t locs_dst, uint32_t n_tokens,
+                              uint32_t n_heads, uint32_t head_dim,
+                              uint32_t pos_offset, float freq_base) {
+  uint32_t read_handles[1] = {locs_src};
+  uint32_t write_handles[1] = {locs_dst};
+  int level = fusion_calc_level_handles(read_handles, 1, write_handles, 1);
+  fusion_auto_flush_if_needed(level);
+  FuseOp *fop = &fusion.ops[fusion.n_ops++];
+  memset(fop, 0, sizeof(*fop));
+  fop->op_type  = FUSE_OP_ROPE;
+  fop->map_id   = map_id;
+  fop->locs_src = locs_src;
+  fop->locs_dst = locs_dst;
+  fop->M        = n_tokens;
+  fop->K        = n_heads;
+  fop->N        = head_dim;
+  fop->u32_a    = pos_offset;
+  fop->scalar2  = freq_base;
+  fop->level    = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_dst);
+  fusion_mark_write(locs_dst, fop->level);
+  return ADAMAH_OK;
+}
+
+// Queue row_copy (KV cache write)
+static int fusion_queue_row_copy(uint32_t map_id, uint32_t copy_spec_handle,
+                                  uint32_t src_base_handle,
+                                  uint32_t dst_row_offset, uint32_t n_copies,
+                                  uint32_t row_size) {
+  // row_copy reads from src_base (the KV output after rope/projection)
+  uint32_t read_handles[1] = {src_base_handle};
+  int level = fusion_calc_level_handles(read_handles, 1, NULL, 0);
+  fusion_auto_flush_if_needed(level);
+  FuseOp *fop = &fusion.ops[fusion.n_ops++];
+  memset(fop, 0, sizeof(*fop));
+  fop->op_type    = FUSE_OP_ROW_COPY;
+  fop->map_id     = map_id;
+  fop->locs_src   = copy_spec_handle;
+  fop->locs_src2  = src_base_handle;
+  fop->M          = n_copies;
+  fop->K          = row_size;
+  fop->u32_a      = dst_row_offset;
+  fop->level      = level;
+  // row_copy writes to the map buffer directly; use locs_dst=0 (no handle)
+  // to avoid false dependency tracking — the KV cache region is separate
+  return ADAMAH_OK;
+}
+
+// Queue attn_softmax_abs (scale + softcap + softmax)
+static int fusion_queue_attn_softmax_abs(uint32_t map_id, uint32_t locs_src,
+                                          uint32_t locs_dst, uint32_t n_rows,
+                                          uint32_t row_size, float scale,
+                                          float cap) {
+  uint32_t read_handles[1] = {locs_src};
+  uint32_t write_handles[1] = {locs_dst};
+  int level = fusion_calc_level_handles(read_handles, 1, write_handles, 1);
+  fusion_auto_flush_if_needed(level);
+  FuseOp *fop = &fusion.ops[fusion.n_ops++];
+  memset(fop, 0, sizeof(*fop));
+  fop->op_type  = FUSE_OP_ATTN_SOFTMAX_ABS;
+  fop->map_id   = map_id;
+  fop->locs_src = locs_src;
+  fop->locs_dst = locs_dst;
+  fop->M        = n_rows;
+  fop->K        = row_size;
+  fop->scalar   = scale;
+  fop->scalar2  = cap;
+  fop->level    = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_dst);
+  fusion_mark_write(locs_dst, fop->level);
   return ADAMAH_OK;
 }
 
@@ -3710,6 +4311,22 @@ static int exec_op2_internal(uint32_t map_id, uint32_t op, uint32_t locs_a,
 static int exec_matmul_internal(uint32_t map_id, uint32_t locs_a,
                                 uint32_t locs_b, uint32_t locs_c, uint32_t M,
                                 uint32_t K, uint32_t N, uint32_t n_ops);
+static int exec_matmul_t_internal(uint32_t map_id, uint32_t locs_a,
+                                  uint32_t locs_b, uint32_t locs_c,
+                                  uint32_t M, uint32_t K, uint32_t N,
+                                  uint32_t n_ops);
+static int exec_matmul_t_x_internal(uint32_t map_act_id, uint32_t map_wt_id,
+                                    uint32_t locs_a, uint32_t locs_b,
+                                    uint32_t locs_c, uint32_t M, uint32_t K,
+                                    uint32_t N, uint32_t n_ops);
+static int exec_matmul_t_xq4_internal(uint32_t map_act_id, uint32_t map_wt_id,
+                                      uint32_t locs_a, uint32_t locs_b,
+                                      uint32_t locs_c, uint32_t M, uint32_t K,
+                                      uint32_t N, uint32_t n_ops);
+static int exec_matmul_t_xq8_internal(uint32_t map_act_id, uint32_t map_wt_id,
+                                      uint32_t locs_a, uint32_t locs_b,
+                                      uint32_t locs_c, uint32_t M, uint32_t K,
+                                      uint32_t N, uint32_t n_ops);
 static int exec_reduce_internal(uint32_t map_id, uint32_t op, uint32_t locs_src,
                                 uint32_t locs_dst, uint32_t n);
 static int exec_softmax_internal(uint32_t map_id, uint32_t locs_src,
@@ -3725,81 +4342,134 @@ static int exec_layernorm_internal(uint32_t map_id, uint32_t locs_src,
 static int exec_broadcast_internal(uint32_t map_id, uint32_t op,
                                    uint32_t locs_a, uint32_t locs_scalar,
                                    uint32_t locs_dst, uint32_t n);
+// Forward declarations for new ops added to fusion
+static int exec_rmsnorm_internal(uint32_t map_id, uint32_t locs_src,
+                                 uint32_t locs_wt, uint32_t locs_dst,
+                                 uint32_t n_rows, uint32_t dim, float eps);
+static int exec_rmsnorm_x_internal(uint32_t map_act_id, uint32_t map_wt_id,
+                                   uint32_t locs_src, uint32_t locs_wt,
+                                   uint32_t locs_dst, uint32_t n_rows,
+                                   uint32_t dim, float eps);
+static int exec_rope_internal(uint32_t map_id, uint32_t locs_src,
+                              uint32_t locs_dst, uint32_t n_tokens,
+                              uint32_t n_heads, uint32_t head_dim,
+                              uint32_t pos_offset, float freq_base);
+static int exec_row_copy_internal(uint32_t map_id, uint32_t copy_spec_handle,
+                                  uint32_t src_base_handle,
+                                  uint32_t dst_row_offset, uint32_t n_copies,
+                                  uint32_t row_size);
+static int exec_attn_softmax_abs_internal(uint32_t map_id, uint32_t locs_src,
+                                          uint32_t locs_dst, uint32_t n_rows,
+                                          uint32_t row_size, float scale,
+                                          float cap);
 
-// Execute all queued operations, grouped by level
+static int fusion_exec_queued_op(const FuseOp *fop) {
+  switch (fop->op_type) {
+  case FUSE_OP_UNARY:
+    return exec_op1_internal(fop->map_id, fop->op_code, fop->locs_src,
+                             fop->locs_dst, fop->n);
+  case FUSE_OP_BINARY:
+    return exec_op2_internal(fop->map_id, fop->op_code, fop->locs_src,
+                             fop->locs_src2, fop->locs_dst, fop->n);
+  case FUSE_OP_MATMUL:
+    return exec_matmul_internal(fop->map_id, fop->locs_extra[0],
+                                fop->locs_extra[1], fop->locs_extra[2],
+                                fop->M, fop->K, fop->N, fop->n);
+  case FUSE_OP_MATMUL_T:
+    return exec_matmul_t_internal(fop->map_id, fop->locs_extra[0],
+                                  fop->locs_extra[1], fop->locs_extra[2],
+                                  fop->M, fop->K, fop->N, fop->n);
+  case FUSE_OP_MATMUL_T_X:
+    return exec_matmul_t_x_internal(fop->map_id, fop->map_id2,
+                                    fop->locs_extra[0], fop->locs_extra[1],
+                                    fop->locs_extra[2], fop->M, fop->K,
+                                    fop->N, fop->n);
+  case FUSE_OP_MATMUL_T_XQ4:
+    return exec_matmul_t_xq4_internal(fop->map_id, fop->map_id2,
+                                      fop->locs_extra[0], fop->locs_extra[1],
+                                      fop->locs_extra[2], fop->M, fop->K,
+                                      fop->N, fop->n);
+  case FUSE_OP_MATMUL_T_XQ8:
+    return exec_matmul_t_xq8_internal(fop->map_id, fop->map_id2,
+                                      fop->locs_extra[0], fop->locs_extra[1],
+                                      fop->locs_extra[2], fop->M, fop->K,
+                                      fop->N, fop->n);
+  case FUSE_OP_REDUCE:
+    return exec_reduce_internal(fop->map_id, fop->op_code, fop->locs_src,
+                                fop->locs_dst, fop->n);
+  case FUSE_OP_SOFTMAX:
+    return fop->op_code
+               ? exec_softmax_abs_internal(fop->map_id, fop->locs_src,
+                                           fop->locs_dst, fop->M, fop->n)
+               : exec_softmax_internal(fop->map_id, fop->locs_src,
+                                       fop->locs_dst, fop->M, fop->n);
+  case FUSE_OP_LAYERNORM:
+    return exec_layernorm_internal(fop->map_id, fop->locs_src, fop->locs_dst,
+                                   fop->locs_extra[0], fop->locs_extra[1],
+                                   fop->M, fop->n, fop->eps);
+  case FUSE_OP_BROADCAST:
+    return exec_broadcast_internal(fop->map_id, fop->op_code, fop->locs_src,
+                                   fop->locs_src2, fop->locs_dst, fop->n);
+  case FUSE_OP_RMSNORM:
+    return exec_rmsnorm_internal(fop->map_id, fop->locs_src, fop->locs_src2,
+                                 fop->locs_dst, fop->M, fop->K, fop->eps);
+  case FUSE_OP_RMSNORM_X:
+    return exec_rmsnorm_x_internal(fop->map_id, fop->map_id2, fop->locs_src,
+                                   fop->locs_src2, fop->locs_dst, fop->M,
+                                   fop->K, fop->eps);
+  case FUSE_OP_ROPE:
+    return exec_rope_internal(fop->map_id, fop->locs_src, fop->locs_dst,
+                              fop->M, fop->K, fop->N, fop->u32_a,
+                              fop->scalar2);
+  case FUSE_OP_ROW_COPY:
+    return exec_row_copy_internal(fop->map_id, fop->locs_src, fop->locs_src2,
+                                  fop->u32_a, fop->M, fop->K);
+  case FUSE_OP_ATTN_SOFTMAX_ABS:
+    return exec_attn_softmax_abs_internal(fop->map_id, fop->locs_src,
+                                          fop->locs_dst, fop->M, fop->K,
+                                          fop->scalar, fop->scalar2);
+  default:
+    return ADAMAH_ERR_INVALID;
+  }
+}
+
+// Execute all queued operations, grouped by level.
 int adamah_fusion_flush(void) {
   if (fusion.n_ops == 0)
     return ADAMAH_OK;
 
+  native_stats.fusion_flush_count += 1;
   int result = ADAMAH_OK;
   int active_batch = batch_mode;
 
   if (!active_batch) {
-    // Single batch for ALL levels
     batch_begin();
   }
 
-  // Execute level by level with barriers between
-  for (int level = 0; level <= fusion.max_level; level++) {
-    // Execute all ops at this level
+  if (fusion.scheduler_mode == FUSION_SCHEDULER_LEGACY) {
     for (int i = 0; i < fusion.n_ops; i++) {
-      FuseOp *fop = &fusion.ops[i];
-      if (fop->level != level)
-        continue;
-
-      int ret = ADAMAH_OK;
-      switch (fop->op_type) {
-      case FUSE_OP_UNARY:
-        ret = exec_op1_internal(fop->map_id, fop->op_code, fop->locs_src,
-                                fop->locs_dst, fop->n);
-        break;
-      case FUSE_OP_BINARY:
-        ret = exec_op2_internal(fop->map_id, fop->op_code, fop->locs_src,
-                                fop->locs_src2, fop->locs_dst, fop->n);
-        break;
-      case FUSE_OP_MATMUL:
-        ret = exec_matmul_internal(fop->map_id, fop->locs_extra[0],
-                                   fop->locs_extra[1], fop->locs_extra[2],
-                                   fop->M, fop->K, fop->N, fop->n);
-        break;
-      case FUSE_OP_REDUCE:
-        ret = exec_reduce_internal(fop->map_id, fop->op_code, fop->locs_src,
-                                   fop->locs_dst, fop->n);
-        break;
-      case FUSE_OP_SOFTMAX:
-        ret = fop->op_code
-                  ? exec_softmax_abs_internal(fop->map_id, fop->locs_src,
-                                              fop->locs_dst, fop->M, fop->n)
-                  : exec_softmax_internal(fop->map_id, fop->locs_src,
-                                          fop->locs_dst, fop->M, fop->n);
-        break;
-      case FUSE_OP_LAYERNORM:
-        ret = exec_layernorm_internal(fop->map_id, fop->locs_src, fop->locs_dst,
-                                      fop->locs_extra[0], fop->locs_extra[1],
-                                      fop->M, fop->n, fop->eps);
-        break;
-      case FUSE_OP_BROADCAST:
-        ret = exec_broadcast_internal(fop->map_id, fop->op_code, fop->locs_src,
-                                      fop->locs_src2, fop->locs_dst, fop->n);
-        break;
-      }
+      int ret = fusion_exec_queued_op(&fusion.ops[i]);
       if (ret != ADAMAH_OK)
         result = ret;
     }
-
-    // Barrier between levels (if not the last level)
-    // The barrier is already added by cmd_barrier_after_dispatch() in each
-    // exec_*_internal
+  } else {
+    for (int level = 0; level <= fusion.max_level; level++) {
+      for (int i = 0; i < fusion.n_ops; i++) {
+        FuseOp *fop = &fusion.ops[i];
+        if (fop->level != level)
+          continue;
+        int ret = fusion_exec_queued_op(fop);
+        if (ret != ADAMAH_OK)
+          result = ret;
+      }
+    }
   }
 
   if (!active_batch) {
-    // Single submit for ALL ops across ALL levels
     batch_end();
   }
 
-  // Reset fusion state
   fusion_reset();
-
   return result;
 }
 
@@ -3882,12 +4552,23 @@ static GpuBuf *get_or_create_buf_ex(const char *base_name, uint32_t n_elems,
   b->elem_size = elem_size;
   b->device_local = device_local;
   b->usage = usage;
+  b->mem_props = 0;
 
-  if (create_buffer(&b->buf, &b->mem, desired_capacity, usage, device_local) !=
-      0)
+  if (create_buffer_ex(&b->buf, &b->mem, desired_capacity, usage, device_local,
+                       &b->mem_props) != 0)
     return NULL;
   if (!device_local) {
-    vkMapMemory(ctx.device, b->mem, 0, desired_capacity, 0, &b->ptr);
+    b->ptr = NULL;
+    if (vkMapMemory(ctx.device, b->mem, 0, desired_capacity, 0, &b->ptr) !=
+        VK_SUCCESS) {
+      vkDestroyBuffer(ctx.device, b->buf, NULL);
+      vkFreeMemory(ctx.device, b->mem, NULL);
+      b->buf = VK_NULL_HANDLE;
+      b->mem = VK_NULL_HANDLE;
+      b->ptr = NULL;
+      b->mem_props = 0;
+      return NULL;
+    }
   } else {
     b->ptr = NULL;
   }
@@ -4665,12 +5346,11 @@ int map_softmax_abs_dev(uint32_t map_id, uint32_t locs_src_handle,
                                    row_size, n_rows);
 }
 
-int map_attn_softmax_abs_dev(uint32_t map_id, uint32_t locs_src_handle,
-                             uint32_t locs_dst_handle, uint32_t n_rows,
-                             uint32_t row_size, float scale, float cap) {
-  int fret = fusion_flush_pending_for_immediate();
-  if (fret != ADAMAH_OK)
-    return fret;
+static int exec_attn_softmax_abs_internal(uint32_t map_id,
+                                          uint32_t locs_src_handle,
+                                          uint32_t locs_dst_handle,
+                                          uint32_t n_rows, uint32_t row_size,
+                                          float scale, float cap) {
   if (map_id >= MAX_MAPS || !ctx.maps[map_id].active)
     return ADAMAH_ERR_INVALID;
   if (n_rows == 0)
@@ -4739,6 +5419,18 @@ int map_attn_softmax_abs_dev(uint32_t map_id, uint32_t locs_src_handle,
   res_unpin(locs_src_handle);
   res_unpin(locs_dst_handle);
   return ADAMAH_OK;
+}
+
+int map_attn_softmax_abs_dev(uint32_t map_id, uint32_t locs_src_handle,
+                             uint32_t locs_dst_handle, uint32_t n_rows,
+                             uint32_t row_size, float scale, float cap) {
+  if (fusion.enabled)
+    return fusion_queue_attn_softmax_abs(map_id, locs_src_handle,
+                                         locs_dst_handle, n_rows, row_size,
+                                         scale, cap);
+  return exec_attn_softmax_abs_internal(map_id, locs_src_handle,
+                                        locs_dst_handle, n_rows, row_size,
+                                        scale, cap);
 }
 
 // ============================================
@@ -4892,29 +5584,17 @@ int map_argmax_dev(uint32_t map_id, uint32_t locs_src_handle,
     return ADAMAH_ERR_INVALID;
   }
 
-  VkDescriptorSet ds = alloc_desc_set(&ctx.argmax_pipe);
-  if (ds == VK_NULL_HANDLE) {
-    res_unpin(locs_src_handle);
-    res_unpin(locs_dst_handle);
-    return ADAMAH_ERR_VULKAN;
-  }
-
   VkDescriptorBufferInfo buf_infos[3] = {
       {.buffer = m->buf, .range = VK_WHOLE_SIZE},
       {.buffer = ctx.hot_pool->buf, .offset = src_off, .range = src_res->size_bytes},
       {.buffer = ctx.hot_pool->buf, .offset = dst_off, .range = dst_res->size_bytes},
   };
-  VkWriteDescriptorSet writes[3];
-  for (int i = 0; i < 3; i++) {
-    writes[i] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = ds,
-        .dstBinding = i,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo = &buf_infos[i]};
+  VkDescriptorSet ds = prepare_cached_desc_set(&ctx.argmax_pipe, buf_infos, 3);
+  if (ds == VK_NULL_HANDLE) {
+    res_unpin(locs_src_handle);
+    res_unpin(locs_dst_handle);
+    return ADAMAH_ERR_VULKAN;
   }
-  vkUpdateDescriptorSets(ctx.device, 3, writes, 0, NULL);
 
   cmd_begin();
   vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -5209,31 +5889,19 @@ int map_resolve_idx_dev(uint32_t map_id, uint32_t base_locs_handle,
     return ADAMAH_ERR_INVALID;
   }
 
-  VkDescriptorSet ds = alloc_desc_set(&ctx.resolve_idx_pipe);
-  if (ds == VK_NULL_HANDLE) {
-    res_unpin(base_locs_handle);
-    res_unpin(sel_locs_handle);
-    res_unpin(dst_locs_handle);
-    return ADAMAH_ERR_VULKAN;
-  }
-
   VkDescriptorBufferInfo buf_infos[4] = {
       {.buffer = m->buf, .range = VK_WHOLE_SIZE},
       {.buffer = ctx.hot_pool->buf, .offset = base_off, .range = base_res->size_bytes},
       {.buffer = ctx.hot_pool->buf, .offset = sel_off, .range = sel_res->size_bytes},
       {.buffer = ctx.hot_pool->buf, .offset = dst_off, .range = dst_res->size_bytes},
   };
-  VkWriteDescriptorSet writes[4];
-  for (int i = 0; i < 4; i++) {
-    writes[i] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = ds,
-        .dstBinding = i,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo = &buf_infos[i]};
+  VkDescriptorSet ds = prepare_cached_desc_set(&ctx.resolve_idx_pipe, buf_infos, 4);
+  if (ds == VK_NULL_HANDLE) {
+    res_unpin(base_locs_handle);
+    res_unpin(sel_locs_handle);
+    res_unpin(dst_locs_handle);
+    return ADAMAH_ERR_VULKAN;
   }
-  vkUpdateDescriptorSets(ctx.device, 4, writes, 0, NULL);
 
   cmd_begin();
   vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -5580,12 +6248,10 @@ int adamah_fused_ffn(uint32_t map_id, uint32_t loc_out, uint32_t loc_x,
 // RMSNorm: x / sqrt(mean(x²) + eps) * weight
 // Used by Gemma/LLaMA instead of LayerNorm
 // ============================================
-int map_rmsnorm_dev(uint32_t map_id, uint32_t locs_src_handle,
-                    uint32_t locs_wt_handle, uint32_t locs_dst_handle,
-                    uint32_t n_rows, uint32_t dim, float eps) {
-  int fret = fusion_flush_pending_for_immediate();
-  if (fret != ADAMAH_OK)
-    return fret;
+static int exec_rmsnorm_internal(uint32_t map_id, uint32_t locs_src_handle,
+                                 uint32_t locs_wt_handle,
+                                 uint32_t locs_dst_handle, uint32_t n_rows,
+                                 uint32_t dim, float eps) {
   if (map_id >= MAX_MAPS || !ctx.maps[map_id].active)
     return ADAMAH_ERR_INVALID;
   if (n_rows == 0)
@@ -5597,7 +6263,7 @@ int map_rmsnorm_dev(uint32_t map_id, uint32_t locs_src_handle,
 
   Map *m = &ctx.maps[map_id];
   ResEntry *src_res = res_get(locs_src_handle);
-  ResEntry *wt_res = res_get(locs_wt_handle);
+  ResEntry *wt_res  = res_get(locs_wt_handle);
   ResEntry *dst_res = res_get(locs_dst_handle);
   if (!src_res || !wt_res || !dst_res)
     return ADAMAH_ERR_INVALID;
@@ -5616,27 +6282,23 @@ int map_rmsnorm_dev(uint32_t map_id, uint32_t locs_src_handle,
   }
 
   VkDescriptorSet ds = alloc_desc_set(&ctx.rmsnorm_pipe);
-  if (ds == VK_NULL_HANDLE)
+  if (ds == VK_NULL_HANDLE) {
+    res_unpin(locs_src_handle);
+    res_unpin(locs_wt_handle);
+    res_unpin(locs_dst_handle);
     return ADAMAH_ERR_VULKAN;
+  }
 
   VkDescriptorBufferInfo buf_infos[4] = {
       {.buffer = m->buf, .range = VK_WHOLE_SIZE},
-      {.buffer = ctx.hot_pool->buf,
-       .offset = src_off,
-       .range = src_res->size_bytes},
-      {.buffer = ctx.hot_pool->buf,
-       .offset = wt_off,
-       .range = wt_res->size_bytes},
-      {.buffer = ctx.hot_pool->buf,
-       .offset = dst_off,
-       .range = dst_res->size_bytes}};
+      {.buffer = ctx.hot_pool->buf, .offset = src_off, .range = src_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = wt_off,  .range = wt_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = dst_off, .range = dst_res->size_bytes}};
   VkWriteDescriptorSet writes[4];
   for (int i = 0; i < 4; i++) {
     writes[i] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = ds,
-        .dstBinding = i,
-        .descriptorCount = 1,
+        .dstSet = ds, .dstBinding = i, .descriptorCount = 1,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .pBufferInfo = &buf_infos[i]};
   }
@@ -5663,16 +6325,24 @@ int map_rmsnorm_dev(uint32_t map_id, uint32_t locs_src_handle,
   return ADAMAH_OK;
 }
 
+int map_rmsnorm_dev(uint32_t map_id, uint32_t locs_src_handle,
+                    uint32_t locs_wt_handle, uint32_t locs_dst_handle,
+                    uint32_t n_rows, uint32_t dim, float eps) {
+  if (fusion.enabled)
+    return fusion_queue_rmsnorm(map_id, locs_src_handle, locs_wt_handle,
+                                locs_dst_handle, n_rows, dim, eps);
+  return exec_rmsnorm_internal(map_id, locs_src_handle, locs_wt_handle,
+                               locs_dst_handle, n_rows, dim, eps);
+}
+
 // ============================================
 // RoPE: Rotary Positional Encoding
 // Standard for Gemma/LLaMA/GPT-NeoX
 // ============================================
-int map_rope_dev(uint32_t map_id, uint32_t locs_src_handle,
-                 uint32_t locs_dst_handle, uint32_t n_tokens, uint32_t n_heads,
-                 uint32_t head_dim, uint32_t pos_offset, float freq_base) {
-  int fret = fusion_flush_pending_for_immediate();
-  if (fret != ADAMAH_OK)
-    return fret;
+static int exec_rope_internal(uint32_t map_id, uint32_t locs_src_handle,
+                              uint32_t locs_dst_handle, uint32_t n_tokens,
+                              uint32_t n_heads, uint32_t head_dim,
+                              uint32_t pos_offset, float freq_base) {
   if (map_id >= MAX_MAPS || !ctx.maps[map_id].active)
     return ADAMAH_ERR_INVALID;
   if (n_tokens == 0)
@@ -5699,24 +6369,21 @@ int map_rope_dev(uint32_t map_id, uint32_t locs_src_handle,
   }
 
   VkDescriptorSet ds = alloc_desc_set(&ctx.rope_pipe);
-  if (ds == VK_NULL_HANDLE)
+  if (ds == VK_NULL_HANDLE) {
+    res_unpin(locs_src_handle);
+    res_unpin(locs_dst_handle);
     return ADAMAH_ERR_VULKAN;
+  }
 
   VkDescriptorBufferInfo buf_infos[3] = {
       {.buffer = m->buf, .range = VK_WHOLE_SIZE},
-      {.buffer = ctx.hot_pool->buf,
-       .offset = src_off,
-       .range = src_res->size_bytes},
-      {.buffer = ctx.hot_pool->buf,
-       .offset = dst_off,
-       .range = dst_res->size_bytes}};
+      {.buffer = ctx.hot_pool->buf, .offset = src_off, .range = src_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = dst_off, .range = dst_res->size_bytes}};
   VkWriteDescriptorSet writes[3];
   for (int i = 0; i < 3; i++) {
     writes[i] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = ds,
-        .dstBinding = i,
-        .descriptorCount = 1,
+        .dstSet = ds, .dstBinding = i, .descriptorCount = 1,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .pBufferInfo = &buf_infos[i]};
   }
@@ -5747,6 +6414,17 @@ int map_rope_dev(uint32_t map_id, uint32_t locs_src_handle,
   return ADAMAH_OK;
 }
 
+int map_rope_dev(uint32_t map_id, uint32_t locs_src_handle,
+                 uint32_t locs_dst_handle, uint32_t n_tokens, uint32_t n_heads,
+                 uint32_t head_dim, uint32_t pos_offset, float freq_base) {
+  if (fusion.enabled)
+    return fusion_queue_rope(map_id, locs_src_handle, locs_dst_handle,
+                             n_tokens, n_heads, head_dim, pos_offset,
+                             freq_base);
+  return exec_rope_internal(map_id, locs_src_handle, locs_dst_handle,
+                            n_tokens, n_heads, head_dim, pos_offset, freq_base);
+}
+
 // ============================================
 // MatMul Transposed: C = A @ B^T
 // B stored as (N, K) — each col of B^T is a row
@@ -5754,9 +6432,17 @@ int map_rope_dev(uint32_t map_id, uint32_t locs_src_handle,
 int map_matmul_t_dev(uint32_t map_id, uint32_t locs_a_handle,
                      uint32_t locs_b_handle, uint32_t locs_c_handle, uint32_t M,
                      uint32_t K, uint32_t N, uint32_t n_ops) {
-  int fret = fusion_flush_pending_for_immediate();
-  if (fret != ADAMAH_OK)
-    return fret;
+  if (fusion.enabled)
+    return fusion_queue_matmul_t(map_id, locs_a_handle, locs_b_handle,
+                                 locs_c_handle, M, K, N, n_ops);
+  return exec_matmul_t_internal(map_id, locs_a_handle, locs_b_handle,
+                                locs_c_handle, M, K, N, n_ops);
+}
+
+static int exec_matmul_t_internal(uint32_t map_id, uint32_t locs_a_handle,
+                                  uint32_t locs_b_handle,
+                                  uint32_t locs_c_handle, uint32_t M,
+                                  uint32_t K, uint32_t N, uint32_t n_ops) {
   if (map_id >= MAX_MAPS || !ctx.maps[map_id].active)
     return ADAMAH_ERR_INVALID;
   if (n_ops == 0)
@@ -5838,13 +6524,10 @@ int map_matmul_t_dev(uint32_t map_id, uint32_t locs_a_handle,
 // copy_spec = [src_row_idx, dst_row_base] pairs
 // dst_row_offset is added at dispatch time
 // ============================================
-int map_row_copy_offset_dev(uint32_t map_id, uint32_t copy_spec_handle,
-                            uint32_t src_base_handle,
-                            uint32_t dst_row_offset,
-                            uint32_t n_copies, uint32_t row_size) {
-  int fret = fusion_flush_pending_for_immediate();
-  if (fret != ADAMAH_OK)
-    return fret;
+static int exec_row_copy_internal(uint32_t map_id, uint32_t copy_spec_handle,
+                                  uint32_t src_base_handle,
+                                  uint32_t dst_row_offset, uint32_t n_copies,
+                                  uint32_t row_size) {
   if (map_id >= MAX_MAPS || !ctx.maps[map_id].active)
     return ADAMAH_ERR_INVALID;
   if (n_copies == 0)
@@ -5911,6 +6594,20 @@ int map_row_copy_offset_dev(uint32_t map_id, uint32_t copy_spec_handle,
   res_unpin(copy_spec_handle);
   res_unpin(src_base_handle);
   return ADAMAH_OK;
+}
+
+int map_row_copy_offset_dev(uint32_t map_id, uint32_t copy_spec_handle,
+                            uint32_t src_base_handle, uint32_t dst_row_offset,
+                            uint32_t n_copies, uint32_t row_size) {
+  // row_copy writes directly into map storage addressed by dst_row_offset.
+  // The current fusion dependency tracker only sees loc handles, not these
+  // implicit map-buffer regions, so queueing row_copy can reorder KV writes
+  // ahead of later attention reads and corrupt decode.
+  int fret = fusion_flush_pending_for_immediate();
+  if (fret != ADAMAH_OK)
+    return fret;
+  return exec_row_copy_internal(map_id, copy_spec_handle, src_base_handle,
+                                dst_row_offset, n_copies, row_size);
 }
 
 int map_row_copy_dev(uint32_t map_id, uint32_t copy_spec_handle,
@@ -6022,9 +6719,20 @@ int map_matmul_t_x_dev(uint32_t map_act_id, uint32_t map_wt_id,
                        uint32_t locs_a_handle, uint32_t locs_b_handle,
                        uint32_t locs_c_handle, uint32_t M, uint32_t K,
                        uint32_t N, uint32_t n_ops) {
-  int fret = fusion_flush_pending_for_immediate();
-  if (fret != ADAMAH_OK)
-    return fret;
+  if (fusion.enabled)
+    return fusion_queue_matmul_t_x(map_act_id, map_wt_id, locs_a_handle,
+                                   locs_b_handle, locs_c_handle, M, K, N,
+                                   n_ops);
+  return exec_matmul_t_x_internal(map_act_id, map_wt_id, locs_a_handle,
+                                  locs_b_handle, locs_c_handle, M, K, N,
+                                  n_ops);
+}
+
+static int exec_matmul_t_x_internal(uint32_t map_act_id, uint32_t map_wt_id,
+                                    uint32_t locs_a_handle,
+                                    uint32_t locs_b_handle,
+                                    uint32_t locs_c_handle, uint32_t M,
+                                    uint32_t K, uint32_t N, uint32_t n_ops) {
   if (map_act_id >= MAX_MAPS || !ctx.maps[map_act_id].active)
     return ADAMAH_ERR_INVALID;
   if (map_wt_id >= MAX_MAPS || !ctx.maps[map_wt_id].active)
@@ -6200,13 +6908,11 @@ int map_matmul_x_dev(uint32_t map_act_id, uint32_t map_wt_id,
 // Cross-map RMSNorm
 // Activations from map_act, weights from map_wt
 // ============================================
-int map_rmsnorm_x_dev(uint32_t map_act_id, uint32_t map_wt_id,
-                      uint32_t locs_src_handle, uint32_t locs_wt_handle,
-                      uint32_t locs_dst_handle, uint32_t n_rows, uint32_t dim,
-                      float eps) {
-  int fret = fusion_flush_pending_for_immediate();
-  if (fret != ADAMAH_OK)
-    return fret;
+static int exec_rmsnorm_x_internal(uint32_t map_act_id, uint32_t map_wt_id,
+                                   uint32_t locs_src_handle,
+                                   uint32_t locs_wt_handle,
+                                   uint32_t locs_dst_handle, uint32_t n_rows,
+                                   uint32_t dim, float eps) {
   if (map_act_id >= MAX_MAPS || !ctx.maps[map_act_id].active)
     return ADAMAH_ERR_INVALID;
   if (map_wt_id >= MAX_MAPS || !ctx.maps[map_wt_id].active)
@@ -6286,6 +6992,19 @@ int map_rmsnorm_x_dev(uint32_t map_act_id, uint32_t map_wt_id,
   res_unpin(locs_wt_handle);
   res_unpin(locs_dst_handle);
   return ADAMAH_OK;
+}
+
+int map_rmsnorm_x_dev(uint32_t map_act_id, uint32_t map_wt_id,
+                      uint32_t locs_src_handle, uint32_t locs_wt_handle,
+                      uint32_t locs_dst_handle, uint32_t n_rows, uint32_t dim,
+                      float eps) {
+  if (fusion.enabled)
+    return fusion_queue_rmsnorm_x(map_act_id, map_wt_id, locs_src_handle,
+                                  locs_wt_handle, locs_dst_handle, n_rows,
+                                  dim, eps);
+  return exec_rmsnorm_x_internal(map_act_id, map_wt_id, locs_src_handle,
+                                  locs_wt_handle, locs_dst_handle,
+                                  n_rows, dim, eps);
 }
 
 // ============================================
@@ -6383,9 +7102,21 @@ int map_matmul_t_xq4_dev(uint32_t map_act_id, uint32_t map_wt_id,
                          uint32_t locs_a_handle, uint32_t locs_b_handle,
                          uint32_t locs_c_handle, uint32_t M, uint32_t K,
                          uint32_t N, uint32_t n_ops) {
-  int fret = fusion_flush_pending_for_immediate();
-  if (fret != ADAMAH_OK)
-    return fret;
+  if (fusion.enabled)
+    return fusion_queue_matmul_t_xq4(map_act_id, map_wt_id, locs_a_handle,
+                                     locs_b_handle, locs_c_handle, M, K, N,
+                                     n_ops);
+  return exec_matmul_t_xq4_internal(map_act_id, map_wt_id, locs_a_handle,
+                                    locs_b_handle, locs_c_handle, M, K, N,
+                                    n_ops);
+}
+
+static int exec_matmul_t_xq4_internal(uint32_t map_act_id, uint32_t map_wt_id,
+                                      uint32_t locs_a_handle,
+                                      uint32_t locs_b_handle,
+                                      uint32_t locs_c_handle, uint32_t M,
+                                      uint32_t K, uint32_t N,
+                                      uint32_t n_ops) {
   if (map_act_id >= MAX_MAPS || !ctx.maps[map_act_id].active)
     return ADAMAH_ERR_INVALID;
   if (map_wt_id >= MAX_MAPS || !ctx.maps[map_wt_id].active)
@@ -6622,13 +7353,6 @@ int map_matvec_topk_t_xq4_ex_dev(uint32_t map_act_id, uint32_t map_wt_id,
     return ADAMAH_ERR_INVALID;
   }
 
-  VkDescriptorSet ds = alloc_desc_set(&ctx.matvec_topk_t_xq4_pipe);
-  if (ds == VK_NULL_HANDLE) {
-    res_unpin(locs_a_handle); res_unpin(locs_b_handle); res_unpin(penalty_ids_handle);
-    res_unpin(locs_idx_dst_handle); res_unpin(locs_val_dst_handle);
-    return ADAMAH_ERR_VULKAN;
-  }
-
   VkDescriptorBufferInfo buf_infos[8] = {
       {.buffer = m_act->buf, .range = VK_WHOLE_SIZE},
       {.buffer = m_wt->buf,  .range = VK_WHOLE_SIZE},
@@ -6639,17 +7363,12 @@ int map_matvec_topk_t_xq4_ex_dev(uint32_t map_act_id, uint32_t map_wt_id,
       {.buffer = ctx.hot_pool->buf, .offset = v_off, .range = v_res->size_bytes},
       {.buffer = m_wt->qparam_buf,  .range = VK_WHOLE_SIZE},
   };
-  VkWriteDescriptorSet writes[8];
-  for (int i = 0; i < 8; i++) {
-    writes[i] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = ds,
-        .dstBinding = i,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo = &buf_infos[i]};
+  VkDescriptorSet ds = prepare_cached_desc_set(&ctx.matvec_topk_t_xq4_pipe, buf_infos, 8);
+  if (ds == VK_NULL_HANDLE) {
+    res_unpin(locs_a_handle); res_unpin(locs_b_handle); res_unpin(penalty_ids_handle);
+    res_unpin(locs_idx_dst_handle); res_unpin(locs_val_dst_handle);
+    return ADAMAH_ERR_VULKAN;
   }
-  vkUpdateDescriptorSets(ctx.device, 8, writes, 0, NULL);
 
   typedef struct {
     uint32_t K;
@@ -6700,8 +7419,21 @@ int map_matmul_t_xq8_dev(uint32_t map_act_id, uint32_t map_wt_id,
                          uint32_t locs_a_handle, uint32_t locs_b_handle,
                          uint32_t locs_c_handle, uint32_t M, uint32_t K,
                          uint32_t N, uint32_t n_ops) {
-  int fret = fusion_flush_pending_for_immediate();
-  if (fret != ADAMAH_OK) return fret;
+  if (fusion.enabled)
+    return fusion_queue_matmul_t_xq8(map_act_id, map_wt_id, locs_a_handle,
+                                     locs_b_handle, locs_c_handle, M, K, N,
+                                     n_ops);
+  return exec_matmul_t_xq8_internal(map_act_id, map_wt_id, locs_a_handle,
+                                    locs_b_handle, locs_c_handle, M, K, N,
+                                    n_ops);
+}
+
+static int exec_matmul_t_xq8_internal(uint32_t map_act_id, uint32_t map_wt_id,
+                                      uint32_t locs_a_handle,
+                                      uint32_t locs_b_handle,
+                                      uint32_t locs_c_handle, uint32_t M,
+                                      uint32_t K, uint32_t N,
+                                      uint32_t n_ops) {
   if (map_act_id >= MAX_MAPS || !ctx.maps[map_act_id].active) return ADAMAH_ERR_INVALID;
   if (map_wt_id  >= MAX_MAPS || !ctx.maps[map_wt_id].active)  return ADAMAH_ERR_INVALID;
   if (n_ops == 0) return ADAMAH_OK;
@@ -6805,13 +7537,6 @@ int map_matvec_topk_t_xq8_ex_dev(uint32_t map_act_id, uint32_t map_wt_id,
     return ADAMAH_ERR_INVALID;
   }
 
-  VkDescriptorSet ds = alloc_desc_set(&ctx.matvec_topk_t_xq8_pipe);
-  if (ds == VK_NULL_HANDLE) {
-    res_unpin(locs_a_handle); res_unpin(locs_b_handle); res_unpin(penalty_ids_handle);
-    res_unpin(locs_idx_dst_handle); res_unpin(locs_val_dst_handle);
-    return ADAMAH_ERR_VULKAN;
-  }
-
   VkDescriptorBufferInfo buf_infos[8] = {
       {.buffer = m_act->buf, .range = VK_WHOLE_SIZE},
       {.buffer = m_wt->buf,  .range = VK_WHOLE_SIZE},
@@ -6822,17 +7547,12 @@ int map_matvec_topk_t_xq8_ex_dev(uint32_t map_act_id, uint32_t map_wt_id,
       {.buffer = ctx.hot_pool->buf, .offset = v_off, .range = v_res->size_bytes},
       {.buffer = m_wt->qparam_buf,  .range = VK_WHOLE_SIZE},
   };
-  VkWriteDescriptorSet writes[8];
-  for (int i = 0; i < 8; i++) {
-    writes[i] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = ds,
-        .dstBinding = i,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo = &buf_infos[i]};
+  VkDescriptorSet ds = prepare_cached_desc_set(&ctx.matvec_topk_t_xq8_pipe, buf_infos, 8);
+  if (ds == VK_NULL_HANDLE) {
+    res_unpin(locs_a_handle); res_unpin(locs_b_handle); res_unpin(penalty_ids_handle);
+    res_unpin(locs_idx_dst_handle); res_unpin(locs_val_dst_handle);
+    return ADAMAH_ERR_VULKAN;
   }
-  vkUpdateDescriptorSets(ctx.device, 8, writes, 0, NULL);
 
   typedef struct {
     uint32_t K;
@@ -7066,23 +7786,13 @@ int map_row_gather_xq8_dev(uint32_t map_act_id, uint32_t map_wt_id,
   if (m_act->dtype != DTYPE_F32 || m_act->pack_size != 1) return ADAMAH_ERR_INVALID;
   if (m_wt->dtype != DTYPE_Q8 || m_wt->qparam_buf == VK_NULL_HANDLE) return ADAMAH_ERR_INVALID;
 
-  VkDescriptorSet ds = alloc_desc_set(&ctx.row_gather_xq8_pipe);
-  if (ds == VK_NULL_HANDLE) return ADAMAH_ERR_VULKAN;
-
   VkDescriptorBufferInfo buf_infos[3] = {
       {.buffer = m_act->buf,       .range = VK_WHOLE_SIZE},
       {.buffer = m_wt->buf,        .range = VK_WHOLE_SIZE},
       {.buffer = m_wt->qparam_buf, .range = VK_WHOLE_SIZE},
   };
-  VkWriteDescriptorSet writes[3];
-  for (int i = 0; i < 3; i++) {
-    writes[i] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = ds, .dstBinding = i, .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo = &buf_infos[i]};
-  }
-  vkUpdateDescriptorSets(ctx.device, 3, writes, 0, NULL);
+  VkDescriptorSet ds = prepare_cached_desc_set(&ctx.row_gather_xq8_pipe, buf_infos, 3);
+  if (ds == VK_NULL_HANDLE) return ADAMAH_ERR_VULKAN;
 
   uint32_t push[6];
   push[0] = src_base;

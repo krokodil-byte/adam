@@ -425,6 +425,32 @@ def test_row_copy_offset(gpu, u):
     return np.allclose(vals, expected, atol=1e-6)
 
 
+def test_fusion_row_copy_then_matmul(gpu, u):
+    gpu.fusion_enable(True)
+    u.array_init(16, 32, 4)
+    all_locs = u.cache_locs(16, np.arange(32, dtype=np.uint32))
+    data = np.zeros(32, dtype=np.float32)
+    data[:8] = np.array([1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0], dtype=np.float32)
+    data[8:12] = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    u.scatter(16, all_locs, data)
+
+    spec_h, _ = gpu.upload_dev(np.array([0, 0, 1, 1], dtype=np.uint32))
+    src_base_h, _ = gpu.upload_dev(np.array([0], dtype=np.uint32))
+    a_h, _ = gpu.upload_dev(np.array([8], dtype=np.uint32))
+    b_h, _ = gpu.upload_dev(np.array([20], dtype=np.uint32))
+    c_h, _ = gpu.upload_dev(np.array([12], dtype=np.uint32))
+
+    gpu.batch_begin()
+    gpu.map_row_copy_offset_dev(16, spec_h, src_base_h, 5, 2, 4)
+    gpu.map_matmul_t_dev(16, a_h, b_h, c_h, 1, 4, 2)
+    gpu.batch_end()
+
+    vals = u.gather(16, np.array([12, 13], dtype=np.uint32)).view(np.float32)
+    expected = np.array([10.0, 100.0], dtype=np.float32)
+    print(f"[fusion_row_copy_then_matmul] vals={vals.tolist()}")
+    return np.allclose(vals, expected, atol=1e-6)
+
+
 def test_scalar_state(u):
     u.array_init(9, 8, 4)
     # current=3, next=0, one=1, limit=4, ge=0, done=0, out=0, eq=0
@@ -503,6 +529,7 @@ def main():
         ok_matvec_q4 = test_matvec_t_xq4(gpu)
         ok_batch_gather = test_batch_gather_scatter(gpu, u)
         ok_row_copy = test_row_copy_offset(gpu, u)
+        ok_row_copy_fusion = test_fusion_row_copy_then_matmul(gpu, u)
         ok_state = test_scalar_state(u)
         ok_fusion = test_fusion_batch_order(gpu, u)
     finally:
@@ -512,7 +539,7 @@ def main():
         ok_argmax and ok_topk and ok_topp and ok_resolve_sample and ok_softmax_abs and ok_attn_softmax_abs and
         ok_q8 and ok_row_gather and ok_matvec_q8 and ok_matvec_topk_q8 and
         ok_matvec_topk_q4 and ok_matvec_rerank_q8 and ok_matvec_q4 and
-        ok_batch_gather and ok_row_copy and ok_state and ok_fusion
+        ok_batch_gather and ok_row_copy and ok_row_copy_fusion and ok_state and ok_fusion
     )
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1

@@ -74,18 +74,32 @@ def load_everything(model_path):
     print(f"  add_space_prefix={add_space_prefix}  "
           f"bos={tokenizer.bos_id}  eos={tokenizer.eos_id}")
 
-    # Try progressively smaller cache sizes if default (auto-sized) fails.
-    # The RTX 3070 has 8GB but the desktop compositor may use 6+GB.
+    # Use a model-aware pool recommendation first; the raw no-arg recommendation
+    # can overshoot badly because it does not account for the model's persistent
+    # GPU footprint and can leave native state poisoned after a failed init.
     gpu = None
-    for hot_mb, cold_mb in [(None, None), (1024, 512), (512, 256), (256, 128)]:
+    attempts = []
+    try:
+        est = ADAMEngine.estimate_persistent_gpu_bytes(
+            cfg,
+            loader.tensor_shapes,
+            loader.tensor_types,
+            kv_cap=ADAMEngine.KV_CAP_DEFAULT,
+            gpu_tied_lm_head=True,
+            gpu_approx_rerank=False,
+            gpu_fused_rows_per_group=ADAMEngine.SAMPLE_FUSED_ROWS_PER_GROUP_NON_GREEDY,
+        )
+        plan = A.recommend_pool_sizes(working_set_bytes=est["total_bytes"])
+        attempts.append((int(plan["hot_mb"]), int(plan["cold_mb"])))
+    except Exception:
+        pass
+    attempts.extend([(1024, 512), (512, 256), (256, 128)])
+    for hot_mb, cold_mb in attempts:
         try:
-            if hot_mb is None:
-                gpu = A.init()
-            else:
-                gpu = A.init(cache_mb=hot_mb, cold_cache_mb=cold_mb)
-                print(f"  [GPU pool: hot={hot_mb}MB cold={cold_mb}MB]")
+            gpu = A.init(cache_mb=hot_mb, cold_cache_mb=cold_mb)
+            print(f"  [GPU pool: hot={hot_mb}MB cold={cold_mb}MB]")
             break
-        except RuntimeError:
+        except (RuntimeError, OSError):
             pass
     if gpu is None:
         raise RuntimeError("GPU init failed at all pool sizes — is VRAM full?")
@@ -361,13 +375,15 @@ def check_generation(engine, tokenizer, cfg, n_tokens=8):
         if vocab and 0 <= t < len(vocab) and '<unused' in vocab[t]
     )
     same_as_cpu = (ref_decoded is None or decoded.rstrip() == ref_decoded.rstrip())
-    used_gpu_argmax = stats.get('sampling_mode') == 'gpu_argmax'
-    ok = unused_count == 0 and same_as_cpu and used_gpu_argmax
+    used_gpu_greedy = stats.get('sampling_mode') in {
+        'gpu_argmax', 'gpu_fused_topk', 'gpu_approx_rerank'
+    }
+    ok = unused_count == 0 and same_as_cpu and used_gpu_greedy
     if unused_count != 0:
         print("  " + FAIL + f" {unused_count}/{len(out_tokens)} tokens are <unused>")
     elif not same_as_cpu:
         print("  " + FAIL + " GPU greedy output diverges from CPU reference")
-    elif not used_gpu_argmax:
+    elif not used_gpu_greedy:
         print("  " + FAIL + " Greedy decode fell back to CPU sampling")
     else:
         print("  " + PASS + " GPU generation matches CPU reference")

@@ -31,6 +31,16 @@ from typing import Dict, Optional, Tuple
 
 __version__ = "5.2.0"
 
+FUSION_SCHEDULER_LEGACY = 0
+FUSION_SCHEDULER_ALIAS_SAFE = 1
+FUSION_SCHEDULER_LEVEL_BATCHED = 2
+
+_FUSION_SCHEDULER_NAMES = {
+    FUSION_SCHEDULER_LEGACY: "legacy",
+    FUSION_SCHEDULER_ALIAS_SAFE: "alias_safe",
+    FUSION_SCHEDULER_LEVEL_BATCHED: "level_batched",
+}
+
 # Import UUCIS wrapper for benchmark compatibility
 try:
     from .uucis import UUCISView
@@ -94,6 +104,8 @@ OP_XOR = 16
 OP_ATAN2 = 17
 OP_STEP = 18
 OP_SMOOTHSTEP = 19
+OP_GEGLU = 34   # GELU(a) * b  (fused GeGLU gate activation)
+OP_SWIGLU = 35  # SiLU(a) * b  (fused SwiGLU gate activation)
 
 # Vulkan physical device types
 DEVICE_OTHER = 0
@@ -124,10 +136,15 @@ def _resolve_lib_path(lib_path: Optional[str] = None) -> str:
         candidates = ['adamah_opt.dll', 'adamah_new.dll', 'adamah.dll']
     else:
         candidates = ['adamah.so']
+    existing = []
     for lib_name in candidates:
         cand = os.path.join(current_dir, lib_name)
         if os.path.exists(cand):
-            return cand
+            existing.append(cand)
+    if existing:
+        # Prefer the newest built backend so source rebuilds take effect even if
+        # an older alternative DLL is still present beside it.
+        return max(existing, key=os.path.getmtime)
 
     raise FileNotFoundError(
         f"{candidates[0]} not found in {current_dir}\n"
@@ -728,6 +745,45 @@ class Adamah:
 
         self._lib.batch_end.argtypes = []
         self._lib.batch_end.restype = None
+
+        try:
+            self._lib.adamah_stats_reset.argtypes = []
+            self._lib.adamah_stats_reset.restype = None
+            self._lib.adamah_stats_get.argtypes = [
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            self._lib.adamah_stats_get.restype = None
+            self._has_native_stats = True
+        except AttributeError:
+            self._has_native_stats = False
+
+        try:
+            self._lib.adamah_fusion_set_scheduler_mode.argtypes = [ctypes.c_int]
+            self._lib.adamah_fusion_set_scheduler_mode.restype = None
+            self._lib.adamah_fusion_get_scheduler_mode.argtypes = []
+            self._lib.adamah_fusion_get_scheduler_mode.restype = ctypes.c_int
+            self._lib.adamah_register_loc_span.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32
+            ]
+            self._lib.adamah_register_loc_span.restype = ctypes.c_int
+            self._lib.adamah_register_row_base_span.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32
+            ]
+            self._lib.adamah_register_row_base_span.restype = ctypes.c_int
+            self._lib.adamah_clear_loc_alias_meta.argtypes = [ctypes.c_uint32]
+            self._lib.adamah_clear_loc_alias_meta.restype = None
+            self._has_fusion_scheduler = True
+        except AttributeError:
+            self._has_fusion_scheduler = False
 
         # Dtype system
         self._try_setup_dtype()
@@ -1827,6 +1883,50 @@ class Adamah:
         """Synchronize GPU (wait for all operations)."""
         self._lib.adamah_sync()
 
+    def reset_native_stats(self):
+        """Reset native scheduling counters collected inside the Vulkan backend."""
+        if not getattr(self, '_has_native_stats', False):
+            return
+        self._lib.adamah_stats_reset()
+
+    def get_native_stats(self) -> Dict[str, int]:
+        """Return native scheduling counters from the Vulkan backend."""
+        if not getattr(self, '_has_native_stats', False):
+            return {}
+        dispatch = ctypes.c_uint64(0)
+        submit = ctypes.c_uint64(0)
+        barrier = ctypes.c_uint64(0)
+        fusion_flush = ctypes.c_uint64(0)
+        descriptor_updates = ctypes.c_uint64(0)
+        descriptor_hits = ctypes.c_uint64(0)
+        descriptor_misses = ctypes.c_uint64(0)
+        alias_conflicts = ctypes.c_uint64(0)
+        scheduler_mode = ctypes.c_uint64(0)
+        self._lib.adamah_stats_get(
+            ctypes.byref(dispatch),
+            ctypes.byref(submit),
+            ctypes.byref(barrier),
+            ctypes.byref(fusion_flush),
+            ctypes.byref(descriptor_updates),
+            ctypes.byref(descriptor_hits),
+            ctypes.byref(descriptor_misses),
+            ctypes.byref(alias_conflicts),
+            ctypes.byref(scheduler_mode),
+        )
+        scheduler_mode_value = int(scheduler_mode.value)
+        return {
+            "dispatch_count": int(dispatch.value),
+            "submit_count": int(submit.value),
+            "barrier_count": int(barrier.value),
+            "fusion_flush_count": int(fusion_flush.value),
+            "descriptor_set_update_count": int(descriptor_updates.value),
+            "descriptor_cache_hit_count": int(descriptor_hits.value),
+            "descriptor_cache_miss_count": int(descriptor_misses.value),
+            "alias_conflict_count": int(alias_conflicts.value),
+            "scheduler_mode": scheduler_mode_value,
+            "scheduler_mode_name": _FUSION_SCHEDULER_NAMES.get(scheduler_mode_value, "unknown"),
+        }
+
     def fusion_enable(self, enable: bool):
         """Enable or disable the fusion op-queue.
 
@@ -1840,6 +1940,61 @@ class Adamah:
     def fusion_is_enabled(self) -> bool:
         """Return whether fusion queueing is currently enabled."""
         return bool(self._lib.adamah_fusion_is_enabled())
+
+    def fusion_set_scheduler_mode(self, mode):
+        """Set the native fusion scheduler mode."""
+        if not getattr(self, '_has_fusion_scheduler', False):
+            return
+        if isinstance(mode, str):
+            name_to_mode = {name: value for value, name in _FUSION_SCHEDULER_NAMES.items()}
+            key = mode.strip().lower()
+            if key not in name_to_mode:
+                raise ValueError(f"Unknown fusion scheduler mode: {mode!r}")
+            mode = name_to_mode[key]
+        self._lib.adamah_fusion_set_scheduler_mode(ctypes.c_int(int(mode)))
+
+    def fusion_get_scheduler_mode(self) -> str:
+        """Return the active native fusion scheduler mode name."""
+        if not getattr(self, '_has_fusion_scheduler', False):
+            return "legacy"
+        mode = int(self._lib.adamah_fusion_get_scheduler_mode())
+        return _FUSION_SCHEDULER_NAMES.get(mode, "unknown")
+
+    def register_loc_span(self, handle: int, map_id: int, start: int, count: int):
+        """Register a contiguous map-slot span for fusion alias tracking."""
+        if not getattr(self, '_has_fusion_scheduler', False):
+            return
+        ret = self._lib.adamah_register_loc_span(
+            ctypes.c_uint32(handle),
+            ctypes.c_uint32(map_id),
+            ctypes.c_uint32(start),
+            ctypes.c_uint32(count),
+        )
+        if ret != 0:
+            raise RuntimeError(f"adamah_register_loc_span failed with code {ret}")
+
+    def register_row_base_span(
+        self, handle: int, map_id: int, start: int, count: int, stride: int, row_size: int
+    ):
+        """Register a regular row-base pattern for fusion alias tracking."""
+        if not getattr(self, '_has_fusion_scheduler', False):
+            return
+        ret = self._lib.adamah_register_row_base_span(
+            ctypes.c_uint32(handle),
+            ctypes.c_uint32(map_id),
+            ctypes.c_uint32(start),
+            ctypes.c_uint32(count),
+            ctypes.c_uint32(stride),
+            ctypes.c_uint32(row_size),
+        )
+        if ret != 0:
+            raise RuntimeError(f"adamah_register_row_base_span failed with code {ret}")
+
+    def clear_loc_alias_meta(self, handle: int):
+        """Clear fusion alias metadata for a loc handle."""
+        if not getattr(self, '_has_fusion_scheduler', False):
+            return
+        self._lib.adamah_clear_loc_alias_meta(ctypes.c_uint32(handle))
 
     @contextmanager
     def fusion_disabled(self):
@@ -2133,8 +2288,9 @@ def init(cache_mb: Optional[int] = None, cold_cache_mb: Optional[int] = None) ->
             attempts.append((plan["hot_mb"], plan["cold_mb"]))
         except Exception:
             pass
+    if not attempts:
+        attempts.append((None, None))
     attempts.extend([
-        (None, None),
         (512, 256),
         (256, 128),
         (128, 64),
@@ -2152,8 +2308,8 @@ def init(cache_mb: Optional[int] = None, cold_cache_mb: Optional[int] = None) ->
         seen.add(key)
         try:
             return Adamah(cache_mb=hot_mb, cold_cache_mb=cold_mb)
-        except RuntimeError as exc:
-            if not _is_memory_init_error(exc):
+        except (RuntimeError, OSError) as exc:
+            if isinstance(exc, RuntimeError) and not _is_memory_init_error(exc):
                 raise
             last_err = exc
             continue
@@ -2185,7 +2341,7 @@ __all__ = [
     'OP_ADD', 'OP_SUB', 'OP_MUL', 'OP_DIV', 'OP_POW',
     'OP_MIN', 'OP_MAX', 'OP_MOD',
     'OP_EQ', 'OP_NE', 'OP_LT', 'OP_LE', 'OP_GT', 'OP_GE',
-    'OP_AND', 'OP_OR', 'OP_XOR', 'OP_ATAN2', 'OP_STEP', 'OP_SMOOTHSTEP',
+    'OP_AND', 'OP_OR', 'OP_XOR', 'OP_ATAN2', 'OP_STEP', 'OP_SMOOTHSTEP', 'OP_GEGLU', 'OP_SWIGLU',
     
     # Reduce / Broadcast
     'REDUCE_SUM', 'REDUCE_MAX', 'REDUCE_MIN',

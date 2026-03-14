@@ -4,6 +4,7 @@ ADAMAH Chat — Universal LLM Inference TUI
 Pure Vulkan, zero CUDA. Loads any GGUF model via ADAM.
 """
 import os, sys, time, glob, platform, shutil
+from functools import lru_cache
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -33,6 +34,7 @@ RESET = "\033[0m"
 BOX_TL = "╔"; BOX_TR = "╗"; BOX_BL = "╚"; BOX_BR = "╝"
 BOX_H = "═"; BOX_V = "║"
 FAST_LM_ROWS_PER_GROUP = 256
+_CANONICAL_TOKENS_KEY = "_canonical_tokens"
 RUNTIME_PRESET_CHOICES = [
     ("fast", "Fast (auto)"),
     ("trace", "Trace (auto)"),
@@ -486,7 +488,35 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
         if unified:
             name = "broadcom_v3dv"
         else:
-            return {"name": "default"}
+            name = "desktop_discrete"
+    if name == "desktop_discrete":
+        return {
+            "name": "desktop_discrete",
+            "reserve_ratio": 0.10,
+            "kv_cap_max": 2048,
+            "stream_load": False,
+            "stream_chunk_mb": 64,
+            "gpu_approx_rerank": False,
+            "gpu_approx_partial_k": 8,
+            "gpu_fused_rows_per_group": 512,
+            "trace_decode": False,
+            "pool_hot_mb": 512,
+            "pool_cold_mb": 1024,
+        }
+    if name == "nvidia_discrete":
+        return {
+            "name": "nvidia_discrete",
+            "reserve_ratio": 0.08,
+            "kv_cap_max": 2048,
+            "stream_load": False,
+            "stream_chunk_mb": 64,
+            "gpu_approx_rerank": False,
+            "gpu_approx_partial_k": 8,
+            "gpu_fused_rows_per_group": 512,
+            "trace_decode": False,
+            "pool_hot_mb": 768,
+            "pool_cold_mb": 1536,
+        }
     if name == "unified_small_gpu":
         return {
             "name": "unified_small_gpu",
@@ -572,12 +602,20 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
     return {"name": name}
 
 
-def _resolve_runtime_profile_name(profile_name, unified):
+def _auto_discrete_runtime_profile_name(device=None):
+    device = device or {}
+    name = str(device.get("device_name") or "").strip().lower()
+    if any(token in name for token in ("nvidia", "geforce", "rtx", "gtx", "quadro")):
+        return "nvidia_discrete"
+    return "desktop_discrete"
+
+
+def _resolve_runtime_profile_name(profile_name, unified, device=None):
     name = (profile_name or "").strip().lower()
     if not name or name in ("default", "auto", "fast"):
-        return "broadcom_v3dv" if unified else "default"
+        return "broadcom_v3dv" if unified else _auto_discrete_runtime_profile_name(device)
     if name == "trace":
-        return "broadcom_v3dv" if unified else "default"
+        return "broadcom_v3dv" if unified else _auto_discrete_runtime_profile_name(device)
     return name
 
 
@@ -591,8 +629,9 @@ def _desired_shader_profile(startup=None) -> str:
 
 
 def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
-    reserve_ratio = min(max(float(os.environ.get("ADAM_RUNTIME_RESERVE_RATIO", "0.10")), 0.0), 0.5)
     startup = startup or {}
+    reserve_default = startup.get("reserve_ratio", os.environ.get("ADAM_RUNTIME_RESERVE_RATIO", "0.10"))
+    reserve_ratio = min(max(float(reserve_default), 0.0), 0.5)
     machine = ""
     try:
         machine = os.uname().machine.lower()
@@ -613,12 +652,17 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
     unified = bool(device.get("is_unified_memory")) or arm_like
     runtime_mode = (startup.get("runtime_mode") or os.environ.get("ADAM_RUNTIME_MODE") or "fast").strip().lower()
     requested_profile = startup.get("runtime_profile") or os.environ.get("ADAM_RUNTIME_PROFILE", "")
-    profile_name = _resolve_runtime_profile_name(requested_profile, unified)
+    profile_name = _resolve_runtime_profile_name(requested_profile, unified, device=device)
     profile = _runtime_profile_overrides(profile_name, cfg, unified)
     if "reserve_ratio" in profile and os.environ.get("ADAM_RUNTIME_RESERVE_RATIO") is None:
         reserve_ratio = float(profile["reserve_ratio"])
     rows_default = int(profile.get("gpu_fused_rows_per_group", FAST_LM_ROWS_PER_GROUP))
     rows_per_group = max(1, int(startup.get("gpu_fused_rows_per_group") or _env_int("ADAM_GPU_FUSED_ROWS_PER_GROUP", rows_default)))
+    fused_topk_default = bool(profile.get("gpu_fused_topk", True))
+    gpu_fused_topk = bool(
+        startup["gpu_fused_topk"] if "gpu_fused_topk" in startup and startup.get("gpu_fused_topk") is not None
+        else _env_flag("ADAM_GPU_FUSED_TOPK", fused_topk_default)
+    )
     approx_default = profile.get("gpu_approx_rerank", False)
     approx_partial_k_default = int(profile.get("gpu_approx_partial_k", engine_cls.SAMPLE_TOPK_MAX))
     approx_rerank = bool(
@@ -675,7 +719,25 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
         )
     except Exception:
         pool_plan = {}
-    if pool_plan:
+    pool_hot_env = os.environ.get("ADAMAH_CACHE_MB")
+    pool_cold_env = os.environ.get("ADAMAH_COLD_CACHE_MB")
+    pool_hot_override = startup.get("pool_hot_mb")
+    pool_cold_override = startup.get("pool_cold_mb")
+    explicit_pool = (
+        pool_hot_override is not None or pool_cold_override is not None or
+        pool_hot_env is not None or pool_cold_env is not None
+    )
+    if explicit_pool:
+        hot_mb = int(pool_hot_override if pool_hot_override is not None else pool_hot_env or 0)
+        cold_mb = int(pool_cold_override if pool_cold_override is not None else pool_cold_env or 0)
+        hot_mb = max(0, hot_mb or cold_mb)
+        cold_mb = max(0, cold_mb or hot_mb)
+        pool_plan = {"hot_mb": hot_mb, "cold_mb": cold_mb}
+    elif profile.get("pool_hot_mb") is not None or profile.get("pool_cold_mb") is not None:
+        hot_mb = int(profile.get("pool_hot_mb") or profile.get("pool_cold_mb") or 0)
+        cold_mb = int(profile.get("pool_cold_mb") or profile.get("pool_hot_mb") or 0)
+        pool_plan = {"hot_mb": max(0, hot_mb), "cold_mb": max(0, cold_mb)}
+    elif pool_plan:
         if profile.get("pool_hot_mb_max") is not None:
             pool_plan["hot_mb"] = min(int(pool_plan.get("hot_mb", 0)), int(profile["pool_hot_mb_max"]))
         if profile.get("pool_cold_mb_max") is not None:
@@ -685,12 +747,18 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
     stream_default = unified
     if host_avail > 0 and eager_host_bytes + 512 * 1024 * 1024 > int(host_avail * (1.0 - reserve_ratio)):
         stream_default = True
-    if profile.get("stream_load") is not None and os.environ.get("ADAM_STREAM_LOAD") is None:
+    if profile.get("stream_load") is not None and os.environ.get("ADAM_STREAM_LOAD") is None and startup.get("stream_load") is None:
         stream_default = bool(profile["stream_load"])
-    stream_load = _env_flag("ADAM_STREAM_LOAD", stream_default)
+    if startup.get("stream_load") is not None:
+        stream_load = bool(startup.get("stream_load"))
+    else:
+        stream_load = _env_flag("ADAM_STREAM_LOAD", stream_default)
 
     chunk_env = os.environ.get("ADAM_STREAM_CHUNK_MB")
-    if chunk_env is not None:
+    startup_chunk = startup.get("stream_chunk_mb")
+    if startup_chunk is not None:
+        stream_chunk_mb = max(8, min(256, int(startup_chunk)))
+    elif chunk_env is not None:
         stream_chunk_mb = max(8, min(256, int(chunk_env)))
     else:
         if host_avail > 0:
@@ -708,6 +776,12 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
         if profile.get("stream_chunk_mb") is not None:
             stream_chunk_mb = min(stream_chunk_mb, int(profile["stream_chunk_mb"]))
 
+    fusion_scheduler_mode = startup.get("fusion_scheduler_mode")
+    if fusion_scheduler_mode is None:
+        fusion_scheduler_mode = os.environ.get("ADAM_FUSION_SCHEDULER_MODE")
+    if fusion_scheduler_mode is None:
+        fusion_scheduler_mode = "alias_safe" if profile.get("name") == "desktop_discrete" else "legacy"
+
     return {
         "profile": profile.get("name", "default"),
         "reserve_ratio": reserve_ratio,
@@ -719,10 +793,12 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
         "stream_load": bool(stream_load),
         "stream_chunk_mb": int(stream_chunk_mb),
         "kv_cap": int(kv_cap),
+        "gpu_fused_topk": gpu_fused_topk,
         "gpu_approx_rerank": approx_rerank,
         "gpu_approx_partial_k": int(approx_partial_k),
         "gpu_fused_rows_per_group": int(rows_per_group),
         "trace_decode": trace_decode,
+        "fusion_scheduler_mode": str(fusion_scheduler_mode),
     }
 
 
@@ -750,13 +826,17 @@ def print_runtime_plan(plan):
     if pool_plan:
         print(f"{GREEN}GPU pools:{RESET} hot={pool_plan.get('hot_mb', 0)}MB "
               f"cold={pool_plan.get('cold_mb', 0)}MB")
+    sampler = "approx_rerank" if plan.get("gpu_approx_rerank") else (
+        "exact_fused_topk" if plan.get("gpu_fused_topk", True) else "exact_argmax"
+    )
     print(f"{GREEN}Runtime:{RESET} profile={profile} kv_cap={plan.get('kv_cap', 0)} "
           f"stream={'on' if plan.get('stream_load') else 'off'} "
           f"chunk={plan.get('stream_chunk_mb', 0)}MB "
-          f"sampler={'approx_rerank' if plan.get('gpu_approx_rerank') else 'exact_fused_topk'} "
+          f"sampler={sampler} "
           f"rows={plan.get('gpu_fused_rows_per_group', FAST_LM_ROWS_PER_GROUP)} "
           f"partial_k={plan.get('gpu_approx_partial_k', 64)} "
-          f"trace={'on' if plan.get('trace_decode') else 'off'}")
+          f"trace={'on' if plan.get('trace_decode') else 'off'} "
+          f"scheduler={plan.get('fusion_scheduler_mode', 'legacy')}")
 
 
 def init_gpu_backend(adamah_mod, runtime_plan=None):
@@ -776,8 +856,9 @@ def init_gpu_backend(adamah_mod, runtime_plan=None):
             (max(16, hot // 2), max(8, cold // 2)),
             (max(16, hot // 4), max(8, cold // 4)),
         ])
+    if not attempts:
+        attempts.append((None, None))
     attempts.extend([
-        (None, None),
         (512, 256),
         (256, 128),
         (128, 64),
@@ -864,16 +945,23 @@ def load_model(model_path, startup=None):
         adamah_mod=adamah_mod,
         verbose=True,
         production_mode=True,
-        gpu_fused_topk=True,
+        gpu_fused_topk=runtime_plan["gpu_fused_topk"],
         gpu_fused_rows_per_group=runtime_plan["gpu_fused_rows_per_group"],
         gpu_approx_rerank=runtime_plan["gpu_approx_rerank"],
         gpu_approx_partial_k=runtime_plan["gpu_approx_partial_k"],
         gpu_tied_lm_head=True,
+        fusion_scheduler_mode=runtime_plan.get("fusion_scheduler_mode", "legacy"),
     )
     engine._runtime_profile = runtime_plan["profile"]
     engine._trace_decode = bool(runtime_plan.get("trace_decode", False))
-    sampler_name = ("gpu_approx_rerank" if runtime_plan["gpu_approx_rerank"]
-                    else "exact gpu_fused_topk")
+    engine._stream_load = bool(runtime_plan.get("stream_load"))
+    engine._pool_hot_mb = int(runtime_plan.get("pool_plan", {}).get("hot_mb", 0) or 0)
+    engine._pool_cold_mb = int(runtime_plan.get("pool_plan", {}).get("cold_mb", 0) or 0)
+    engine._runtime_plan = dict(runtime_plan)
+    sampler_name = (
+        "gpu_approx_rerank" if runtime_plan["gpu_approx_rerank"]
+        else ("exact gpu_fused_topk" if runtime_plan["gpu_fused_topk"] else "exact gpu_argmax")
+    )
     print(f"{GREEN}Chat fast path:{RESET} {sampler_name}, "
           f"rows_per_group={runtime_plan['gpu_fused_rows_per_group']}, "
           f"partial_k={runtime_plan['gpu_approx_partial_k']}, "
@@ -908,7 +996,8 @@ def _token_text(tokenizer, token_id: int) -> str:
     return ""
 
 
-def _render_gguf_chat_template(chat_template: str, tokenizer, messages) -> str | None:
+@lru_cache(maxsize=32)
+def _compiled_gguf_chat_template(chat_template: str):
     try:
         import jinja2
     except Exception:
@@ -923,7 +1012,17 @@ def _render_gguf_chat_template(chat_template: str, tokenizer, messages) -> str |
         lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
     )
     try:
-        return env.from_string(chat_template).render(
+        return env.from_string(chat_template)
+    except Exception:
+        return None
+
+
+def _render_gguf_chat_template(chat_template: str, tokenizer, messages) -> str | None:
+    template = _compiled_gguf_chat_template(chat_template)
+    if template is None:
+        return None
+    try:
+        return template.render(
             messages=messages,
             add_generation_prompt=True,
             bos_token=_token_text(tokenizer, tokenizer.bos_id),
@@ -1068,29 +1167,159 @@ def prepare_chat_messages(messages, arch: str, tokenizer,
     add_bos = not (bos_token and prompt.startswith(bos_token))
     return prompt, add_bos
 
+
+def _common_prefix_len(lhs, rhs) -> int:
+    limit = min(len(lhs), len(rhs))
+    idx = 0
+    while idx < limit and lhs[idx] == rhs[idx]:
+        idx += 1
+    return idx
+
+
+def _chat_reuse_plan(cached_tokens, prompt_tokens, cache_valid: bool):
+    if not cache_valid:
+        return {
+            "reuse_hit": False,
+            "reuse_prefix_tokens": 0,
+            "reuse_miss_reason": "cache_invalid",
+            "reuse_miss_index": 0,
+        }
+    if not cached_tokens:
+        return {
+            "reuse_hit": False,
+            "reuse_prefix_tokens": 0,
+            "reuse_miss_reason": "empty_cache",
+            "reuse_miss_index": 0,
+        }
+    if not prompt_tokens:
+        return {
+            "reuse_hit": False,
+            "reuse_prefix_tokens": 0,
+            "reuse_miss_reason": "empty_prompt",
+            "reuse_miss_index": 0,
+        }
+    shared = _common_prefix_len(cached_tokens, prompt_tokens)
+    if shared != len(cached_tokens):
+        return {
+            "reuse_hit": False,
+            "reuse_prefix_tokens": 0,
+            "reuse_miss_reason": "prefix_mismatch",
+            "reuse_miss_index": int(shared),
+        }
+    if shared >= len(prompt_tokens):
+        return {
+            "reuse_hit": False,
+            "reuse_prefix_tokens": 0,
+            "reuse_miss_reason": "prompt_not_extended",
+            "reuse_miss_index": int(shared),
+        }
+    return {
+        "reuse_hit": True,
+        "reuse_prefix_tokens": int(shared),
+        "reuse_miss_reason": None,
+        "reuse_miss_index": -1,
+    }
+
+
+def _chat_reuse_prefix_len(cached_tokens, prompt_tokens, cache_valid: bool) -> int:
+    plan = _chat_reuse_plan(cached_tokens, prompt_tokens, cache_valid)
+    return int(plan.get("reuse_prefix_tokens", 0) or 0)
+
+
+def _assistant_history_message(text: str, token_ids=None):
+    message = {"role": "assistant", "content": text}
+    if token_ids:
+        message[_CANONICAL_TOKENS_KEY] = [int(tok) for tok in token_ids]
+    return message
+
+
+def _canonical_message_token_splices(messages):
+    splices = []
+    rendered_messages = []
+    for idx, message in enumerate(messages):
+        msg_copy = dict(message)
+        canonical_tokens = msg_copy.get(_CANONICAL_TOKENS_KEY)
+        if msg_copy.get("role") == "assistant" and canonical_tokens:
+            sentinel = f"<<ADAM_CANON_{idx}_{len(splices)}_5e7d3b91>>"
+            msg_copy["content"] = sentinel
+            splices.append((sentinel, [int(tok) for tok in canonical_tokens]))
+        rendered_messages.append(msg_copy)
+    return rendered_messages, splices
+
+
+def _encode_prompt_with_splices(prompt: str, tokenizer, add_bos: bool, splices):
+    if not splices:
+        return tokenizer.encode(prompt, add_bos=add_bos)
+    tokens = []
+    cursor = 0
+    bos_pending = bool(add_bos)
+    for sentinel, canonical_tokens in splices:
+        sentinel_pos = prompt.find(sentinel, cursor)
+        if sentinel_pos < 0:
+            raise RuntimeError(f"canonical chat sentinel missing: {sentinel}")
+        segment = prompt[cursor:sentinel_pos]
+        tokens.extend(tokenizer.encode(segment, add_bos=bos_pending))
+        bos_pending = False
+        tokens.extend(canonical_tokens)
+        cursor = sentinel_pos + len(sentinel)
+    tokens.extend(tokenizer.encode(prompt[cursor:], add_bos=bos_pending))
+    return tokens
+
+
+def _render_messages_tokens(messages, cfg, tokenizer, system_prompt=None):
+    t0 = time.perf_counter()
+    rendered_messages, splices = _canonical_message_token_splices(messages)
+    prompt, add_bos = prepare_chat_messages(
+        rendered_messages,
+        cfg.arch,
+        tokenizer,
+        chat_template=getattr(cfg, "chat_template", None),
+        system_prompt=system_prompt,
+    )
+    render_s = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    tokens = _encode_prompt_with_splices(prompt, tokenizer, add_bos, splices)
+    encode_s = time.perf_counter() - t0
+    return prompt, add_bos, tokens, {
+        "render_s": render_s,
+        "encode_s": encode_s,
+        "passes": 1,
+    }
+
+
 def _trim_messages_to_fit(engine, tokenizer, cfg, messages, gen_cfg, system_prompt=None):
     kv_cap = getattr(engine, "_kv_cap", 0)
     if kv_cap <= 0:
-        prompt, add_bos = prepare_chat_messages(
-            messages, cfg.arch, tokenizer, chat_template=getattr(cfg, "chat_template", None),
-            system_prompt=system_prompt,
+        prompt, add_bos, tokens, prep = _render_messages_tokens(
+            messages, cfg, tokenizer, system_prompt=system_prompt
         )
-        tokens = tokenizer.encode(prompt, add_bos=add_bos)
-        return list(messages), prompt, add_bos, tokens, 0
+        return list(messages), prompt, add_bos, tokens, 0, prep
 
     trimmed = list(messages)
     dropped = 0
+    render_total = 0.0
+    encode_total = 0.0
+    passes = 0
     while True:
-        prompt, add_bos = prepare_chat_messages(
-            trimmed, cfg.arch, tokenizer, chat_template=getattr(cfg, "chat_template", None),
-            system_prompt=system_prompt,
+        prompt, add_bos, tokens, prep = _render_messages_tokens(
+            trimmed, cfg, tokenizer, system_prompt=system_prompt
         )
-        tokens = tokenizer.encode(prompt, add_bos=add_bos)
+        render_total += float(prep["render_s"])
+        encode_total += float(prep["encode_s"])
+        passes += 1
         if len(tokens) + gen_cfg.max_tokens <= kv_cap:
-            return trimmed, prompt, add_bos, tokens, dropped
+            return trimmed, prompt, add_bos, tokens, dropped, {
+                "render_s": render_total,
+                "encode_s": encode_total,
+                "passes": passes,
+            }
         base = 1 if trimmed and trimmed[0].get("role") == "system" else 0
         if len(trimmed) <= base + 1:
-            return trimmed, prompt, add_bos, tokens, dropped
+            return trimmed, prompt, add_bos, tokens, dropped, {
+                "render_s": render_total,
+                "encode_s": encode_total,
+                "passes": passes,
+            }
         drop_n = 2 if len(trimmed) >= base + 2 and trimmed[base + 1].get("role") == "assistant" else 1
         trimmed = trimmed[:base] + trimmed[base + drop_n:]
         dropped += drop_n
@@ -1227,6 +1456,8 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
         gen_cfg.max_tokens = max_soft_cap
         print(f"{DIM}[startup max tokens clamped to {gen_cfg.max_tokens} for kv_cap={kv_cap_runtime}]{RESET}")
     history = []
+    session_tokens = []
+    session_cache_valid = False
     reasoning_cycles = int(startup.get("reasoning_cycles", _reasoning_cycles_from_env()))
     reasoning_trace = _reasoning_trace_from_env()
     decode_trace = bool(getattr(engine, "_trace_decode", False))
@@ -1272,22 +1503,37 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
                     f"{'on' if _auto_compaction_enabled(context_compaction, reasoning_cycles) else 'off'}"
                 )
                 print(f"{BOLD}Gen config:{RESET} temp={gen_cfg.temperature}, max={gen_cfg.max_tokens}, top_k={gen_cfg.top_k}, top_p={gen_cfg.top_p}, repeat={gen_cfg.repeat_penalty}, seed={gen_cfg.seed}")
-                mode = ("gpu_approx_rerank" if getattr(engine, "_gpu_approx_rerank", False)
-                        else "gpu_fused_topk")
+                mode = None
+                if hasattr(engine, "_select_sampling_mode"):
+                    try:
+                        mode = engine._select_sampling_mode(gen_cfg)
+                    except Exception:
+                        mode = None
+                if not mode:
+                    mode = ("gpu_approx_rerank" if getattr(engine, "_gpu_approx_rerank", False)
+                            else "gpu_fused_topk")
                 rows = getattr(engine, "_gpu_fused_rows_per_group", FAST_LM_ROWS_PER_GROUP)
+                rows_active = rows
+                if hasattr(engine, "_effective_gpu_fused_rows_per_group"):
+                    rows_active = engine._effective_gpu_fused_rows_per_group(gen_cfg)
                 profile = getattr(engine, "_runtime_profile", "default")
-                print(f"{BOLD}GPU path:{RESET} {mode} rows_per_group={rows} profile={profile}")
+                rows_text = str(rows_active) if rows_active == rows else f"{rows}->{rows_active}"
+                print(f"{BOLD}GPU path:{RESET} {mode} rows_per_group={rows_text} profile={profile}")
             elif cmd[0] in ('/reset', '/clear'):
                 history.clear()
+                session_tokens = []
+                session_cache_valid = False
                 engine.reset()
                 print(f"{YELLOW}Chat history and KV cache cleared.{RESET}")
             elif cmd[0] == '/compact':
                 if not history:
                     print(f"{YELLOW}Nothing to compact yet.{RESET}")
                 else:
+                    session_cache_valid = False
                     summary = _summarize_history(engine, tokenizer, cfg, GenConfig, history, seed=gen_cfg.seed)
                     if summary:
                         history = [_build_compaction_seed_message(summary)]
+                        session_tokens = []
                         engine.reset()
                         print(f"{GREEN}Conversation compacted into carry-over summary.{RESET}")
                     else:
@@ -1379,7 +1625,7 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
 
         system_prompt = None
         pending_messages = history + [{"role": "user", "content": prompt}]
-        pending_messages, templated, add_bos, tokens, dropped = _trim_messages_to_fit(
+        pending_messages, templated, add_bos, tokens, dropped, prompt_prep = _trim_messages_to_fit(
             engine, tokenizer, cfg, pending_messages, gen_cfg, system_prompt=system_prompt
         )
         if kv_cap_runtime > 0 and len(tokens) + gen_cfg.max_tokens > kv_cap_runtime:
@@ -1389,18 +1635,21 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
                 print(f"{DIM}[max tokens reduced to {gen_cfg.max_tokens} to fit current context]{RESET}")
         if dropped and _auto_compaction_enabled(context_compaction, reasoning_cycles) and history:
             try:
+                session_cache_valid = False
                 summary = _summarize_history(engine, tokenizer, cfg, GenConfig, history, seed=gen_cfg.seed)
             except Exception:
                 summary = None
             if summary:
                 history = [_build_compaction_seed_message(summary)]
+                session_tokens = []
                 engine.reset()
                 pending_messages = history + [{"role": "user", "content": prompt}]
-                pending_messages, templated, add_bos, tokens, dropped = _trim_messages_to_fit(
+                pending_messages, templated, add_bos, tokens, dropped, prompt_prep = _trim_messages_to_fit(
                     engine, tokenizer, cfg, pending_messages, gen_cfg, system_prompt=system_prompt
                 )
                 print(f"{DIM}[context compacted into carry-over summary]{RESET}")
         if _reasoning_enabled(reasoning_cycles):
+            session_cache_valid = False
             draft, reasoning_steps = _build_reasoning_draft(
                 engine, tokenizer, cfg, GenConfig, history,
                 prompt, reasoning_cycles, seed=gen_cfg.seed,
@@ -1411,7 +1660,7 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
                         print(f"{DIM}[reason {idx}/{reasoning_cycles} | {stage}]{RESET}")
                         print(f"{DIM}{notes}{RESET}")
                 system_prompt = _build_session_system_prompt(draft)
-                pending_messages, templated, add_bos, tokens, dropped_after_reason = _trim_messages_to_fit(
+                pending_messages, templated, add_bos, tokens, dropped_after_reason, prompt_prep = _trim_messages_to_fit(
                     engine, tokenizer, cfg, pending_messages, gen_cfg, system_prompt=system_prompt
                 )
                 if kv_cap_runtime > 0 and len(tokens) + gen_cfg.max_tokens > kv_cap_runtime:
@@ -1425,12 +1674,31 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
         if dropped:
             print(f"{DIM}[context trimmed: dropped {dropped} older message(s) to fit kv_cap]{RESET}")
         t0 = time.perf_counter()
+        had_session_cache = bool(session_cache_valid and session_tokens)
+        reuse_plan = _chat_reuse_plan(session_tokens, tokens, session_cache_valid)
+        reuse_prefix = int(reuse_plan.get("reuse_prefix_tokens", 0) or 0)
+        if reuse_plan.get("reuse_hit"):
+            reused = reuse_prefix
+            pending = max(0, len(tokens) - reused)
+            print(f"{DIM}[kv reuse: {reused} prompt tokens reused, {pending} new]{RESET}")
+        elif had_session_cache:
+            miss_reason = reuse_plan.get("reuse_miss_reason", "unknown")
+            miss_index = int(reuse_plan.get("reuse_miss_index", 0) or 0)
+            print(f"{DIM}[kv reuse miss: {miss_reason} at token {miss_index}]{RESET}")
 
         try:
-            out_tokens, stats = engine.generate(tokens, gen_cfg, stream=False, trace_decode=decode_trace)
+            out_tokens, stats = engine.generate(
+                tokens,
+                gen_cfg,
+                stream=False,
+                trace_decode=decode_trace,
+                reuse_prefix=reuse_prefix,
+            )
             elapsed = time.perf_counter() - t0
             text = tokenizer.decode(out_tokens)
-            history = pending_messages + [{"role": "assistant", "content": text}]
+            history = pending_messages + [_assistant_history_message(text, out_tokens)]
+            session_tokens = list(tokens) + list(out_tokens)
+            session_cache_valid = True
 
             print(f"\n{MAGENTA}{text}{RESET}")
             n_gen = stats.get('n_gen', len(out_tokens))
@@ -1438,11 +1706,35 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
             decode_tps = stats.get('decode_tps', 0.0)
             prefill_s = stats.get('prefill_s', 0.0)
             decode_s = stats.get('decode_s', 0.0)
+            prompt_total = int(stats.get('n_prompt_total', stats.get('n_prompt', len(tokens))) or 0)
+            prompt_reused = int(stats.get('n_prompt_reused', 0) or 0)
+            prompt_prefilled = int(stats.get('n_prompt_prefilled', stats.get('n_prompt', len(tokens))) or 0)
+            prompt_render_ms = float(prompt_prep.get("render_s", 0.0) or 0.0) * 1000.0
+            prompt_encode_ms = float(prompt_prep.get("encode_s", 0.0) or 0.0) * 1000.0
+            prompt_passes = int(prompt_prep.get("passes", 1) or 1)
+            prompt_suffix = (
+                f" | prompt {prompt_prefilled}/{prompt_total} prefilled, {prompt_reused} reused"
+                if prompt_reused > 0 else
+                f" | prompt {prompt_prefilled} prefilled"
+            )
+            reuse_suffix = ""
+            if not reuse_plan.get("reuse_hit") and had_session_cache:
+                miss_reason = reuse_plan.get("reuse_miss_reason", "unknown")
+                miss_index = int(reuse_plan.get("reuse_miss_index", 0) or 0)
+                reuse_suffix = f" | reuse miss {miss_reason}@{miss_index}"
+            prep_suffix = (
+                f" | prep {prompt_render_ms + prompt_encode_ms:.1f}ms "
+                f"(render {prompt_render_ms:.1f} | tok {prompt_encode_ms:.1f})"
+            )
+            if prompt_passes > 1:
+                prep_suffix += f" | fit passes {prompt_passes}"
             mode = stats.get('sampling_mode', 'unknown')
+            rows_active = stats.get('gpu_fused_rows_per_group_active')
+            rows_suffix = f" | rows {int(rows_active)}" if rows_active else ""
             print(
                 f"{DIM}[{n_gen} tokens | decode {decode_tps:.1f} tok/s | "
                 f"total {total_tps:.1f} tok/s | prefill {prefill_s:.2f}s | "
-                f"decode {decode_s:.2f}s | {mode}]{RESET}\n"
+                f"decode {decode_s:.2f}s{prompt_suffix}{reuse_suffix}{prep_suffix} | {mode}{rows_suffix}]{RESET}\n"
             )
             trace_summary = stats.get('trace_summary') or {}
             if decode_trace and trace_summary:
@@ -1458,6 +1750,7 @@ def chat_loop(engine, tokenizer, cfg, GenConfig, startup=None):
                     f"ffn {trace_summary.get('ffn_ms_avg', 0.0):.2f}ms]{RESET}\n"
                 )
         except Exception as e:
+            session_cache_valid = False
             print(f"{RED}Error: {e}{RESET}")
             import traceback
             traceback.print_exc()

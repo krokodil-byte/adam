@@ -9,8 +9,11 @@ for p in [ROOT, os.path.join(ROOT, "adamah-MAIN")]:
         sys.path.insert(0, p)
 
 from adamah_chat import (
+    _assistant_history_message,
     _auto_compaction_enabled,
     _build_compaction_seed_message,
+    _chat_reuse_plan,
+    _chat_reuse_prefix_len,
     _desired_shader_profile,
     _build_reasoning_request,
     _build_session_system_prompt,
@@ -21,6 +24,7 @@ from adamah_chat import (
     _max_tokens_soft_cap,
     _reasoning_enabled,
     _reasoning_stage_name,
+    _render_messages_tokens,
     _resolve_runtime_profile_name,
     _runtime_preset_defaults,
     _runtime_profile_overrides,
@@ -35,6 +39,18 @@ class DummyTokenizer:
         self.bos_id = 1
         self.eos_id = 2
         self._vocab = ["<unk>", "<s>", "</s>"]
+        self._specials = {}
+
+    def encode(self, text, add_bos=True):
+        ids = [100 + ord(ch) for ch in text]
+        return ([self.bos_id] + ids) if add_bos else ids
+
+
+class DummyGPU:
+    _has_map_matvec_topk_t_xq4_dev = True
+    _has_map_matvec_topk_t_xq8_dev = True
+    _has_map_matvec_topk_t_xq4_ex_dev = True
+    _has_map_matvec_topk_t_xq8_ex_dev = True
 
 
 def main():
@@ -78,6 +94,36 @@ def main():
     assert convo.rstrip().endswith("<|assistant|>")
     assert add_bos is True
 
+    assert _chat_reuse_prefix_len([1, 2, 3], [1, 2, 3, 4, 5], True) == 3
+    assert _chat_reuse_prefix_len([1, 2, 3], [1, 2, 9, 4, 5], True) == 0
+    assert _chat_reuse_prefix_len([1, 2, 3], [1, 2, 3], True) == 0
+    assert _chat_reuse_prefix_len([1, 2, 3], [1, 2, 3, 4], False) == 0
+    reuse_hit = _chat_reuse_plan([1, 2, 3], [1, 2, 3, 4], True)
+    assert reuse_hit["reuse_hit"] is True
+    assert reuse_hit["reuse_prefix_tokens"] == 3
+    reuse_miss = _chat_reuse_plan([1, 2, 3], [1, 2, 9, 4], True)
+    assert reuse_miss["reuse_hit"] is False
+    assert reuse_miss["reuse_miss_reason"] == "prefix_mismatch"
+    assert reuse_miss["reuse_miss_index"] == 2
+    prompt_not_extended = _chat_reuse_plan([1, 2, 3], [1, 2, 3], True)
+    assert prompt_not_extended["reuse_miss_reason"] == "prompt_not_extended"
+
+    cfg_stub = type("Cfg", (), {"arch": "gemma3", "chat_template": None})()
+    canon_prompt, add_bos, canon_tokens, prep = _render_messages_tokens(
+        [
+            {"role": "user", "content": "hi"},
+            _assistant_history_message("WRONG", [9001, 9002]),
+            {"role": "user", "content": "next"},
+        ],
+        cfg_stub,
+        tok,
+    )
+    assert "<start_of_turn>user" in canon_prompt
+    assert add_bos is True
+    assert prep["render_s"] >= 0.0
+    joined = ",".join(str(tok_id) for tok_id in canon_tokens)
+    assert "9001,9002" in joined
+
     assert _build_session_system_prompt() is None
     assert _build_session_system_prompt("remember this") == (
         "Use the following working notes privately to answer the user's latest message. "
@@ -89,7 +135,7 @@ def main():
     assert _runtime_preset_defaults("desktop_long")["kv_cap"] == 16384
     assert _runtime_preset_defaults("broadcom_fast")["kv_cap"] == 256
     assert _runtime_preset_defaults("broadcom_trace")["runtime_profile"] == "broadcom_v3dv"
-    assert _desired_shader_profile({"runtime_mode": "fast", "runtime_profile": "default"}) in ("default", "broadcom_v3dv")
+    assert _desired_shader_profile({"runtime_mode": "fast", "runtime_profile": "default"}) in ("desktop_discrete", "broadcom_v3dv")
     assert _max_tokens_soft_cap(256) == 128
     assert _max_tokens_hard_cap(256) == 224
     assert _clamp_default_max_tokens(256, 256) == 128
@@ -142,13 +188,24 @@ def main():
     assert trace_summary["step_ms_avg"] == 12.0
     assert trace_summary["sample_ms_avg"] == 3.0
     assert trace_summary["attn_ms_avg"] == 4.0
-    assert _resolve_runtime_profile_name("default", unified=False) == "default"
+    assert _resolve_runtime_profile_name("default", unified=False) == "desktop_discrete"
     assert _resolve_runtime_profile_name("default", unified=True) == "broadcom_v3dv"
     assert _resolve_runtime_profile_name("trace", unified=True) == "broadcom_v3dv"
+    assert _resolve_runtime_profile_name(
+        "default",
+        unified=False,
+        device={"device_name": "NVIDIA GeForce RTX 3070"},
+    ) == "nvidia_discrete"
     small_prof = _runtime_profile_overrides("default", ModelConfig(), unified=True)
     assert small_prof["gpu_approx_rerank"] is False
     assert small_prof["gpu_fused_rows_per_group"] == 256
     assert small_prof["gpu_approx_partial_k"] == 8
+    discrete_prof = _runtime_profile_overrides("default", ModelConfig(), unified=False)
+    assert discrete_prof["stream_load"] is False
+    assert discrete_prof["gpu_fused_rows_per_group"] == 512
+    nvidia_prof = _runtime_profile_overrides("nvidia_discrete", ModelConfig(), unified=False)
+    assert nvidia_prof["gpu_fused_rows_per_group"] == 512
+    assert nvidia_prof["gpu_approx_rerank"] is False
     gemma_prof = _runtime_profile_overrides(
         "default",
         ModelConfig(n_vocab=262144),
@@ -165,6 +222,29 @@ def main():
     assert prof["trace_decode"] is True
     assert prof["gpu_approx_rerank"] is True
     assert prof["gpu_approx_partial_k"] == 8
+    engine = ADAMEngine.__new__(ADAMEngine)
+    engine.gpu = DummyGPU()
+    engine.cfg = ModelConfig(n_vocab=32768)
+    engine._gpu_fused_topk = True
+    engine._gpu_approx_rerank = True
+    engine._gpu_fused_rows_per_group = 256
+    engine._runtime_profile = "desktop_discrete"
+    engine._lm_wt_name = "output.weight"
+    engine._q4_tensors = {"output.weight"}
+    engine._q8_tensors = set()
+    engine._trans = {"output.weight": False}
+    greedy_cfg = GenerationConfig(temperature=0.0, top_k=1, repeat_penalty=1.0)
+    chat_cfg = GenerationConfig(temperature=0.7, top_k=40, repeat_penalty=1.08)
+    assert engine._gpu_fused_topk_weight_kind() == "q4"
+    assert engine._can_gpu_fused_topk_sample(greedy_cfg) is True
+    assert engine._effective_gpu_fused_rows_per_group(greedy_cfg) == 256
+    assert engine._effective_gpu_fused_rows_per_group(chat_cfg) == 256
+    engine._can_gpu_argmax_sample = lambda cfg: True
+    engine._can_gpu_approx_rerank_sample = lambda cfg: True
+    engine._can_gpu_topk_sample = lambda cfg: True
+    assert engine._select_sampling_mode(greedy_cfg) == "gpu_fused_topk"
+    engine._gpu_fused_topk = False
+    assert engine._select_sampling_mode(greedy_cfg) == "gpu_argmax"
 
     print("PASS adaptive chat template rendering")
     return 0
