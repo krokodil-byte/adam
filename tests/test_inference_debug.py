@@ -38,6 +38,26 @@ WARN = "\033[33mWARN\033[0m"
 BOLD = "\033[1m"
 RST  = "\033[0m"
 
+
+def _is_broadcom_like_profile() -> bool:
+    profile = str(
+        os.environ.get("ADAM_RUNTIME_PROFILE")
+        or os.environ.get("ADAMAH_SHADER_PROFILE")
+        or ""
+    ).strip().lower()
+    return profile.startswith("broadcom_v3dv")
+
+
+def _pool_attempts_for_device() -> list[tuple[int, int]]:
+    try:
+        device = A.probe_device()
+    except Exception:
+        device = {}
+    unified = bool(device.get("is_unified_memory"))
+    if unified or _is_broadcom_like_profile():
+        return [(64, 32), (48, 24), (32, 16)]
+    return [(1024, 512), (512, 256), (256, 128)]
+
 # ── Model path ───────────────────────────────────────────────────────────────
 def find_model(argv):
     if len(argv) > 1 and argv[1].endswith('.gguf'):
@@ -93,14 +113,19 @@ def load_everything(model_path):
         attempts.append((int(plan["hot_mb"]), int(plan["cold_mb"])))
     except Exception:
         pass
-    attempts.extend([(1024, 512), (512, 256), (256, 128)])
+    attempts.extend(_pool_attempts_for_device())
+    seen = set()
     for hot_mb, cold_mb in attempts:
+        key = (int(hot_mb), int(cold_mb))
+        if key in seen:
+            continue
+        seen.add(key)
         try:
             gpu = A.init(cache_mb=hot_mb, cold_cache_mb=cold_mb)
             print(f"  [GPU pool: hot={hot_mb}MB cold={cold_mb}MB]")
             break
-        except (RuntimeError, OSError):
-            pass
+        except (RuntimeError, OSError) as exc:
+            print(f"  [GPU pool failed: hot={hot_mb}MB cold={cold_mb}MB] {exc}")
     if gpu is None:
         raise RuntimeError("GPU init failed at all pool sizes — is VRAM full?")
     engine = ADAMEngine(
@@ -432,17 +457,26 @@ def check_cpu_reference(engine, tokenizer, cfg):
     g = engine.gpu
     ws_id = engine.ws_map_id
 
-    # Gather V slot (written by V projection, never overwritten in layer 0)
-    _, v_sz, v_pos = engine._ws_slots['v']
-    v_locs = np.arange(v_pos, v_pos + v_sz, dtype=np.uint32)
-    gpu_v = g.gather(ws_id, v_locs).view(np.float32)
+    # Gather V from the actual KV cache, not the temporary workspace staging slot.
+    kv_step = engine._kv_cap * c.head_dim_kv
+    gpu_v = np.concatenate([
+        g.gather(
+            ws_id,
+            np.arange(
+                engine._kc_v_base[0] + gi * kv_step,
+                engine._kc_v_base[0] + gi * kv_step + c.head_dim_kv,
+                dtype=np.uint32,
+            ),
+        ).view(np.float32)
+        for gi in range(c.n_head_kv)
+    ], axis=0)
 
     # Gather attn_out slot (written by weighted-sum matmul, never overwritten)
     _, ao_sz, ao_pos = engine._ws_slots['attn_out']
     ao_locs = np.arange(ao_pos, ao_pos + ao_sz, dtype=np.uint32)
     gpu_ao = g.gather(ws_id, ao_locs).view(np.float32)
 
-    # ---- 5a: Trivial identity: for pos=0, attn_out[h] must equal V[h//gs] exactly ----
+    # ---- 5a: Trivial identity: for pos=0, attn_out[h] must equal cached V[h//gs] exactly ----
     # softmax([score]) = [1.0]  →  attn_out[h] = 1.0 * V_cache[h//gs][0] = V[h//gs]
     max_diff = 0.0
     for h in range(c.n_head):
@@ -500,7 +534,7 @@ def check_cpu_reference(engine, tokenizer, cfg):
 
     # RoPE: no-op at pos=0 (cos=1, sin=0), skip
 
-    # ---- 5b: V projection CPU vs GPU ----
+    # ---- 5b: V projection CPU vs cached GPU V ----
     v_rmse = float(np.sqrt(np.mean((gpu_v - v_cpu) ** 2)))
     v_std  = float(max(np.std(v_cpu), 1e-8))
     ok5b = v_rmse / v_std < 0.15
