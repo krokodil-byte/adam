@@ -9,6 +9,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from typing import Any, Dict, List, Optional
@@ -26,6 +27,7 @@ DECODE_REGRESSION_PRESET = "decode_regression"
 CHAT_TURN_REGRESSION_PRESET = "chat_turn_regression"
 DEFAULT_OLLAMA_MODEL = "gemma3:1b"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_EXPERIMENT_LOG = os.path.join(_ROOT, "reports", "throughput_experiments.jsonl")
 DEFAULT_WARMUP = 1
 DEFAULT_RUNS = 3
 DEFAULT_MAX_TOKENS = 32
@@ -33,6 +35,7 @@ DEFAULT_TRACE_TOKENS = 8
 DEFAULT_SEED = 123
 DEFAULT_LLAMA_NGL = 999
 DEFAULT_KPI_TARGET_TPS = 100.0
+DEFAULT_GPU_TELEMETRY_MODE = "auto"
 MIN_VALID_GENERATED_TOKENS = 8
 SWEEP_STREAM_LOAD = (False, True)
 SWEEP_STREAM_CHUNK_MB = (8, 16, 32, 64)
@@ -96,6 +99,51 @@ PRESET_DEFAULTS = {
     },
 }
 
+DECODE_ABLATION_CASES: List[Dict[str, Any]] = [
+    {
+        "id": "qk_norm_rope_off",
+        "label": "disable fused qk_norm_rope",
+        "feature": "fused Q/K norm+RoPE prep",
+        "mode": "disable",
+        "startup": {"experimental_qk_norm_rope": False},
+    },
+    {
+        "id": "merged_qkv_off",
+        "label": "disable merged qkv",
+        "feature": "merged QKV projection",
+        "mode": "disable",
+        "startup": {"experimental_merged_qkv": False},
+    },
+    {
+        "id": "fused_qkv_qk_norm_rope_off",
+        "label": "disable fused merged qkv -> qk norm+rope",
+        "feature": "fused merged QKV -> Q/K norm+RoPE prep",
+        "mode": "disable",
+        "startup": {"experimental_fused_qkv_qk_norm_rope": False},
+    },
+    {
+        "id": "merged_gateup_off",
+        "label": "disable merged gate+up",
+        "feature": "merged gate+up FFN projection",
+        "mode": "disable",
+        "startup": {"experimental_merged_gateup": False},
+    },
+    {
+        "id": "attn_softmax_value_on",
+        "label": "enable fused attn softmax+value",
+        "feature": "fused attention softmax+value",
+        "mode": "enable",
+        "startup": {"experimental_attn_softmax_value": True},
+    },
+    {
+        "id": "rmsnorm_add_on",
+        "label": "enable fused rmsnorm+add",
+        "feature": "fused rmsnorm+add residual path",
+        "mode": "enable",
+        "startup": {"experimental_rmsnorm_add": True},
+    },
+]
+
 TRACE_SUMMARY_DEFAULTS: Dict[str, Any] = {
     "step_ms_avg": 0.0,
     "sample_ms_avg": 0.0,
@@ -132,6 +180,7 @@ TRACE_SUMMARY_DEFAULTS: Dict[str, Any] = {
     "alias_conflict_count_per_token": 0.0,
     "scheduler_mode": 0,
     "scheduler_mode_name": "legacy",
+    "descriptor_cache_breakdown": {},
 }
 
 CHAT_TURN_METRICS_DEFAULTS: Dict[str, Any] = {
@@ -159,6 +208,27 @@ CHAT_TURN_METRICS_DEFAULTS: Dict[str, Any] = {
     "reuse_miss_index": -1,
 }
 
+GPU_TELEMETRY_DEFAULTS: Dict[str, Any] = {
+    "available": False,
+    "sample_count": 0,
+    "gpu_name": None,
+    "gpu_index": None,
+    "gpu_util_avg": 0.0,
+    "gpu_util_max": 0.0,
+    "mem_util_avg": 0.0,
+    "mem_util_max": 0.0,
+    "mem_used_mb_avg": 0.0,
+    "mem_used_mb_max": 0.0,
+    "mem_total_mb": 0.0,
+    "sm_clock_mhz_avg": 0.0,
+    "sm_clock_mhz_max": 0.0,
+    "mem_clock_mhz_avg": 0.0,
+    "mem_clock_mhz_max": 0.0,
+    "power_w_avg": 0.0,
+    "power_w_max": 0.0,
+    "error": None,
+}
+
 
 def _empty_trace_summary() -> Dict[str, Any]:
     return dict(TRACE_SUMMARY_DEFAULTS)
@@ -166,6 +236,33 @@ def _empty_trace_summary() -> Dict[str, Any]:
 
 def _empty_chat_turn_metrics() -> Dict[str, Any]:
     return dict(CHAT_TURN_METRICS_DEFAULTS)
+
+
+def _empty_gpu_telemetry() -> Dict[str, Any]:
+    return dict(GPU_TELEMETRY_DEFAULTS)
+
+
+def _default_experiment_name(args: argparse.Namespace) -> str:
+    parts = [
+        str(getattr(args, "preset", DEFAULT_PRESET) or DEFAULT_PRESET),
+        str(getattr(args, "profile", "auto") or "auto"),
+    ]
+    scheduler = getattr(args, "fusion_scheduler_mode", None)
+    if scheduler:
+        parts.append(f"sched={scheduler}")
+    direct_kv = getattr(args, "direct_kv_cache_write", None)
+    if direct_kv:
+        parts.append(f"direct_kv={direct_kv}")
+    rows = getattr(args, "gpu_fused_rows_per_group", None)
+    if rows is not None:
+        parts.append(f"rows={rows}")
+    return " | ".join(parts)
+
+
+def _profile_prefers_dispatch_cut(args: Optional[argparse.Namespace] = None) -> bool:
+    profile = str(getattr(args, "profile", "") or "").strip().lower()
+    explicit = getattr(args, "experimental_fused_qkv_qk_norm_rope", None) if args is not None else None
+    return explicit == "on" or profile.startswith("broadcom_v3dv")
 
 
 def _normalize_trace_summary(summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -184,6 +281,260 @@ def _normalize_chat_turn_metrics(metrics: Optional[Dict[str, Any]]) -> Dict[str,
     return normalized
 
 
+def _normalize_gpu_telemetry(metrics: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized = _empty_gpu_telemetry()
+    if metrics:
+        for key, value in metrics.items():
+            normalized[key] = value
+    return normalized
+
+
+def _parse_nvidia_smi_csv_numbers(line: str, expected_fields: int) -> Optional[List[float]]:
+    parts = [part.strip() for part in (line or "").split(",")]
+    if len(parts) < expected_fields:
+        return None
+    values: List[float] = []
+    for part in parts[:expected_fields]:
+        lower = part.lower()
+        if lower in {"n/a", "[not supported]", "not supported"}:
+            values.append(0.0)
+            continue
+        try:
+            values.append(float(part))
+        except ValueError:
+            return None
+    return values
+
+
+def _summarize_gpu_telemetry_samples(samples: List[Dict[str, float]],
+                                     gpu_name: Optional[str] = None,
+                                     gpu_index: Optional[int] = None,
+                                     mem_total_mb: Optional[float] = None,
+                                     error: Optional[str] = None) -> Dict[str, Any]:
+    if not samples:
+        telemetry = _empty_gpu_telemetry()
+        telemetry["gpu_name"] = gpu_name
+        telemetry["gpu_index"] = gpu_index
+        telemetry["mem_total_mb"] = _safe_float(mem_total_mb)
+        telemetry["error"] = error
+        return telemetry
+
+    def avg(key: str) -> float:
+        return sum(_safe_float(sample.get(key)) for sample in samples) / max(1, len(samples))
+
+    def maxv(key: str) -> float:
+        return max((_safe_float(sample.get(key)) for sample in samples), default=0.0)
+
+    telemetry = {
+        "available": True,
+        "sample_count": len(samples),
+        "gpu_name": gpu_name,
+        "gpu_index": gpu_index,
+        "gpu_util_avg": avg("gpu_util"),
+        "gpu_util_max": maxv("gpu_util"),
+        "mem_util_avg": avg("mem_util"),
+        "mem_util_max": maxv("mem_util"),
+        "mem_used_mb_avg": avg("mem_used_mb"),
+        "mem_used_mb_max": maxv("mem_used_mb"),
+        "mem_total_mb": _safe_float(mem_total_mb),
+        "sm_clock_mhz_avg": avg("sm_clock_mhz"),
+        "sm_clock_mhz_max": maxv("sm_clock_mhz"),
+        "mem_clock_mhz_avg": avg("mem_clock_mhz"),
+        "mem_clock_mhz_max": maxv("mem_clock_mhz"),
+        "power_w_avg": avg("power_w"),
+        "power_w_max": maxv("power_w"),
+        "error": error,
+    }
+    return telemetry
+
+
+def _summarize_gpu_telemetry(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    source = []
+    for record in records:
+        telemetry = _normalize_gpu_telemetry(record.get("gpu_telemetry"))
+        if telemetry.get("available") and _safe_int(telemetry.get("sample_count")) > 0:
+            source.append(telemetry)
+    if not source:
+        return _empty_gpu_telemetry()
+
+    def med(key: str) -> float:
+        return _median([_safe_float(item.get(key)) for item in source])
+
+    summary = {
+        "available": True,
+        "sample_count": _median([float(_safe_int(item.get("sample_count"))) for item in source]),
+        "gpu_name": next((item.get("gpu_name") for item in source if item.get("gpu_name")), None),
+        "gpu_index": next((item.get("gpu_index") for item in source if item.get("gpu_index") is not None), None),
+        "gpu_util_avg": med("gpu_util_avg"),
+        "gpu_util_max": med("gpu_util_max"),
+        "mem_util_avg": med("mem_util_avg"),
+        "mem_util_max": med("mem_util_max"),
+        "mem_used_mb_avg": med("mem_used_mb_avg"),
+        "mem_used_mb_max": med("mem_used_mb_max"),
+        "mem_total_mb": med("mem_total_mb"),
+        "sm_clock_mhz_avg": med("sm_clock_mhz_avg"),
+        "sm_clock_mhz_max": med("sm_clock_mhz_max"),
+        "mem_clock_mhz_avg": med("mem_clock_mhz_avg"),
+        "mem_clock_mhz_max": med("mem_clock_mhz_max"),
+        "power_w_avg": med("power_w_avg"),
+        "power_w_max": med("power_w_max"),
+        "error": next((item.get("error") for item in source if item.get("error")), None),
+    }
+    return summary
+
+
+class _NvidiaSmiMonitor:
+    _STATIC_QUERY = [
+        "nvidia-smi",
+        "--query-gpu=index,name,memory.total",
+        "--format=csv,noheader,nounits",
+    ]
+    _LOOP_QUERY_FIELDS = (
+        "utilization.gpu",
+        "utilization.memory",
+        "memory.used",
+        "clocks.sm",
+        "clocks.mem",
+        "power.draw",
+    )
+
+    def __init__(self, gpu_index: int = 0, interval_ms: int = 100):
+        self.gpu_index = int(gpu_index)
+        self.interval_ms = max(20, int(interval_ms))
+        self.proc: Optional[subprocess.Popen] = None
+        self.thread: Optional[threading.Thread] = None
+        self.samples: List[Dict[str, float]] = []
+        self.gpu_name: Optional[str] = None
+        self.mem_total_mb: float = 0.0
+        self.error: Optional[str] = None
+        self._stop = threading.Event()
+
+    @classmethod
+    def probe_static(cls, gpu_index: int = 0) -> Dict[str, Any]:
+        try:
+            proc = subprocess.run(
+                cls._STATIC_QUERY,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+            )
+        except Exception as exc:
+            telemetry = _empty_gpu_telemetry()
+            telemetry["error"] = str(exc)
+            return telemetry
+        if proc.returncode != 0:
+            telemetry = _empty_gpu_telemetry()
+            telemetry["error"] = (proc.stderr or proc.stdout or "nvidia-smi failed").strip()
+            return telemetry
+        lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+        if not lines:
+            telemetry = _empty_gpu_telemetry()
+            telemetry["error"] = "nvidia-smi returned no GPU rows"
+            return telemetry
+        row = None
+        for line in lines:
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 3:
+                continue
+            if _safe_int(parts[0], -1) == int(gpu_index):
+                row = parts
+                break
+        if row is None:
+            row = [part.strip() for part in lines[0].split(",")]
+        telemetry = _empty_gpu_telemetry()
+        telemetry["available"] = True
+        telemetry["gpu_index"] = _safe_int(row[0], gpu_index)
+        telemetry["gpu_name"] = row[1] if len(row) > 1 else None
+        telemetry["mem_total_mb"] = _safe_float(row[2] if len(row) > 2 else 0.0)
+        return telemetry
+
+    def start(self) -> bool:
+        static = self.probe_static(self.gpu_index)
+        self.gpu_name = static.get("gpu_name")
+        self.mem_total_mb = _safe_float(static.get("mem_total_mb"))
+        if not static.get("available"):
+            self.error = static.get("error")
+            return False
+        cmd = [
+            "nvidia-smi",
+            f"--id={self.gpu_index}",
+            f"--query-gpu={','.join(self._LOOP_QUERY_FIELDS)}",
+            "--format=csv,noheader,nounits",
+            f"--loop-ms={self.interval_ms}",
+        ]
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except Exception as exc:
+            self.error = str(exc)
+            self.proc = None
+            return False
+
+        def _reader() -> None:
+            assert self.proc is not None
+            try:
+                while not self._stop.is_set():
+                    line = self.proc.stdout.readline() if self.proc.stdout else ""
+                    if not line:
+                        if self.proc.poll() is not None:
+                            break
+                        continue
+                    values = _parse_nvidia_smi_csv_numbers(line.strip(), expected_fields=6)
+                    if values is None:
+                        continue
+                    self.samples.append({
+                        "gpu_util": values[0],
+                        "mem_util": values[1],
+                        "mem_used_mb": values[2],
+                        "sm_clock_mhz": values[3],
+                        "mem_clock_mhz": values[4],
+                        "power_w": values[5],
+                    })
+            except Exception as exc:
+                self.error = self.error or str(exc)
+
+        self.thread = threading.Thread(target=_reader, name="nvidia-smi-monitor", daemon=True)
+        self.thread.start()
+        return True
+
+    def stop(self) -> Dict[str, Any]:
+        self._stop.set()
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+        if self.proc is not None and self.proc.stderr:
+            try:
+                stderr = self.proc.stderr.read().strip()
+            except Exception:
+                stderr = ""
+            if stderr and not self.error and "interrupted" not in stderr.lower():
+                self.error = stderr
+        return _summarize_gpu_telemetry_samples(
+            self.samples,
+            gpu_name=self.gpu_name,
+            gpu_index=self.gpu_index,
+            mem_total_mb=self.mem_total_mb,
+            error=self.error,
+        )
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark ADAM runtime path against llama.cpp and Ollama."
@@ -200,7 +551,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--suite", action="store_true")
     parser.add_argument("--json-out", dest="json_out")
     parser.add_argument("--output", dest="json_out")
+    parser.add_argument("--experiment-name")
+    parser.add_argument("--experiment-log", dest="experiment_log")
     parser.add_argument("--diagnose-trace", action="store_true")
+    parser.add_argument(
+        "--decode-ablation",
+        action="store_true",
+        help="Run targeted ADAM decode ablations to show which subgraphs are worth deeper optimization.",
+    )
     parser.add_argument("--profile", help="Runtime profile override for ADAM")
     parser.add_argument("--sweep", action="store_true", help="Run ADAM-only regression sweep")
     parser.add_argument("--adam-only", action="store_true", help="Skip llama.cpp and Ollama")
@@ -208,6 +566,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--skip-llama", action="store_true")
     parser.add_argument("--skip-ollama", action="store_true")
     parser.add_argument("--llama-ngl", type=int, default=DEFAULT_LLAMA_NGL)
+    parser.add_argument(
+        "--gpu-telemetry",
+        choices=("auto", "on", "off"),
+        default=DEFAULT_GPU_TELEMETRY_MODE,
+        help="Sample GPU utilization during benchmark runs when supported.",
+    )
     parser.add_argument("--stream-load", choices=("on", "off"), help=argparse.SUPPRESS)
     parser.add_argument("--stream-chunk-mb", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--kv-cap", type=int, help=argparse.SUPPRESS)
@@ -216,6 +580,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--gpu-fused-rows-per-group", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--gpu-fused-topk", choices=("on", "off"), help=argparse.SUPPRESS)
     parser.add_argument("--fusion-scheduler-mode", help=argparse.SUPPRESS)
+    parser.add_argument("--direct-kv-cache-write", choices=("on", "off"), help=argparse.SUPPRESS)
+    parser.add_argument("--experimental-qk-norm-rope", choices=("on", "off"), help=argparse.SUPPRESS)
+    parser.add_argument("--experimental-merged-qkv", choices=("on", "off"), help=argparse.SUPPRESS)
+    parser.add_argument("--experimental-fused-qkv-qk-norm-rope", choices=("on", "off"), help=argparse.SUPPRESS)
+    parser.add_argument("--experimental-merged-gateup", choices=("on", "off"), help=argparse.SUPPRESS)
+    parser.add_argument("--experimental-attn-softmax-value", choices=("on", "off"), help=argparse.SUPPRESS)
+    parser.add_argument("--experimental-rmsnorm-add", choices=("on", "off"), help=argparse.SUPPRESS)
     parser.add_argument("--turn-prompt1", help=argparse.SUPPRESS)
     parser.add_argument("--turn-prompt2", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -242,10 +613,24 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         args.gpu_fused_topk = str(preset["gpu_fused_topk"])
     if args.fusion_scheduler_mode is None and preset.get("fusion_scheduler_mode") is not None:
         args.fusion_scheduler_mode = str(preset["fusion_scheduler_mode"])
+    if args.direct_kv_cache_write is None and preset.get("direct_kv_cache_write") is not None:
+        args.direct_kv_cache_write = str(preset["direct_kv_cache_write"])
     if args.turn_prompt1 is None and preset.get("turn_prompt1") is not None:
         args.turn_prompt1 = str(preset["turn_prompt1"])
     if args.turn_prompt2 is None and preset.get("turn_prompt2") is not None:
         args.turn_prompt2 = str(preset["turn_prompt2"])
+    if args.experiment_log is None:
+        env_log = os.environ.get("ADAM_BENCH_EXPERIMENT_LOG", "").strip()
+        if env_log:
+            args.experiment_log = env_log
+    if args.experiment_name is None:
+        env_name = os.environ.get("ADAM_BENCH_EXPERIMENT_NAME", "").strip()
+        if env_name:
+            args.experiment_name = env_name
+    if args.experiment_name and not args.experiment_log:
+        args.experiment_log = DEFAULT_EXPERIMENT_LOG
+    if args.decode_ablation and not args.diagnose_trace:
+        args.diagnose_trace = True
     if args.turn_prompt1 is None:
         args.turn_prompt1 = DEFAULT_TURN_PROMPT1
     if args.turn_prompt2 is None:
@@ -320,6 +705,7 @@ def _error_record(backend: str, error: str) -> Dict[str, Any]:
         "total_s": 0.0,
         "sampling_mode": None,
         "runtime_profile": None,
+        "decode_path": None,
         "stream_load": None,
         "stream_chunk_mb": None,
         "kv_cap": None,
@@ -328,10 +714,18 @@ def _error_record(backend: str, error: str) -> Dict[str, Any]:
         "gpu_fused_rows_per_group": None,
         "gpu_fused_topk": None,
         "fusion_scheduler_mode": None,
+        "direct_kv_cache_write": None,
+        "experimental_qk_norm_rope": None,
+        "experimental_merged_qkv": None,
+        "experimental_fused_qkv_qk_norm_rope": None,
+        "experimental_merged_gateup": None,
+        "experimental_attn_softmax_value": None,
+        "experimental_rmsnorm_add": None,
         "gpu_approx_rerank": None,
         "gpu_approx_partial_k": None,
         "trace_decode": None,
         "trace_summary": _empty_trace_summary(),
+        "gpu_telemetry": _empty_gpu_telemetry(),
         "prompt_render_ms": None,
         "prompt_tokenize_ms": None,
         "prompt_total_tokens": None,
@@ -359,6 +753,7 @@ def _finalize_run_record(record: Dict[str, Any], max_tokens: int) -> Dict[str, A
     status = record.get("status")
     record["trace_summary"] = _normalize_trace_summary(record.get("trace_summary"))
     record["chat_turn_metrics"] = _normalize_chat_turn_metrics(record.get("chat_turn_metrics"))
+    record["gpu_telemetry"] = _normalize_gpu_telemetry(record.get("gpu_telemetry"))
     if status in {"error", "skipped"}:
         return record
     if _safe_int(record.get("n_gen"), 0) < _valid_token_floor(max_tokens):
@@ -401,6 +796,14 @@ def summarize_records(backend: str, records: List[Dict[str, Any]]) -> Dict[str, 
     skipped = [r for r in records if r.get("status") == "skipped"]
 
     source = valid or short
+    descriptor_cache_breakdown = {}
+    for r in source:
+        breakdown = r.get("descriptor_cache_breakdown")
+        if not breakdown:
+            breakdown = (r.get("trace_summary") or {}).get("descriptor_cache_breakdown")
+        if breakdown:
+            descriptor_cache_breakdown = breakdown
+            break
     return {
         "backend": backend,
         "status": "ok" if valid else ("short_run" if short else ("error" if errors else "skipped")),
@@ -418,6 +821,7 @@ def summarize_records(backend: str, records: List[Dict[str, Any]]) -> Dict[str, 
         "n_gen": _median([float(_safe_int(r.get("n_gen"))) for r in source]),
         "sampling_mode": next((r.get("sampling_mode") for r in source if r.get("sampling_mode")), None),
         "runtime_profile": next((r.get("runtime_profile") for r in source if r.get("runtime_profile")), None),
+        "decode_path": next((r.get("decode_path") for r in source if r.get("decode_path")), None),
         "stream_load": next((r.get("stream_load") for r in source if r.get("stream_load") is not None), None),
         "stream_chunk_mb": next((r.get("stream_chunk_mb") for r in source if r.get("stream_chunk_mb") is not None), None),
         "kv_cap": next((r.get("kv_cap") for r in source if r.get("kv_cap") is not None), None),
@@ -430,6 +834,40 @@ def summarize_records(backend: str, records: List[Dict[str, Any]]) -> Dict[str, 
         "gpu_fused_topk": next((r.get("gpu_fused_topk") for r in source if r.get("gpu_fused_topk") is not None), None),
         "fusion_scheduler_mode": next(
             (r.get("fusion_scheduler_mode") for r in source if r.get("fusion_scheduler_mode")),
+            None,
+        ),
+        "direct_kv_cache_write": next(
+            (r.get("direct_kv_cache_write") for r in source if r.get("direct_kv_cache_write") is not None),
+            None,
+        ),
+        "experimental_qk_norm_rope": next(
+            (r.get("experimental_qk_norm_rope") for r in source if r.get("experimental_qk_norm_rope") is not None),
+            None,
+        ),
+        "experimental_merged_qkv": next(
+            (r.get("experimental_merged_qkv") for r in source if r.get("experimental_merged_qkv") is not None),
+            None,
+        ),
+        "experimental_fused_qkv_qk_norm_rope": next(
+            (
+                r.get("experimental_fused_qkv_qk_norm_rope")
+                for r in source if r.get("experimental_fused_qkv_qk_norm_rope") is not None
+            ),
+            None,
+        ),
+        "experimental_merged_gateup": next(
+            (r.get("experimental_merged_gateup") for r in source if r.get("experimental_merged_gateup") is not None),
+            None,
+        ),
+        "experimental_attn_softmax_value": next(
+            (
+                r.get("experimental_attn_softmax_value")
+                for r in source if r.get("experimental_attn_softmax_value") is not None
+            ),
+            None,
+        ),
+        "experimental_rmsnorm_add": next(
+            (r.get("experimental_rmsnorm_add") for r in source if r.get("experimental_rmsnorm_add") is not None),
             None,
         ),
         "gpu_approx_rerank": next(
@@ -475,6 +913,8 @@ def summarize_records(backend: str, records: List[Dict[str, Any]]) -> Dict[str, 
         "reuse_miss_index": next(
             (r.get("reuse_miss_index") for r in source if r.get("reuse_miss_index") is not None), None
         ),
+        "descriptor_cache_breakdown": descriptor_cache_breakdown,
+        "gpu_telemetry": _summarize_gpu_telemetry(source),
         "error": errors[0].get("error") if errors else (skipped[0].get("error") if skipped else None),
     }
 
@@ -570,6 +1010,7 @@ def _normalize_run_record_trace(record: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(record)
     normalized["trace_summary"] = _normalize_trace_summary(normalized.get("trace_summary"))
     normalized["chat_turn_metrics"] = _normalize_chat_turn_metrics(normalized.get("chat_turn_metrics"))
+    normalized["gpu_telemetry"] = _normalize_gpu_telemetry(normalized.get("gpu_telemetry"))
     return normalized
 
 
@@ -587,6 +1028,7 @@ def _normalize_backend_trace_payload(backend_payload: Dict[str, Any]) -> Dict[st
     if diagnostic is not None:
         diagnostic = dict(diagnostic)
         diagnostic["trace_summary"] = _normalize_trace_summary(diagnostic.get("trace_summary"))
+        diagnostic["gpu_telemetry"] = _normalize_gpu_telemetry(diagnostic.get("gpu_telemetry"))
         payload["diagnostic"] = diagnostic
     return payload
 
@@ -606,7 +1048,8 @@ def _normalize_prompt_results(prompt_results: List[Dict[str, Any]]) -> List[Dict
 def build_json_report(args: argparse.Namespace,
                       prompt_results: List[Dict[str, Any]],
                       overall: Dict[str, Dict[str, Any]],
-                      sweep_results: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                      sweep_results: Optional[List[Dict[str, Any]]] = None,
+                      decode_ablations: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     prompt_results = _normalize_prompt_results(prompt_results)
     return {
         "config": {
@@ -622,23 +1065,129 @@ def build_json_report(args: argparse.Namespace,
             "deterministic": True,
             "diagnose_trace": bool(args.diagnose_trace),
             "profile": args.profile,
+            "decode_ablation": bool(args.decode_ablation),
             "fusion_scheduler_mode": args.fusion_scheduler_mode,
+            "direct_kv_cache_write": args.direct_kv_cache_write,
+            "experimental_qk_norm_rope": args.experimental_qk_norm_rope,
+            "experimental_merged_qkv": args.experimental_merged_qkv,
+            "experimental_fused_qkv_qk_norm_rope": args.experimental_fused_qkv_qk_norm_rope,
+            "experimental_merged_gateup": args.experimental_merged_gateup,
+            "experimental_attn_softmax_value": args.experimental_attn_softmax_value,
+            "experimental_rmsnorm_add": args.experimental_rmsnorm_add,
+            "gpu_telemetry": args.gpu_telemetry,
             "turn_prompt1": args.turn_prompt1,
             "turn_prompt2": args.turn_prompt2,
             "sweep": bool(args.sweep),
             "adam_only": bool(args.adam_only),
             "kpi_target_tps": DEFAULT_KPI_TARGET_TPS,
+            "experiment_name": args.experiment_name,
+            "experiment_log": args.experiment_log,
         },
         "prompt_results": prompt_results,
         "overall": overall,
         "sweep": sweep_results or [],
+        "decode_ablations": decode_ablations or [],
     }
+
+
+def _median_trace_summary_for_backend(prompt_results: List[Dict[str, Any]],
+                                      backend: str = "adam") -> Dict[str, Any]:
+    summaries: List[Dict[str, Any]] = []
+    for prompt_result in prompt_results:
+        backend_payload = (prompt_result.get("backends") or {}).get(backend) or {}
+        diagnostic = backend_payload.get("diagnostic") or {}
+        trace_summary = diagnostic.get("trace_summary") or {}
+        if trace_summary:
+            summaries.append(_normalize_trace_summary(trace_summary))
+
+    if not summaries:
+        return _empty_trace_summary()
+
+    merged = _empty_trace_summary()
+    for key, default in TRACE_SUMMARY_DEFAULTS.items():
+        if key == "descriptor_cache_breakdown":
+            merged[key] = next(
+                (summary.get(key) for summary in summaries if summary.get(key)),
+                {},
+            )
+            continue
+        if isinstance(default, float):
+            merged[key] = _median([_safe_float(summary.get(key)) for summary in summaries])
+        elif isinstance(default, int):
+            merged[key] = int(round(_median([float(_safe_int(summary.get(key))) for summary in summaries])))
+        else:
+            merged[key] = next(
+                (summary.get(key) for summary in summaries if summary.get(key) not in (None, "")),
+                default,
+            )
+    return merged
+
+
+def build_experiment_entry(args: argparse.Namespace,
+                           prompt_results: List[Dict[str, Any]],
+                           overall: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    adam_overall = dict((overall or {}).get("adam") or {})
+    adam_trace = _median_trace_summary_for_backend(prompt_results, backend="adam")
+    experiment_name = str(
+        getattr(args, "experiment_name", None) or _default_experiment_name(args)
+    )
+    return {
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "experiment_name": experiment_name,
+        "model": args.model,
+        "preset": args.preset,
+        "profile": args.profile,
+        "config": {
+            "runs": args.runs,
+            "warmup": args.warmup,
+            "max_tokens": args.max_tokens,
+            "diagnose_trace": bool(args.diagnose_trace),
+            "stream_load": args.stream_load,
+            "stream_chunk_mb": args.stream_chunk_mb,
+            "kv_cap": args.kv_cap,
+            "gpu_fused_rows_per_group": args.gpu_fused_rows_per_group,
+            "gpu_fused_topk": args.gpu_fused_topk,
+            "fusion_scheduler_mode": args.fusion_scheduler_mode,
+            "direct_kv_cache_write": args.direct_kv_cache_write,
+            "experimental_qk_norm_rope": args.experimental_qk_norm_rope,
+            "experimental_merged_qkv": args.experimental_merged_qkv,
+            "experimental_fused_qkv_qk_norm_rope": args.experimental_fused_qkv_qk_norm_rope,
+            "experimental_merged_gateup": args.experimental_merged_gateup,
+            "experimental_attn_softmax_value": args.experimental_attn_softmax_value,
+            "experimental_rmsnorm_add": args.experimental_rmsnorm_add,
+            "gpu_telemetry": args.gpu_telemetry,
+            "adam_only": bool(args.adam_only),
+        },
+        "adam": {
+            "status": adam_overall.get("status"),
+            "steady_decode_tps": _safe_float(adam_overall.get("steady_decode_tps", adam_overall.get("decode_tps"))),
+            "first_run_decode_tps": _safe_float(adam_overall.get("first_run_decode_tps")),
+            "prefill_tps": _safe_float(adam_overall.get("prefill_tps")),
+            "total_s": _safe_float(adam_overall.get("total_s")),
+            "sampling_mode": adam_overall.get("sampling_mode"),
+            "runtime_profile": adam_overall.get("runtime_profile"),
+            "gpu_telemetry": _normalize_gpu_telemetry(adam_overall.get("gpu_telemetry")),
+            "trace_summary": adam_trace,
+        },
+    }
+
+
+def append_experiment_log(path: str, entry: Dict[str, Any]) -> None:
+    if not path:
+        raise ValueError("experiment log path is required")
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        json.dump(entry, handle, ensure_ascii=True)
+        handle.write("\n")
 
 
 def _collect_runtime_knobs(engine: Any, trace_decode: bool) -> Dict[str, Any]:
     runtime_plan = dict(getattr(engine, "_runtime_plan", {}) or {})
     pool_plan = dict(runtime_plan.get("pool_plan", {}) or {})
     return {
+        "decode_path": runtime_plan.get("decode_path", getattr(engine, "_decode_path", None)),
         "stream_load": runtime_plan.get("stream_load", getattr(engine, "_stream_load", None)),
         "stream_chunk_mb": runtime_plan.get("stream_chunk_mb", getattr(engine, "_stream_chunk_mb", None)),
         "kv_cap": runtime_plan.get("kv_cap", getattr(engine, "_kv_cap", None)),
@@ -650,6 +1199,28 @@ def _collect_runtime_knobs(engine: Any, trace_decode: bool) -> Dict[str, Any]:
         "gpu_fused_topk": runtime_plan.get("gpu_fused_topk", getattr(engine, "_gpu_fused_topk", None)),
         "fusion_scheduler_mode": runtime_plan.get(
             "fusion_scheduler_mode", getattr(engine, "_fusion_scheduler_mode", None)
+        ),
+        "direct_kv_cache_write": runtime_plan.get(
+            "direct_kv_cache_write", getattr(engine, "_direct_kv_cache_write", None)
+        ),
+        "experimental_qk_norm_rope": runtime_plan.get(
+            "experimental_qk_norm_rope", getattr(engine, "_experimental_qk_norm_rope", None)
+        ),
+        "experimental_merged_qkv": runtime_plan.get(
+            "experimental_merged_qkv", getattr(engine, "_experimental_merged_qkv", None)
+        ),
+        "experimental_fused_qkv_qk_norm_rope": runtime_plan.get(
+            "experimental_fused_qkv_qk_norm_rope",
+            getattr(engine, "_experimental_fused_qkv_qk_norm_rope", None),
+        ),
+        "experimental_merged_gateup": runtime_plan.get(
+            "experimental_merged_gateup", getattr(engine, "_experimental_merged_gateup", None)
+        ),
+        "experimental_attn_softmax_value": runtime_plan.get(
+            "experimental_attn_softmax_value", getattr(engine, "_experimental_attn_softmax_value", None)
+        ),
+        "experimental_rmsnorm_add": runtime_plan.get(
+            "experimental_rmsnorm_add", getattr(engine, "_experimental_rmsnorm_add", None)
         ),
         "gpu_approx_rerank": runtime_plan.get("gpu_approx_rerank", getattr(engine, "_gpu_approx_rerank", None)),
         "gpu_approx_partial_k": runtime_plan.get(
@@ -684,9 +1255,49 @@ def _build_adam_startup(args: argparse.Namespace, extra: Optional[Dict[str, Any]
         startup["gpu_fused_topk"] = (args.gpu_fused_topk == "on")
     if getattr(args, "fusion_scheduler_mode", None):
         startup["fusion_scheduler_mode"] = str(args.fusion_scheduler_mode)
+    if getattr(args, "direct_kv_cache_write", None) is not None:
+        startup["direct_kv_cache_write"] = (args.direct_kv_cache_write == "on")
+    if getattr(args, "experimental_qk_norm_rope", None) is not None:
+        startup["experimental_qk_norm_rope"] = (args.experimental_qk_norm_rope == "on")
+    if getattr(args, "experimental_merged_qkv", None) is not None:
+        startup["experimental_merged_qkv"] = (args.experimental_merged_qkv == "on")
+    if getattr(args, "experimental_fused_qkv_qk_norm_rope", None) is not None:
+        startup["experimental_fused_qkv_qk_norm_rope"] = (
+            args.experimental_fused_qkv_qk_norm_rope == "on"
+        )
+    if getattr(args, "experimental_merged_gateup", None) is not None:
+        startup["experimental_merged_gateup"] = (args.experimental_merged_gateup == "on")
+    if getattr(args, "experimental_attn_softmax_value", None) is not None:
+        startup["experimental_attn_softmax_value"] = (args.experimental_attn_softmax_value == "on")
+    if getattr(args, "experimental_rmsnorm_add", None) is not None:
+        startup["experimental_rmsnorm_add"] = (args.experimental_rmsnorm_add == "on")
     if extra:
         startup.update({key: value for key, value in extra.items() if value is not None})
     return startup
+
+
+def _should_monitor_gpu(args: argparse.Namespace, backend: str) -> bool:
+    mode = str(getattr(args, "gpu_telemetry", DEFAULT_GPU_TELEMETRY_MODE) or DEFAULT_GPU_TELEMETRY_MODE).strip().lower()
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    return backend == "adam"
+
+
+def _run_with_gpu_telemetry(backend: str, args: argparse.Namespace, fn, *run_args, **run_kwargs) -> Dict[str, Any]:
+    monitor: Optional[_NvidiaSmiMonitor] = None
+    monitor_enabled = _should_monitor_gpu(args, backend)
+    if monitor_enabled:
+        monitor = _NvidiaSmiMonitor(gpu_index=_safe_int(os.environ.get("ADAM_BENCH_GPU_INDEX"), 0))
+        if not monitor.start():
+            monitor = None
+    result = fn(*run_args, **run_kwargs)
+    telemetry = monitor.stop() if monitor is not None else _empty_gpu_telemetry()
+    if telemetry.get("available") or telemetry.get("error"):
+        result = dict(result)
+        result["gpu_telemetry"] = telemetry
+    return result
 
 
 class ADAMRunner:
@@ -746,10 +1357,11 @@ class ADAMRunner:
                 "prefill_s": _safe_float(stats.get("prefill_s")),
                 "decode_s": _safe_float(stats.get("decode_s")),
                 "total_s": _safe_float(stats.get("total_s"), total_s),
-                "sampling_mode": stats.get("sampling_mode"),
-                "runtime_profile": getattr(self.engine, "_runtime_profile", None),
-                "trace_summary": _normalize_trace_summary(stats.get("trace_summary")),
-                "text": self.tokenizer.decode(out_tokens),
+        "sampling_mode": stats.get("sampling_mode"),
+        "runtime_profile": getattr(self.engine, "_runtime_profile", None),
+        "decode_path": getattr(self.engine, "_decode_path", None),
+        "trace_summary": _normalize_trace_summary(stats.get("trace_summary")),
+        "text": self.tokenizer.decode(out_tokens),
             }
             record.update(_collect_runtime_knobs(self.engine, trace_decode))
             return _finalize_run_record(record, max_tokens)
@@ -826,6 +1438,7 @@ class ADAMRunner:
                 "total_s": turn2_total_s,
                 "sampling_mode": turn2_stats.get("sampling_mode"),
                 "runtime_profile": getattr(self.engine, "_runtime_profile", None),
+                "decode_path": getattr(self.engine, "_decode_path", None),
                 "trace_summary": _normalize_trace_summary(turn2_stats.get("trace_summary")),
                 "prompt_render_ms": chat_turn_metrics["turn2_prompt_render_ms"],
                 "prompt_tokenize_ms": chat_turn_metrics["turn2_prompt_tokenize_ms"],
@@ -1038,7 +1651,7 @@ def _run_backend_suite(backend: str,
         run_fn = runner.run_chat_turn
         run_args = (args.turn_prompt1, args.turn_prompt2, args.max_tokens)
 
-    cold_first_run = run_fn(*run_args, trace_decode=False)
+    cold_first_run = _run_with_gpu_telemetry(backend, args, run_fn, *run_args, trace_decode=False)
     if cold_first_run.get("status") == "error":
         return {
             "backend": backend,
@@ -1051,7 +1664,7 @@ def _run_backend_suite(backend: str,
 
     warmup = []
     for _ in range(max(0, int(args.warmup))):
-        result = run_fn(*run_args, trace_decode=False)
+        result = _run_with_gpu_telemetry(backend, args, run_fn, *run_args, trace_decode=False)
         warmup.append(result)
         if result.get("status") == "error":
             return {
@@ -1063,11 +1676,14 @@ def _run_backend_suite(backend: str,
                 "summary": summarize_backend_runs(backend, cold_first_run, [result]),
             }
 
-    runs = [run_fn(*run_args, trace_decode=False) for _ in range(max(1, int(args.runs)))]
+    runs = [
+        _run_with_gpu_telemetry(backend, args, run_fn, *run_args, trace_decode=False)
+        for _ in range(max(1, int(args.runs)))
+    ]
     diagnostic = None
     if backend == "adam" and args.diagnose_trace:
         diag_args = run_args[:-1] + (min(int(args.max_tokens), DEFAULT_TRACE_TOKENS),)
-        diagnostic = run_fn(*diag_args, trace_decode=True)
+        diagnostic = _run_with_gpu_telemetry(backend, args, run_fn, *diag_args, trace_decode=True)
 
     return {
         "backend": backend,
@@ -1147,7 +1763,37 @@ def _trace_line(trace_summary: Dict[str, Any]) -> str:
         )
     if summary.get("scheduler_mode_name"):
         line += f" | scheduler {summary.get('scheduler_mode_name')}"
+    breakdown = summary.get("descriptor_cache_breakdown") or {}
+    if isinstance(breakdown, dict) and breakdown:
+        top_misses = sorted(
+            (
+                (str(name), _safe_float((stats or {}).get("miss_count")))
+                for name, stats in breakdown.items()
+                if _safe_float((stats or {}).get("miss_count")) > 0.0
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:2]
+        if top_misses:
+            line += " | desc miss top " + ", ".join(
+                f"{name}={miss:.1f}" for name, miss in top_misses
+            )
     return line
+
+
+def _gpu_telemetry_line(gpu_telemetry: Dict[str, Any]) -> str:
+    telemetry = _normalize_gpu_telemetry(gpu_telemetry)
+    if not telemetry.get("available"):
+        error = telemetry.get("error")
+        return f"gpu telemetry unavailable{': ' + str(error) if error else ''}"
+    return (
+        "gpu telemetry: "
+        f"util {telemetry.get('gpu_util_avg', 0.0):.1f}% avg {telemetry.get('gpu_util_max', 0.0):.1f}% max | "
+        f"mem {telemetry.get('mem_util_avg', 0.0):.1f}% avg {telemetry.get('mem_util_max', 0.0):.1f}% max | "
+        f"used {telemetry.get('mem_used_mb_avg', 0.0):.0f}/{telemetry.get('mem_total_mb', 0.0):.0f}MB avg | "
+        f"sm {telemetry.get('sm_clock_mhz_avg', 0.0):.0f}MHz avg | "
+        f"power {telemetry.get('power_w_avg', 0.0):.1f}W avg {telemetry.get('power_w_max', 0.0):.1f}W max"
+    )
 
 
 def _fixed_pool_pair(profile: Optional[str]) -> Dict[str, int]:
@@ -1239,6 +1885,26 @@ def _apply_case_args(base_cmd: List[str], startup: Dict[str, Any]) -> List[str]:
         cmd.extend(["--gpu-fused-topk", "on" if startup.get("gpu_fused_topk") else "off"])
     if startup.get("fusion_scheduler_mode"):
         cmd.extend(["--fusion-scheduler-mode", str(startup["fusion_scheduler_mode"])])
+    if startup.get("direct_kv_cache_write") is not None:
+        cmd.extend(["--direct-kv-cache-write", "on" if startup.get("direct_kv_cache_write") else "off"])
+    if startup.get("experimental_qk_norm_rope") is not None:
+        cmd.extend(["--experimental-qk-norm-rope", "on" if startup.get("experimental_qk_norm_rope") else "off"])
+    if startup.get("experimental_merged_qkv") is not None:
+        cmd.extend(["--experimental-merged-qkv", "on" if startup.get("experimental_merged_qkv") else "off"])
+    if startup.get("experimental_fused_qkv_qk_norm_rope") is not None:
+        cmd.extend([
+            "--experimental-fused-qkv-qk-norm-rope",
+            "on" if startup.get("experimental_fused_qkv_qk_norm_rope") else "off",
+        ])
+    if startup.get("experimental_merged_gateup") is not None:
+        cmd.extend(["--experimental-merged-gateup", "on" if startup.get("experimental_merged_gateup") else "off"])
+    if startup.get("experimental_attn_softmax_value") is not None:
+        cmd.extend([
+            "--experimental-attn-softmax-value",
+            "on" if startup.get("experimental_attn_softmax_value") else "off",
+        ])
+    if startup.get("experimental_rmsnorm_add") is not None:
+        cmd.extend(["--experimental-rmsnorm-add", "on" if startup.get("experimental_rmsnorm_add") else "off"])
     return cmd
 
 
@@ -1261,6 +1927,10 @@ def _run_sweep_case_subprocess(args: argparse.Namespace,
             "--skip-ollama",
             "--json-out", tmp_path,
         ]
+        if args.diagnose_trace:
+            cmd.append("--diagnose-trace")
+        if getattr(args, "gpu_telemetry", None):
+            cmd.extend(["--gpu-telemetry", str(args.gpu_telemetry)])
         if args.profile:
             cmd.extend(["--profile", args.profile])
         if args.preset == CHAT_TURN_REGRESSION_PRESET:
@@ -1288,11 +1958,13 @@ def _run_sweep_case_subprocess(args: argparse.Namespace,
             }
         with open(tmp_path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
+        prompt_results = payload.get("prompt_results", [])
         return {
             "label": case["label"],
             "startup": case["startup"],
-            "prompt_results": payload.get("prompt_results", []),
+            "prompt_results": prompt_results,
             "overall": payload.get("overall", {}).get("adam", {}),
+            "trace_summary": _median_trace_summary_for_backend(prompt_results, backend="adam"),
             "stdout": proc.stdout,
             "stderr": proc.stderr,
         }
@@ -1309,6 +1981,131 @@ def _run_adam_sweep(args: argparse.Namespace, prompts: List[str]) -> List[Dict[s
         print(f"[SWEEP] {case['label']}")
         sweep_results.append(_run_sweep_case_subprocess(args, prompts, case))
     return sweep_results
+
+
+def _build_decode_ablation_cases(args: Optional[argparse.Namespace] = None) -> List[Dict[str, Any]]:
+    cases = [{
+        "id": "baseline",
+        "label": "baseline current fast path",
+        "feature": "current fast path",
+        "mode": "baseline",
+        "startup": {},
+    }]
+    for case in DECODE_ABLATION_CASES:
+        # The fused merged QKV->Q/K prep path is only interesting on profiles
+        # where we are actively exploring dispatch-cut decode scheduling.
+        if case.get("id") == "fused_qkv_qk_norm_rope_off" and not _profile_prefers_dispatch_cut(args):
+            continue
+        cases.append(dict(case))
+    return cases
+
+
+def _make_decode_ablation_result(case: Dict[str, Any],
+                                 overall_adam: Dict[str, Any],
+                                 trace_summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        "id": case["id"],
+        "label": case["label"],
+        "feature": case["feature"],
+        "mode": case["mode"],
+        "startup": dict(case.get("startup", {})),
+        "overall": dict(overall_adam or {}),
+        "trace_summary": _normalize_trace_summary(trace_summary),
+    }
+
+
+def _interpret_decode_ablation(case: Dict[str, Any], delta_tps: float) -> str:
+    feature = str(case.get("feature") or case.get("label") or "this path")
+    if case.get("mode") == "baseline":
+        return "Reference current path."
+    if case.get("mode") == "disable":
+        if delta_tps <= -0.5:
+            return f"{feature} is helping now; keep it and optimize deeper in that subgraph."
+        if delta_tps >= 0.5:
+            return f"{feature} is hurting desktop decode as implemented; do not deepen it before fixing it."
+        return f"{feature} is roughly neutral on desktop right now."
+    if delta_tps >= 0.5:
+        return f"{feature} looks promising; this is a good candidate for deeper implementation."
+    if delta_tps <= -0.5:
+        return f"{feature} still hurts desktop decode; not the next desktop target."
+    return f"{feature} is roughly neutral on desktop right now."
+
+
+def _run_decode_ablations(args: argparse.Namespace,
+                          prompts: List[str],
+                          prompt_results: List[Dict[str, Any]],
+                          overall: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cases = _build_decode_ablation_cases(args)
+    results = [
+        _make_decode_ablation_result(
+            cases[0],
+            dict((overall or {}).get("adam") or {}),
+            _median_trace_summary_for_backend(prompt_results, backend="adam"),
+        )
+    ]
+    for case in cases[1:]:
+        print(f"[ABLATE] {case['label']}")
+        payload = _run_sweep_case_subprocess(args, prompts, case)
+        results.append(
+            _make_decode_ablation_result(
+                case,
+                payload.get("overall", {}),
+                payload.get("trace_summary"),
+            )
+        )
+
+    baseline_tps = _safe_float(results[0].get("overall", {}).get("steady_decode_tps"))
+    for result in results:
+        current_tps = _safe_float(result.get("overall", {}).get("steady_decode_tps"))
+        result["delta_decode_tps"] = current_tps - baseline_tps
+        result["takeaway"] = _interpret_decode_ablation(result, result["delta_decode_tps"])
+    return results
+
+
+def _print_decode_ablation_summary(results: List[Dict[str, Any]]) -> None:
+    if not results:
+        return
+    baseline = results[0]
+    ranked = sorted(results[1:], key=lambda item: _safe_float(item.get("delta_decode_tps")), reverse=True)
+    base_overall = baseline.get("overall", {})
+    base_trace = baseline.get("trace_summary", {})
+    print("")
+    print("=" * 104)
+    print("DECODE ABLATION SUMMARY")
+    print("=" * 104)
+    print(
+        "baseline: "
+        f"steady={_safe_float(base_overall.get('steady_decode_tps')):.1f} tok/s | "
+        f"core={_safe_float(base_trace.get('core_batch_ms_avg')):.2f} ms | "
+        f"lm={_safe_float(base_trace.get('lm_head_batch_ms_avg')):.2f} ms | "
+        f"dispatch={_safe_float(base_trace.get('dispatch_count_per_token')):.1f}/tok | "
+        f"desc={_safe_float(base_trace.get('descriptor_set_update_count_per_token')):.1f}/tok | "
+        f"flush={_safe_float(base_trace.get('fusion_flush_count_per_token')):.1f}/tok"
+    )
+    print("-" * 104)
+    print(
+        f"{'rank':<5} {'steady':>10} {'delta':>8} {'core':>8} {'lm':>8} "
+        f"{'dispatch':>10} {'desc':>10} {'flush':>8} {'status':<10} case"
+    )
+    print("-" * 104)
+    for idx, result in enumerate(ranked, start=1):
+        summary = result.get("overall", {})
+        trace = result.get("trace_summary", {})
+        print(
+            f"{idx:<5} "
+            f"{_format_optional_number(summary.get('steady_decode_tps'))} "
+            f"{result.get('delta_decode_tps', 0.0):>8.1f} "
+            f"{_safe_float(trace.get('core_batch_ms_avg')):>8.2f} "
+            f"{_safe_float(trace.get('lm_head_batch_ms_avg')):>8.2f} "
+            f"{_safe_float(trace.get('dispatch_count_per_token')):>10.1f} "
+            f"{_safe_float(trace.get('descriptor_set_update_count_per_token')):>10.1f} "
+            f"{_safe_float(trace.get('fusion_flush_count_per_token')):>8.1f} "
+            f"{str(summary.get('status', 'n/a')):<10} {result.get('label', '')}"
+        )
+    print("")
+    print("Where To Implement Next")
+    for result in ranked:
+        print(f"- {result.get('label')}: {result.get('takeaway')}")
 
 
 def _print_prompt_summary(prompt_result: Dict[str, Any]) -> None:
@@ -1339,10 +2136,13 @@ def _print_prompt_summary(prompt_result: Dict[str, Any]) -> None:
             print(
                 "  runtime: "
                 f"profile={summary.get('runtime_profile')} "
+                f"path={summary.get('decode_path') or 'n/a'} "
                 f"stream={'on' if summary.get('stream_load') else 'off'} "
                 f"chunk={summary.get('stream_chunk_mb')}MB "
                 f"kv={summary.get('kv_cap')} "
                 f"rows={summary.get('gpu_fused_rows_per_group')} "
+                f"scheduler={summary.get('fusion_scheduler_mode') or 'n/a'} "
+                f"direct_kv={'on' if summary.get('direct_kv_cache_write') else 'off'} "
                 f"trace={'on' if summary.get('trace_decode') else 'off'}"
             )
             print(
@@ -1352,6 +2152,9 @@ def _print_prompt_summary(prompt_result: Dict[str, Any]) -> None:
                 f"kpi={summary.get('kpi_decode_tps', 0.0):.1f} "
                 f"target={summary.get('kpi_target_tps', DEFAULT_KPI_TARGET_TPS):.0f}"
             )
+            gpu_telemetry = summary.get("gpu_telemetry") or {}
+            if gpu_telemetry.get("available") or gpu_telemetry.get("error"):
+                print(f"  {_gpu_telemetry_line(gpu_telemetry)}")
             if _safe_float(summary.get("prompt_total_tokens")) > 0.0:
                 reuse_note = (
                     f"hit {int(summary.get('reuse_prefix_tokens') or 0)}"
@@ -1404,6 +2207,10 @@ def _print_overall_summary(overall: Dict[str, Dict[str, Any]]) -> None:
         )
         if summary.get("error"):
             print(f"  note: {summary['error']}")
+        elif backend == "adam":
+            gpu_telemetry = summary.get("gpu_telemetry") or {}
+            if gpu_telemetry.get("available") or gpu_telemetry.get("error"):
+                print(f"  {_gpu_telemetry_line(gpu_telemetry)}")
         elif backend == "adam":
             print(
                 f"  kpi: cold={summary.get('first_run_decode_tps', 0.0):.1f} "
@@ -1509,12 +2316,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     overall = build_overall_summary(prompt_results)
     _print_overall_summary(overall)
     sweep_results = []
+    decode_ablation_results = []
     if args.sweep and not args.skip_adam:
         sweep_results = _run_adam_sweep(args, prompts)
         _print_sweep_summary(sweep_results)
+    if args.decode_ablation and not args.skip_adam:
+        decode_ablation_results = _run_decode_ablations(args, prompts, prompt_results, overall)
+        _print_decode_ablation_summary(decode_ablation_results)
+
+    if args.experiment_log:
+        entry = build_experiment_entry(args, prompt_results, overall)
+        append_experiment_log(args.experiment_log, entry)
+        print(f"saved experiment log: {args.experiment_log}")
 
     if args.json_out:
-        payload = build_json_report(args, prompt_results, overall, sweep_results=sweep_results)
+        payload = build_json_report(
+            args,
+            prompt_results,
+            overall,
+            sweep_results=sweep_results,
+            decode_ablations=decode_ablation_results,
+        )
         with open(args.json_out, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=True)
             handle.write("\n")
