@@ -58,6 +58,14 @@ def _pool_attempts_for_device() -> list[tuple[int, int]]:
         return [(64, 32), (48, 24), (32, 16)]
     return [(1024, 512), (512, 256), (256, 128)]
 
+
+def _should_stream_loader() -> bool:
+    try:
+        device = A.probe_device()
+    except Exception:
+        device = {}
+    return bool(device.get("is_unified_memory")) or _is_broadcom_like_profile()
+
 # ── Model path ───────────────────────────────────────────────────────────────
 def find_model(argv):
     if len(argv) > 1 and argv[1].endswith('.gguf'):
@@ -73,7 +81,12 @@ def find_model(argv):
 # ── Load ─────────────────────────────────────────────────────────────────────
 def load_everything(model_path):
     print(f"\n{BOLD}Loading {os.path.basename(model_path)}...{RST}")
-    loader = GGUFLoader(model_path)
+    stream_loader = _should_stream_loader()
+    loader = GGUFLoader(
+        model_path,
+        keep_tensors=not stream_loader,
+        keep_raw_blocks=not stream_loader,
+    )
     loader.load(verbose=False)
 
     cfg = ModelConfig.from_gguf_metadata(loader.metadata, verbose=False)
@@ -128,13 +141,25 @@ def load_everything(model_path):
             print(f"  [GPU pool failed: hot={hot_mb}MB cold={cold_mb}MB] {exc}")
     if gpu is None:
         raise RuntimeError("GPU init failed at all pool sizes — is VRAM full?")
-    engine = ADAMEngine(
-        gpu, cfg, loader.tensors,
-        raw_blocks=loader.raw_blocks,
-        tensor_types=loader.tensor_types,
-        adamah_mod=A,
-        verbose=False,
-    )
+    engine_kwargs = {
+        "raw_blocks": loader.raw_blocks,
+        "tensor_types": loader.tensor_types,
+        "adamah_mod": A,
+        "verbose": False,
+    }
+    if stream_loader:
+        engine_kwargs.update({
+            "tensor_shapes": loader.tensor_shapes,
+            "tensor_loader": loader,
+            "runtime_profile": "broadcom_v3dv",
+            "stream_chunk_mb": 8,
+            "kv_cap": 256,
+            "gpu_fused_rows_per_group": 256,
+            "fusion_scheduler_mode": "level_batched",
+            "direct_kv_cache_write": True,
+        })
+        print("  [Loader mode: streamed tensors, broadcom-safe engine config]")
+    engine = ADAMEngine(gpu, cfg, loader.tensors, **engine_kwargs)
     return engine, tokenizer, cfg, gpu
 
 # ── CHECK 1: Attention scale broadcast ───────────────────────────────────────
