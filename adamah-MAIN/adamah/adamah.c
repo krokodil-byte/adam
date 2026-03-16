@@ -592,6 +592,18 @@ static uint32_t find_mem_type(uint32_t bits, VkMemoryPropertyFlags props) {
 static uint32_t find_device_local(uint32_t bits) {
   VkPhysicalDeviceMemoryProperties mp;
   vkGetPhysicalDeviceMemoryProperties(ctx.phys, &mp);
+  // On integrated GPU (unified memory), prefer DEVICE_LOCAL + HOST_VISIBLE
+  // so the CPU can directly access GPU buffers without staging copies.
+  if (is_integrated_gpu) {
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+      if (!(bits & (1u << i)))
+        continue;
+      VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+      if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+          (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+        return i;
+    }
+  }
   for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
     if (!(bits & (1u << i)))
       continue;
@@ -811,6 +823,7 @@ static int cmd_recording_async = 0;
 static int cmd_async_slot = -1;
 static int barrier_skip = 0;     // When >0, skip per-dispatch barriers (fusion level batching)
 static int is_integrated_gpu = 0; // Detected at init: 1 for RPi/integrated (unified memory)
+static int batch_submitted = 0;  // 1 if batch was submitted but not yet waited on
 
 // Matmul workgroup dimensions for cross-map Q4/Q8 shaders.
 // Set at shader-load time based on the compiled shader profile.
@@ -1412,6 +1425,87 @@ void batch_end(void) {
   reset_pipeline_desc_pool(&ctx.row_gather_xq8_pipe);
 
   batch_op_counter = 0; // Reset counter
+}
+
+// Submit batch without waiting (non-blocking).
+// CPU can do work while GPU executes the batch.
+// Must call batch_wait() before any GPU data access.
+void batch_submit(void) {
+  if (!batch_mode)
+    return;
+
+  if (fusion.enabled && fusion.n_ops > 0) {
+    adamah_fusion_flush();
+  }
+
+  batch_mode = 0;
+
+  if (cmd_recording) {
+    vkEndCommandBuffer(ctx.cmd);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                       .commandBufferCount = 1,
+                       .pCommandBuffers = &ctx.cmd};
+    vkResetFences(ctx.device, 1, &ctx.fence);
+    vkQueueSubmit(ctx.queue, 1, &si, ctx.fence);
+    batch_submitted = 1;
+    // cmd_recording stays 1 until batch_wait resets it
+  }
+}
+
+// Wait for a previously submitted batch to complete.
+// After this, GPU results are visible to CPU.
+void batch_wait(void) {
+  if (!batch_submitted)
+    return;
+  vkWaitForFences(ctx.device, 1, &ctx.fence, VK_TRUE, UINT64_MAX);
+  batch_submitted = 0;
+  cmd_recording = 0;
+
+  // Invalidate hot_pool CPU cache if host-visible (for CPU reads)
+  if (ctx.hot_pool && ctx.hot_pool->ptr) {
+    invalidate_mapped_gpu_buf(ctx.hot_pool, 0);
+  }
+
+  // Recycle descriptor sets
+  reset_pipeline_desc_pool(&ctx.unary_pipe);
+  reset_pipeline_desc_pool(&ctx.binary_pipe);
+  reset_pipeline_desc_pool(&ctx.matmul_pipe);
+  reset_pipeline_desc_pool(&ctx.matmul_t_pipe);
+  reset_pipeline_desc_pool(&ctx.rmsnorm_pipe);
+  reset_pipeline_desc_pool(&ctx.rope_pipe);
+  reset_pipeline_desc_pool(&ctx.row_copy_pipe);
+  reset_pipeline_desc_pool(&ctx.fma_pipe);
+  reset_pipeline_desc_pool(&ctx.reduce_pipe);
+  reset_pipeline_desc_pool(&ctx.reduce_small_pipe);
+  reset_pipeline_desc_pool(&ctx.broadcast_pipe);
+  reset_pipeline_desc_pool(&ctx.softmax_pipe);
+  reset_pipeline_desc_pool(&ctx.softmax_abs_pipe);
+  reset_pipeline_desc_pool(&ctx.attn_softmax_abs_pipe);
+  reset_pipeline_desc_pool(&ctx.layernorm_pipe);
+  reset_pipeline_desc_pool(&ctx.unified_pipe);
+  reset_pipeline_desc_pool(&ctx.scatter_pipe);
+  reset_pipeline_desc_pool(&ctx.gather_pipe);
+  reset_pipeline_desc_pool(&ctx.repeat_penalty_pipe);
+  reset_pipeline_desc_pool(&ctx.argmax_pipe);
+  reset_pipeline_desc_pool(&ctx.topk_pipe);
+  reset_pipeline_desc_pool(&ctx.topp_pipe);
+  reset_pipeline_desc_pool(&ctx.resolve_idx_pipe);
+  reset_pipeline_desc_pool(&ctx.sample_categorical_pipe);
+  reset_pipeline_desc_pool(&ctx.matmul_x_pipe);
+  reset_pipeline_desc_pool(&ctx.matmul_t_x_pipe);
+  reset_pipeline_desc_pool(&ctx.rmsnorm_x_pipe);
+  reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq4_pipe);
+  reset_pipeline_desc_pool(&ctx.matvec_t_xq4_pipe);
+  reset_pipeline_desc_pool(&ctx.matmul_t_xq4_pipe);
+  reset_pipeline_desc_pool(&ctx.matmul_xq4_pipe);
+  reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq8_pipe);
+  reset_pipeline_desc_pool(&ctx.matvec_rerank_t_xq8_pipe);
+  reset_pipeline_desc_pool(&ctx.matvec_t_xq8_pipe);
+  reset_pipeline_desc_pool(&ctx.matmul_t_xq8_pipe);
+  reset_pipeline_desc_pool(&ctx.matmul_xq8_pipe);
+  reset_pipeline_desc_pool(&ctx.row_gather_xq8_pipe);
+
+  batch_op_counter = 0;
 }
 
 // Sync: wait for all queued GPU work to finish
@@ -4607,20 +4701,26 @@ static GpuBuf *get_or_create_buf_ex(const char *base_name, uint32_t n_elems,
   if (create_buffer_ex(&b->buf, &b->mem, desired_capacity, usage, device_local,
                        &b->mem_props) != 0)
     return NULL;
-  if (!device_local) {
-    b->ptr = NULL;
+  b->ptr = NULL;
+  // Map memory for CPU access: always for host-visible staging buffers,
+  // and also for device-local buffers on integrated GPU (unified memory).
+  if (!device_local ||
+      (b->mem_props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
     if (vkMapMemory(ctx.device, b->mem, 0, desired_capacity, 0, &b->ptr) !=
         VK_SUCCESS) {
-      vkDestroyBuffer(ctx.device, b->buf, NULL);
-      vkFreeMemory(ctx.device, b->mem, NULL);
-      b->buf = VK_NULL_HANDLE;
-      b->mem = VK_NULL_HANDLE;
+      if (!device_local) {
+        // Staging buffers MUST be mappable
+        vkDestroyBuffer(ctx.device, b->buf, NULL);
+        vkFreeMemory(ctx.device, b->mem, NULL);
+        b->buf = VK_NULL_HANDLE;
+        b->mem = VK_NULL_HANDLE;
+        b->ptr = NULL;
+        b->mem_props = 0;
+        return NULL;
+      }
+      // Device-local: mapping is optional (fallback to staging copies)
       b->ptr = NULL;
-      b->mem_props = 0;
-      return NULL;
     }
-  } else {
-    b->ptr = NULL;
   }
 
   return b;
@@ -7886,4 +7986,50 @@ void adamah_get_gpu_caps(uint32_t *max_workgroup_size, uint32_t *subgroup_size,
     *subgroup_size = gpu_caps.subgroup_size;
   if (vram_bytes)
     *vram_bytes = gpu_caps.vram_bytes;
+}
+
+// Get CPU-accessible pointer to workspace (map) data at given byte offset.
+// Returns NULL if the map's backing buffer is not HOST_VISIBLE (discrete GPU).
+// On integrated GPU with unified memory, this provides zero-copy access.
+// IMPORTANT: Only valid after batch_wait() or batch_end() — GPU must be done.
+void *adamah_ws_map_ptr(uint32_t map_id, uint32_t byte_offset) {
+  if (map_id >= MAX_MAPS || !ctx.maps[map_id].active)
+    return NULL;
+  Map *m = &ctx.maps[map_id];
+  GpuBuf *pool = m->pool;
+  if (!pool || !pool->ptr)
+    return NULL;
+  VkDeviceSize off = (VkDeviceSize)m->pool_offset + (VkDeviceSize)byte_offset;
+  if (off >= pool->bytes_capacity)
+    return NULL;
+  return (char *)pool->ptr + off;
+}
+
+// Flush CPU writes to GPU-visible memory (call after CPU writes to ws_map_ptr).
+// On HOST_COHERENT memory this is a no-op.
+void adamah_ws_flush(uint32_t map_id, uint32_t byte_offset, uint32_t size) {
+  if (map_id >= MAX_MAPS || !ctx.maps[map_id].active)
+    return;
+  Map *m = &ctx.maps[map_id];
+  GpuBuf *pool = m->pool;
+  if (!pool || !pool->ptr)
+    return;
+  if (pool->mem_props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    return; // No flush needed
+  VkDeviceSize off = (VkDeviceSize)m->pool_offset + (VkDeviceSize)byte_offset;
+  VkDeviceSize flush_size = size > 0 ? (VkDeviceSize)size : pool->bytes_capacity;
+  if (ctx.copy_align > 1)
+    flush_size =
+        ((flush_size + ctx.copy_align - 1) / ctx.copy_align) * ctx.copy_align;
+  VkMappedMemoryRange range = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = pool->mem,
+      .offset = off,
+      .size = flush_size};
+  vkFlushMappedMemoryRanges(ctx.device, 1, &range);
+}
+
+// Check if hot_pool has CPU-accessible mapping (unified memory).
+int adamah_has_unified_memory(void) {
+  return (ctx.hot_pool && ctx.hot_pool->ptr) ? 1 : 0;
 }
