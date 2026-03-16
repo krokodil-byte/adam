@@ -12,3 +12,6 @@ __pycache__/
 adamah-MAIN/adamah/*.dll
 adamah-MAIN/adamah/*.dll.bak
 adamah-MAIN/adamah/*.so
+
+# Stale release snapshots
+releases/
