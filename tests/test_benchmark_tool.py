@@ -2,12 +2,8 @@
 """Smoke tests for the comparative benchmark helpers."""
 import json
 import os
-import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for p in [ROOT, os.path.join(ROOT, "adamah-MAIN")]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+from adam.paths import ROOT, setup; setup()
 
 from adam.tools import benchmark
 

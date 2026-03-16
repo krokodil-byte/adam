@@ -1,9 +1,6 @@
 """ADAM — quick initialization test."""
-import sys, os
-_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_ADAMAH_DIR = os.path.join(_ROOT, "adamah-MAIN")
-for _p in [_ROOT, _ADAMAH_DIR]:
-    if _p not in sys.path: sys.path.insert(0, _p)
+import os
+from adam.paths import ROOT as _ROOT, setup; setup()
 
 from adam.loaders.gguf import GGUFLoader
 from adam.models.engine import ADAMEngine, ModelConfig
