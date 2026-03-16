@@ -785,6 +785,49 @@ class Adamah:
         except AttributeError:
             self._has_fusion_scheduler = False
 
+        # GPU capability queries (integrated GPU detection, caps)
+        try:
+            self._lib.adamah_is_integrated_gpu.argtypes = []
+            self._lib.adamah_is_integrated_gpu.restype = ctypes.c_int
+            self._is_integrated_gpu = bool(self._lib.adamah_is_integrated_gpu())
+        except AttributeError:
+            self._is_integrated_gpu = False
+
+        try:
+            self._lib.adamah_set_xq_matmul_wg.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+            self._lib.adamah_set_xq_matmul_wg.restype = None
+            self._has_set_xq_matmul_wg = True
+            # Auto-configure matmul WG sizes based on shader profile
+            _profile = (os.environ.get('ADAMAH_SHADER_PROFILE')
+                        or os.environ.get('ADAM_RUNTIME_PROFILE') or '').strip().lower()
+            if _profile == 'broadcom_v3dv_narrow':
+                self._lib.adamah_set_xq_matmul_wg(8, 8)
+            elif _profile.startswith('broadcom_v3dv'):
+                self._lib.adamah_set_xq_matmul_wg(8, 16)
+        except AttributeError:
+            self._has_set_xq_matmul_wg = False
+
+        try:
+            self._lib.adamah_get_gpu_caps.argtypes = [
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            self._lib.adamah_get_gpu_caps.restype = None
+            _max_wg = ctypes.c_uint32(0)
+            _sub_sz = ctypes.c_uint32(0)
+            _vram = ctypes.c_uint64(0)
+            self._lib.adamah_get_gpu_caps(
+                ctypes.byref(_max_wg), ctypes.byref(_sub_sz), ctypes.byref(_vram)
+            )
+            self._gpu_max_workgroup_size = int(_max_wg.value)
+            self._gpu_subgroup_size = int(_sub_sz.value)
+            self._gpu_vram_bytes = int(_vram.value)
+        except AttributeError:
+            self._gpu_max_workgroup_size = 256
+            self._gpu_subgroup_size = 32
+            self._gpu_vram_bytes = 0
+
         # Dtype system
         self._try_setup_dtype()
 

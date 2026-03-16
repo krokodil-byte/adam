@@ -1,5 +1,14 @@
 #version 450
-layout(local_size_x = 256) in;
+
+#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
+#define WG_RMS 32
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+#define WG_RMS 64
+#else
+#define WG_RMS 256
+#endif
+
+layout(local_size_x = WG_RMS) in;
 layout(push_constant) uniform PushConstants {
     uint n_rows; uint dim; float eps;
 } pc;
@@ -10,7 +19,7 @@ layout(set = 0, binding = 2) buffer SrcLocs   { uint locs_src[]; };
 layout(set = 0, binding = 3) buffer WtLocs    { uint locs_wt[]; };
 layout(set = 0, binding = 4) buffer DstLocs   { uint locs_dst[]; };
 
-shared float sdata[256];
+shared float sdata[WG_RMS];
 
 // RMSNorm: dst = (src / sqrt(mean(src²) + eps)) * weight
 // src and dst indexed into map_act, weight indexed into map_wt
@@ -23,15 +32,15 @@ void main() {
     uint db = locs_dst[ri];
     // Sum of squares
     float ss = 0.0;
-    for (uint i = tid; i < pc.dim; i += 256u) {
+    for (uint i = tid; i < pc.dim; i += uint(WG_RMS)) {
         float x = map_act[sb + i];
         ss += x * x;
     }
     sdata[tid] = ss; barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) { if (tid < s) sdata[tid] += sdata[tid + s]; barrier(); }
+    for (uint s = uint(WG_RMS >> 1); s > 0u; s >>= 1u) { if (tid < s) sdata[tid] += sdata[tid + s]; barrier(); }
     float inv_rms = 1.0 / sqrt(sdata[0] / float(pc.dim) + pc.eps); barrier();
     // Normalize and scale by weight
-    for (uint i = tid; i < pc.dim; i += 256u) {
+    for (uint i = tid; i < pc.dim; i += uint(WG_RMS)) {
         float x = map_act[sb + i];
         float w = map_wt[wb + i];
         map_act[db + i] = x * inv_rms * w;

@@ -1,5 +1,12 @@
 #version 450
+
+#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
+layout(local_size_x = 8, local_size_y = 8) in;
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+layout(local_size_x = 8, local_size_y = 16) in;
+#else
 layout(local_size_x = 16, local_size_y = 16) in;
+#endif
 layout(push_constant) uniform PushConstants {
     uint M; uint K; uint N; uint n_ops; uint group_size;
 } pc;

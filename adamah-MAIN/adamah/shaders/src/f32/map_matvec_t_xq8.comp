@@ -1,13 +1,13 @@
 #version 450
 
 #ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
-#define WG_SIZE 32
-#define TILE_K 64
-#define MAX_ROWS_PER_WG 4
+#define WG_SIZE 16
+#define TILE_K 32
+#define MAX_ROWS_PER_WG 8
 #elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
-#define WG_SIZE 128
-#define TILE_K 128
-#define MAX_ROWS_PER_WG 4
+#define WG_SIZE 64
+#define TILE_K 64
+#define MAX_ROWS_PER_WG 8
 #else
 #define WG_SIZE 128
 #define TILE_K 128
@@ -32,6 +32,17 @@ layout(set = 0, binding = 5) buffer QParams    { float qparams[]; };
 
 shared float a_tile[TILE_K];
 shared float partial[MAX_ROWS_PER_WG * WG_SIZE];
+
+// Packed Q8 load: decode 4 bytes from one uint in registers
+void load_q8_4(uint word_addr, float scale, float zp, inout float acc0,
+               inout float acc1, inout float acc2, inout float acc3,
+               uint tile_off) {
+    uint packed = map_wt[word_addr];
+    acc0 += a_tile[tile_off + 0u] * (float((packed      ) & 0xFFu) * scale + zp);
+    acc1 += a_tile[tile_off + 1u] * (float((packed >>  8u) & 0xFFu) * scale + zp);
+    acc2 += a_tile[tile_off + 2u] * (float((packed >> 16u) & 0xFFu) * scale + zp);
+    acc3 += a_tile[tile_off + 3u] * (float((packed >> 24u)        ) * scale + zp);
+}
 
 float load_q8(uint idx) {
     uint word_idx = idx / 4u;
@@ -66,9 +77,28 @@ void main() {
             uint row = base_row + r;
             if (row >= pc.N) break;
             uint row_base = b_base + row * pc.K;
+#if defined(ADAMAH_PROFILE_BROADCOM_V3DV_NARROW) || defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+            // Packed Q8 path: process 4 elements per word for fewer memory ops
+            uint aligned_len = tile_len & ~3u;
+            for (uint i = lid * 4u; i < aligned_len; i += uint(WG_SIZE) * 4u) {
+                uint abs_idx = row_base + tile + i;
+                uint word_addr = abs_idx / 4u;
+                uint group = abs_idx / pc.group_size;
+                float scale = qparams[group * 2u];
+                float zp = qparams[group * 2u + 1u];
+                float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                load_q8_4(word_addr, scale, zp, a0, a1, a2, a3, i);
+                sums[r] += a0 + a1 + a2 + a3;
+            }
+            // Remainder
+            for (uint i = aligned_len + lid; i < tile_len; i += uint(WG_SIZE)) {
+                sums[r] += a_tile[i] * load_q8(row_base + tile + i);
+            }
+#else
             for (uint i = lid; i < tile_len; i += uint(WG_SIZE)) {
                 sums[r] += a_tile[i] * load_q8(row_base + tile + i);
             }
+#endif
         }
         barrier();
     }

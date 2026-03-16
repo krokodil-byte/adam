@@ -1,5 +1,14 @@
 #version 450
-layout(local_size_x = 256) in;
+
+#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
+#define WG_SM 32
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+#define WG_SM 64
+#else
+#define WG_SM 256
+#endif
+
+layout(local_size_x = WG_SM) in;
 
 layout(push_constant) uniform PushConstants {
     uint n_rows;
@@ -10,7 +19,7 @@ layout(set = 0, binding = 0) buffer MapBuffer { float data[]; };
 layout(set = 0, binding = 1) buffer SrcLocs { uint locs_src[]; };
 layout(set = 0, binding = 2) buffer DstLocs { uint locs_dst[]; };
 
-shared float sdata[256];
+shared float sdata[WG_SM];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -22,13 +31,13 @@ void main() {
 
     // Pass 1: find max
     float max_val = -9.99999968e+37;
-    for (uint i = tid; i < pc.row_size; i += 256u) {
+    for (uint i = tid; i < pc.row_size; i += uint(WG_SM)) {
         max_val = max(max_val, data[src_base + i]);
     }
     sdata[tid] = max_val;
     barrier();
 
-    for (uint s = 128u; s > 0u; s >>= 1u) {
+    for (uint s = uint(WG_SM >> 1); s > 0u; s >>= 1u) {
         if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
         barrier();
     }
@@ -37,7 +46,7 @@ void main() {
 
     // Pass 2: exp and sum
     float sum_val = 0.0;
-    for (uint i = tid; i < pc.row_size; i += 256u) {
+    for (uint i = tid; i < pc.row_size; i += uint(WG_SM)) {
         float e = exp(data[src_base + i] - row_max);
         data[dst_base + i] = e;
         sum_val += e;
@@ -45,7 +54,7 @@ void main() {
     sdata[tid] = sum_val;
     barrier();
 
-    for (uint s = 128u; s > 0u; s >>= 1u) {
+    for (uint s = uint(WG_SM >> 1); s > 0u; s >>= 1u) {
         if (tid < s) sdata[tid] += sdata[tid + s];
         barrier();
     }
@@ -54,7 +63,7 @@ void main() {
     barrier();
 
     // Pass 3: normalize
-    for (uint i = tid; i < pc.row_size; i += 256u) {
+    for (uint i = tid; i < pc.row_size; i += uint(WG_SM)) {
         data[dst_base + i] *= inv_sum;
     }
 }

@@ -287,9 +287,28 @@ class ADAMEngine:
         if self._production_mode:
             self.release_host_state()
         self.timing = {}; self._reset_timing()
+        # Detect runtime profile for hardware-specific optimizations
+        self._runtime_profile = str(
+            os.environ.get('ADAMAH_SHADER_PROFILE', os.environ.get('ADAM_RUNTIME_PROFILE', ''))
+        ).strip().lower()
+        self._is_broadcom = self._runtime_profile.startswith('broadcom_v3dv')
+        self._is_integrated = getattr(self.gpu, '_is_integrated_gpu', False)
+        # Auto-tune for Broadcom / integrated GPU (Raspberry Pi)
+        if self._is_broadcom or self._is_integrated:
+            # Default to level_batched fusion scheduler (enables barrier coalescing)
+            default_scheduler = 'level_batched'
+            # Larger rows_per_group reduces dispatch count for LM head sampling
+            if self._gpu_fused_rows_per_group == self.SAMPLE_FUSED_ROWS_PER_GROUP:
+                self._gpu_fused_rows_per_group = 1024
+            if self.verbose:
+                print(f"[GPU] Broadcom/integrated GPU detected — "
+                      f"auto-tuning: scheduler={default_scheduler}, "
+                      f"rows_per_group={self._gpu_fused_rows_per_group}")
+        else:
+            default_scheduler = 'legacy'
         self._fusion_scheduler_mode = str(
-            kw.get('fusion_scheduler_mode', os.environ.get('ADAM_FUSION_SCHEDULER_MODE', 'legacy'))
-        ).strip().lower() or 'legacy'
+            kw.get('fusion_scheduler_mode', os.environ.get('ADAM_FUSION_SCHEDULER_MODE', default_scheduler))
+        ).strip().lower() or default_scheduler
         if hasattr(self.gpu, 'fusion_set_scheduler_mode'):
             self.gpu.fusion_set_scheduler_mode(self._fusion_scheduler_mode)
         if hasattr(self.gpu, 'fusion_get_scheduler_mode'):
@@ -1004,6 +1023,7 @@ class ADAMEngine:
         self._sample_fused_topk_n = 0
         self._sample_fused_partial_n = 0
         self._sample_rerank_n = 0
+        self._sample_token_ready = False  # True when sampling is fused into forward batch
 
         self._ws_total_elems = pos
         if self.verbose:
@@ -1228,7 +1248,12 @@ class ADAMEngine:
 
     def _effective_gpu_fused_rows_per_group(self, cfg) -> int:
         del cfg
-        return max(1, int(self._gpu_fused_rows_per_group))
+        base = max(1, int(self._gpu_fused_rows_per_group))
+        # On Broadcom, use even larger groups for greedy (top_k=1) to minimize
+        # dispatch count — the LM head dominates decode time on low-end GPUs.
+        if (self._is_broadcom or self._is_integrated) and base < 2048:
+            return max(base, 1024)
+        return base
 
     def _can_gpu_fused_topk_sample(self, cfg) -> bool:
         if not self._gpu_fused_topk:
@@ -1279,6 +1304,9 @@ class ADAMEngine:
 
     def _sample_gpu_argmax(self) -> int:
         """Sample next token by reducing the GPU logits buffer to one scalar index."""
+        if self._sample_token_ready:
+            self._sample_token_ready = False
+            return self._gpu_read_sample_token()
         g = self.gpu; ws_id = self.ws_map_id
         lo_h, _ = self._wsh('logits')
         tok_h, _ = self._wsh('sample_token')
@@ -1288,6 +1316,9 @@ class ADAMEngine:
 
     def _sample_gpu_topk(self, cfg, prev) -> int:
         """Sample from a GPU-computed top-k shortlist with GPU top-p probabilities."""
+        if self._sample_token_ready:
+            self._sample_token_ready = False
+            return self._gpu_read_sample_token()
         g = self.gpu; ws_id = self.ws_map_id
         lo_h, _ = self._wsh('logits')
         idx_h, _ = self._wsh('sample_topk_idx')
@@ -1352,6 +1383,10 @@ class ADAMEngine:
 
     def _sample_gpu_approx_rerank(self, cfg) -> int:
         """Sample from an exact rerank over a GPU-computed approximate shortlist."""
+        if self._sample_token_ready:
+            self._sample_token_ready = False
+            self._sample_rerank_n = 0
+            return self._gpu_read_sample_token()
         n = self._sample_rerank_n
         if n <= 0:
             return 0
@@ -1436,13 +1471,21 @@ class ADAMEngine:
             return 0
         t0 = time.perf_counter()
         g = self.gpu; ws_id = self.ws_map_id
+        self._sample_fused_topk_n = 0
+
+        # Fast path: sampling was already fused into the forward batch — just gather.
+        if self._sample_token_ready:
+            self._sample_token_ready = False
+            tok = self._gpu_read_sample_token()
+            self.timing['sample_resolve'] += time.perf_counter() - t0
+            return tok
+
         pos_h, _ = self._wsh('sample_topk_idx')
         prob_h, _ = self._wsh('sample_topk_prob')
         tok_h, _ = self._wsh('sample_token')
         resolved_h, _ = self._wsh('sample_short_sel')
         can_resolve = self._can_gpu_resolve_idx()
         can_dev_sample = self._can_gpu_categorical_sample()
-        self._sample_fused_topk_n = 0
 
         if top_k == 1:
             if can_resolve:
@@ -1818,7 +1861,10 @@ class ADAMEngine:
                                  1, seq_len, c.head_dim_kv, c.n_head)
                 # `attn_out` is produced through row-base handles but consumed as a
                 # contiguous slot by `o_proj`; keep that ordered for now.
-                g.fusion_flush()
+                # On Broadcom, the level-batched scheduler with barrier coalescing
+                # handles ordering correctly, so skip the expensive flush.
+                if not (self._is_broadcom or self._is_integrated):
+                    g.fusion_flush()
             if te: self.timing['attn'] += time.perf_counter() - t0
 
             # ---- Output projection ----
@@ -2007,6 +2053,23 @@ class ADAMEngine:
                     if sample_cfg.temperature > 0.0:
                         g.map_topp_dev(ws_id, val_h, prob_h, top_k, float(sample_cfg.temperature), float(sample_cfg.top_p))
                 self._sample_fused_topk_n = top_k
+                # ---- Fuse resolve + categorical sample into forward batch ----
+                # This eliminates a separate batch_begin/batch_end (fence wait)
+                # in _consume_gpu_fused_topk, saving ~0.5-1ms per token.
+                can_resolve = self._can_gpu_resolve_idx()
+                can_dev_sample = self._can_gpu_categorical_sample()
+                if can_resolve:
+                    tok_h, _ = self._wsh('sample_token')
+                    if top_k == 1 or (sample_cfg and sample_cfg.temperature <= 0.0):
+                        g.map_resolve_idx_dev(ws_id, self._sample_fused_base_h, idx_h, tok_h, 1)
+                        self._sample_token_ready = True
+                    elif can_dev_sample and sample_cfg and sample_cfg.temperature > 0.0:
+                        resolved_h, _ = self._wsh('sample_short_sel')
+                        g.map_resolve_idx_dev(ws_id, self._sample_fused_base_h, idx_h, resolved_h, top_k)
+                        rand_h, _ = self._wsh('sample_rand')
+                        self._gpu_write_sample_rand()
+                        g.map_sample_categorical_dev(ws_id, resolved_h, prob_h, rand_h, tok_h, top_k)
+                        self._sample_token_ready = True
                 if te: self.timing['lm_head_shortlist'] += time.perf_counter() - shortlist_t0
             else:
                 # GPU path: output.weight is in the Q4/Q8 map → one GPU matmul
@@ -2017,10 +2080,105 @@ class ADAMEngine:
                     g.map_broadcast_dev(ws_id, self.A.OP_DIV, lo_h, fcap_h, lo_h, c.n_vocab)
                     g.map_op1_dev(ws_id, self.A.OP_TANH, lo_h, lo_h, c.n_vocab)
                     g.map_broadcast_dev(ws_id, self.A.OP_MUL, lo_h, fcap_h, lo_h, c.n_vocab)
+                # ---- Fuse argmax/topk sampling into forward batch ----
+                if sample_mode == 'gpu_argmax':
+                    tok_h, _ = self._wsh('sample_token')
+                    g.map_argmax_dev(ws_id, lo_h, tok_h, c.n_vocab)
+                    self._sample_token_ready = True
+                elif sample_mode == 'gpu_topk' and sample_cfg is not None:
+                    # Apply repeat penalty on GPU if supported
+                    if sample_cfg.repeat_penalty != 1.0 and sample_prev:
+                        if getattr(g, '_has_map_repeat_penalty_dev', False):
+                            n_rep = self._prepare_repeat_ids(sample_prev)
+                            if n_rep:
+                                g.map_repeat_penalty_dev(ws_id, lo_h, self._sample_repeat_ids_h,
+                                                         n_rep, float(sample_cfg.repeat_penalty))
+                    # topk → topp → categorical sample — all inside the batch
+                    _top_k = self._effective_sample_top_k(sample_cfg)
+                    _idx_h, _ = self._wsh('sample_topk_idx')
+                    _val_h, _ = self._wsh('sample_topk_val')
+                    _prob_h, _ = self._wsh('sample_topk_prob')
+                    g.map_topk_dev(ws_id, lo_h, _idx_h, _val_h, c.n_vocab, _top_k)
+                    if sample_cfg.temperature > 0.0:
+                        g.map_topp_dev(ws_id, _val_h, _prob_h, _top_k,
+                                       float(sample_cfg.temperature), float(sample_cfg.top_p))
+                        if self._can_gpu_categorical_sample():
+                            _rand_h, _ = self._wsh('sample_rand')
+                            tok_h, _ = self._wsh('sample_token')
+                            self._gpu_write_sample_rand()
+                            g.map_sample_categorical_dev(ws_id, _idx_h, _prob_h, _rand_h, tok_h, _top_k)
+                            self._sample_token_ready = True
         else:
             # CPU fallback: weight-tied (token_embd.weight) — gather hidden,
             # multiply on CPU, scatter result.  One gather + one scatter per token.
             pass  # handled after batch_end below
+
+        # ---- Fold Broadcom rerank into main batch (saves one fence wait) ----
+        _rerank_folded = False
+        if self._lm_wt_name and sample_mode == 'gpu_approx_rerank':
+            partial_n = self._sample_fused_partial_n
+            if partial_n > 0 and self._can_gpu_merge_approx_shortlist() and approx_partial_val_h is not None:
+                shortlist_n = min(self.SAMPLE_TOPK_MAX, self.SAMPLE_APPROX_SHORTLIST_MAX, partial_n)
+                if shortlist_n > 0:
+                    short_sel_h, _ = self._wsh('sample_short_sel')
+                    val_h, _ = self._wsh('sample_exact_val')
+                    g.map_topk_dev(
+                        ws_id,
+                        approx_partial_val_h,
+                        short_sel_h,
+                        val_h,
+                        partial_n,
+                        shortlist_n,
+                    )
+                    wt_mid = self.tensor_map_id[self._lm_wt_name]
+                    g.map_matvec_rerank_t_xq8_dev(
+                        ws_id,
+                        wt_mid,
+                        normed_final_h,
+                        self._wh[self._lm_wt_name],
+                        self._sample_fused_base_h,
+                        self._sample_short_sel_chunk_h[0],
+                        self._sample_repeat_ids_h,
+                        self._sample_exact_idx_chunk_h[0],
+                        self._sample_exact_val_chunk_h[0],
+                        c.n_embd,
+                        shortlist_n,
+                        approx_penalty_n,
+                        float(sample_cfg.repeat_penalty),
+                    )
+                    self._sample_rerank_n = shortlist_n
+                    _rerank_folded = True
+                    # Also fuse final sampling into the batch
+                    _can_resolve = self._can_gpu_resolve_idx()
+                    _can_dev = self._can_gpu_categorical_sample()
+                    if _can_resolve and shortlist_n > 0:
+                        _exact_val_h, _ = self._wsh('sample_exact_val')
+                        _topk_idx_h, _ = self._wsh('sample_topk_idx')
+                        _topk_val_h, _ = self._wsh('sample_topk_val')
+                        _top_k = min(self._effective_sample_top_k(sample_cfg), shortlist_n, self.SAMPLE_TOPK_MAX)
+                        if _top_k <= 0: _top_k = min(shortlist_n, self.SAMPLE_TOPK_MAX)
+                        g.map_topk_dev(ws_id, _exact_val_h, _topk_idx_h, _topk_val_h, shortlist_n, _top_k)
+                        if c.final_softcap > 0:
+                            fcap_h, _ = self._wsh('final_softcap')
+                            g.map_broadcast_dev(ws_id, self.A.OP_DIV, _topk_val_h, fcap_h, _topk_val_h, _top_k)
+                            g.map_op1_dev(ws_id, self.A.OP_TANH, _topk_val_h, _topk_val_h, _top_k)
+                            g.map_broadcast_dev(ws_id, self.A.OP_MUL, _topk_val_h, fcap_h, _topk_val_h, _top_k)
+                        tok_h, _ = self._wsh('sample_token')
+                        if sample_cfg.temperature <= 0.0:
+                            _ebase_h = self._sample_exact_base_h
+                            g.map_resolve_idx_dev(ws_id, _ebase_h, _topk_idx_h, tok_h, 1)
+                            self._sample_token_ready = True
+                        elif _can_dev:
+                            _ebase_h = self._sample_exact_base_h
+                            _resolved_h, _ = self._wsh('sample_short_sel')
+                            _prob_h, _ = self._wsh('sample_topk_prob')
+                            g.map_resolve_idx_dev(ws_id, _ebase_h, _topk_idx_h, _resolved_h, _top_k)
+                            g.map_topp_dev(ws_id, _topk_val_h, _prob_h, _top_k,
+                                           float(sample_cfg.temperature), float(sample_cfg.top_p))
+                            _rand_h, _ = self._wsh('sample_rand')
+                            self._gpu_write_sample_rand()
+                            g.map_sample_categorical_dev(ws_id, _resolved_h, _prob_h, _rand_h, tok_h, _top_k)
+                            self._sample_token_ready = True
 
         if trace_split:
             if te: self.timing['lm_head'] += time.perf_counter() - t0
@@ -2032,101 +2190,59 @@ class ADAMEngine:
             g.batch_end()
             if te: self.timing['lm_head'] += time.perf_counter() - t0
 
-        if self._lm_wt_name and sample_mode == 'gpu_approx_rerank':
+        if self._lm_wt_name and sample_mode == 'gpu_approx_rerank' and not _rerank_folded:
             shortlist_n = 0
             partial_n = self._sample_fused_partial_n
             if partial_n > 0:
-                if self._can_gpu_merge_approx_shortlist() and approx_partial_val_h is not None:
-                    shortlist_n = min(self.SAMPLE_TOPK_MAX, self.SAMPLE_APPROX_SHORTLIST_MAX, partial_n)
-                    if shortlist_n > 0:
-                        short_sel_h, _ = self._wsh('sample_short_sel')
-                        val_h, _ = self._wsh('sample_exact_val')
-                        g.batch_begin()
-                        try:
-                            g.map_topk_dev(
-                                ws_id,
-                                approx_partial_val_h,
-                                short_sel_h,
-                                val_h,
-                                partial_n,
-                                shortlist_n,
-                            )
-                            wt_mid = self.tensor_map_id[self._lm_wt_name]
+                partial_vals = g.gather(
+                    ws_id, self._sample_fused_val_locs[:partial_n]).view(np.float32)
+                valid_pos = np.flatnonzero(np.isfinite(partial_vals))
+                if valid_pos.size:
+                    shortlist_n = min(self.SAMPLE_APPROX_SHORTLIST_MAX, int(valid_pos.size))
+                    if shortlist_n < valid_pos.size:
+                        keep_rel = np.argpartition(
+                            partial_vals[valid_pos], -shortlist_n)[-shortlist_n:]
+                        keep_pos = valid_pos[keep_rel]
+                    else:
+                        keep_pos = valid_pos
+                    keep_pos = keep_pos[np.argsort(partial_vals[keep_pos])[::-1]]
+                    self._sample_short_sel_arr[:shortlist_n] = keep_pos.astype(np.float32, copy=False)
+                    short_sel_h, _ = self._wsh('sample_short_sel')
+                    idx_h, _ = self._wsh('sample_exact_idx')
+                    val_h, _ = self._wsh('sample_exact_val')
+                    g.batch_begin()
+                    try:
+                        g.scatter(
+                            ws_id,
+                            self._sample_short_sel_locs[:shortlist_n],
+                            self._sample_short_sel_arr[:shortlist_n],
+                        )
+                        wt_mid = self.tensor_map_id[self._lm_wt_name]
+                        for chunk_i, start in enumerate(range(0, shortlist_n, self.SAMPLE_TOPK_MAX)):
+                            chunk_n = min(self.SAMPLE_TOPK_MAX, shortlist_n - start)
                             g.map_matvec_rerank_t_xq8_dev(
                                 ws_id,
                                 wt_mid,
                                 normed_final_h,
                                 self._wh[self._lm_wt_name],
                                 self._sample_fused_base_h,
-                                self._sample_short_sel_chunk_h[0],
+                                self._sample_short_sel_chunk_h[chunk_i],
                                 self._sample_repeat_ids_h,
-                                self._sample_exact_idx_chunk_h[0],
-                                self._sample_exact_val_chunk_h[0],
+                                self._sample_exact_idx_chunk_h[chunk_i],
+                                self._sample_exact_val_chunk_h[chunk_i],
                                 c.n_embd,
-                                shortlist_n,
+                                chunk_n,
                                 approx_penalty_n,
                                 float(sample_cfg.repeat_penalty),
                             )
-                        finally:
-                            if trace_split:
-                                t_batch = time.perf_counter()
-                                g.batch_end()
-                                self.timing['rerank_batch'] += time.perf_counter() - t_batch
-                            else:
-                                g.batch_end()
-                        self._sample_rerank_n = shortlist_n
-                else:
-                    partial_vals = g.gather(
-                        ws_id, self._sample_fused_val_locs[:partial_n]).view(np.float32)
-                    valid_pos = np.flatnonzero(np.isfinite(partial_vals))
-                    if valid_pos.size:
-                        shortlist_n = min(self.SAMPLE_APPROX_SHORTLIST_MAX, int(valid_pos.size))
-                        if shortlist_n < valid_pos.size:
-                            keep_rel = np.argpartition(
-                                partial_vals[valid_pos], -shortlist_n)[-shortlist_n:]
-                            keep_pos = valid_pos[keep_rel]
+                    finally:
+                        if trace_split:
+                            t_batch = time.perf_counter()
+                            g.batch_end()
+                            self.timing['rerank_batch'] += time.perf_counter() - t_batch
                         else:
-                            keep_pos = valid_pos
-                        keep_pos = keep_pos[np.argsort(partial_vals[keep_pos])[::-1]]
-                        self._sample_short_sel_arr[:shortlist_n] = keep_pos.astype(np.float32, copy=False)
-                        short_sel_h, _ = self._wsh('sample_short_sel')
-                        idx_h, _ = self._wsh('sample_exact_idx')
-                        val_h, _ = self._wsh('sample_exact_val')
-                        # Keep the rerank stage inside one GPU batch after shortlist selection
-                        # to avoid per-chunk submit/fence overhead on slower drivers.
-                        g.batch_begin()
-                        try:
-                            g.scatter(
-                                ws_id,
-                                self._sample_short_sel_locs[:shortlist_n],
-                                self._sample_short_sel_arr[:shortlist_n],
-                            )
-                            wt_mid = self.tensor_map_id[self._lm_wt_name]
-                            for chunk_i, start in enumerate(range(0, shortlist_n, self.SAMPLE_TOPK_MAX)):
-                                chunk_n = min(self.SAMPLE_TOPK_MAX, shortlist_n - start)
-                                g.map_matvec_rerank_t_xq8_dev(
-                                    ws_id,
-                                    wt_mid,
-                                    normed_final_h,
-                                    self._wh[self._lm_wt_name],
-                                    self._sample_fused_base_h,
-                                    self._sample_short_sel_chunk_h[chunk_i],
-                                    self._sample_repeat_ids_h,
-                                    self._sample_exact_idx_chunk_h[chunk_i],
-                                    self._sample_exact_val_chunk_h[chunk_i],
-                                    c.n_embd,
-                                    chunk_n,
-                                    approx_penalty_n,
-                                    float(sample_cfg.repeat_penalty),
-                                )
-                        finally:
-                            if trace_split:
-                                t_batch = time.perf_counter()
-                                g.batch_end()
-                                self.timing['rerank_batch'] += time.perf_counter() - t_batch
-                            else:
-                                g.batch_end()
-                        self._sample_rerank_n = shortlist_n
+                            g.batch_end()
+                    self._sample_rerank_n = shortlist_n
 
         if not self._lm_wt_name:
             # CPU fallback (weight-tied models): gather from 'normed' slot
@@ -2293,7 +2409,6 @@ class ADAMEngine:
         trace_steps = []
         for step in range(config.max_tokens):
             t0 = time.perf_counter()
-            repeat_prev = self._repeat_history(token_ids, out_tok, config)
             t_sample0 = time.perf_counter()
             if sampling_mode == 'gpu_approx_rerank':
                 nt = self._sample_gpu_approx_rerank(config)
@@ -2302,14 +2417,20 @@ class ADAMEngine:
             elif gpu_argmax:
                 nt = self._sample_gpu_argmax()
             elif gpu_topk:
-                nt = self._sample_gpu_topk(config, repeat_prev)
+                if self._sample_token_ready:
+                    self._sample_token_ready = False
+                    nt = self._gpu_read_sample_token()
+                else:
+                    repeat_prev = self._repeat_history(token_ids, out_tok, config)
+                    nt = self._sample_gpu_topk(config, repeat_prev)
             else:
+                repeat_prev = self._repeat_history(token_ids, out_tok, config)
                 nt = self._sample(logits, config, repeat_prev)
             sample_dt = time.perf_counter() - t_sample0
             if nt in config.eos_token_ids: break
             all_tok.append(nt); out_tok.append(nt)
-            sample_mode = sampling_mode if sampling_mode in ('gpu_fused_topk', 'gpu_approx_rerank') else None
-            repeat_prev = self._repeat_history(token_ids, out_tok, config) if sample_mode else None
+            sample_mode = sampling_mode if sampling_mode in ('gpu_fused_topk', 'gpu_approx_rerank', 'gpu_topk', 'gpu_argmax') else None
+            repeat_prev = self._repeat_history(token_ids, out_tok, config) if sample_mode in ('gpu_fused_topk', 'gpu_approx_rerank', 'gpu_topk') else None
             timing_before = dict(self.timing) if trace_decode else None
             t_forward0 = time.perf_counter()
             logits = self._forward(nt, len(token_ids) + step, return_logits=(sampling_mode == 'cpu'),
@@ -2381,6 +2502,7 @@ class ADAMEngine:
         self._sample_fused_topk_n = 0
         self._sample_fused_partial_n = 0
         self._sample_rerank_n = 0
+        self._sample_token_ready = False
         self._reset_timing()
 
     def _reset_timing(self):
