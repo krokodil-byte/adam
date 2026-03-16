@@ -809,6 +809,13 @@ static int cmd_recording = 0;    // Is command buffer currently recording?
 static int batch_op_counter = 0; // Counter for unique buffer names in batch
 static int cmd_recording_async = 0;
 static int cmd_async_slot = -1;
+static int barrier_skip = 0;     // When >0, skip per-dispatch barriers (fusion level batching)
+static int is_integrated_gpu = 0; // Detected at init: 1 for RPi/integrated (unified memory)
+
+// Matmul workgroup dimensions for cross-map Q4/Q8 shaders.
+// Set at shader-load time based on the compiled shader profile.
+static uint32_t xq_matmul_wg_x = 16;
+static uint32_t xq_matmul_wg_y = 16;
 
 #define HANDLE_FROM_BUF(b) ((uint32_t)((b) - ctx.bufs) + 1u)
 #define BUF_FROM_HANDLE(h)                                                     \
@@ -854,6 +861,10 @@ static VkDescriptorSet alloc_desc_set_async(Pipeline *p) {
 static void cmd_barrier_after_dispatch(void) {
   if (!batch_mode)
     return;
+  // In fusion level-batched mode, ops within the same level are independent
+  // and don't need barriers between them. barrier_skip is set by fusion flush.
+  if (barrier_skip)
+    return;
   VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
                         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
@@ -861,6 +872,20 @@ static void cmd_barrier_after_dispatch(void) {
   vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL,
                        0, NULL);
+}
+
+// Explicit barrier insertion for between fusion levels
+static void cmd_barrier_between_levels(void) {
+  if (!batch_mode || !cmd_recording)
+    return;
+  VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                         VK_ACCESS_SHADER_WRITE_BIT};
+  vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL,
+                       0, NULL);
+  native_stats.barrier_count += 1;
 }
 
 static void cmd_buffer_barrier(VkPipelineStageFlags src_stage,
@@ -1606,6 +1631,10 @@ int adamah_init_ex(uint64_t hot_bytes, uint64_t cold_bytes) {
   vkGetPhysicalDeviceProperties(ctx.phys, &props);
   fprintf(stderr, "[ADAMAH] Selected: %s\n", props.deviceName);
   printf("ADAMAH v4: %s\n", props.deviceName);
+  is_integrated_gpu = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ? 1 : 0;
+  if (is_integrated_gpu) {
+    fprintf(stderr, "[ADAMAH] Integrated GPU detected — enabling unified memory optimizations\n");
+  }
   ctx.copy_align = props.limits.optimalBufferCopyOffsetAlignment;
   if (ctx.copy_align < 4)
     ctx.copy_align = 4;
@@ -1771,15 +1800,25 @@ int adamah_init_ex(uint64_t hot_bytes, uint64_t cold_bytes) {
     goto fail_cleanup;
   }
 
-  // Scale staging pool with cache allocation; bounded to [32 MB, 512 MB].
-  // Smaller cache requests (e.g. from RPi/low-VRAM fallback) also get a
-  // smaller staging pool so total allocation stays within device limits.
+  // Scale staging pool with cache allocation; bounded to [16 MB, 512 MB].
+  // Integrated GPUs (RPi/Broadcom) get a much smaller staging pool since
+  // memory is unified and staging copies are cheaper (same physical RAM).
   {
-    uint64_t staging_bytes = (uint64_t)hot_bytes / 4;
-    if (staging_bytes < 32ULL * 1024 * 1024)
-      staging_bytes = 32ULL * 1024 * 1024;
-    if (staging_bytes > STAGING_POOL_BYTES)
-      staging_bytes = STAGING_POOL_BYTES;
+    uint64_t staging_bytes;
+    if (is_integrated_gpu) {
+      // Unified memory: smaller staging pool, most ops can avoid staging entirely
+      staging_bytes = (uint64_t)hot_bytes / 8;
+      if (staging_bytes < 16ULL * 1024 * 1024)
+        staging_bytes = 16ULL * 1024 * 1024;
+      if (staging_bytes > 64ULL * 1024 * 1024)
+        staging_bytes = 64ULL * 1024 * 1024;
+    } else {
+      staging_bytes = (uint64_t)hot_bytes / 4;
+      if (staging_bytes < 32ULL * 1024 * 1024)
+        staging_bytes = 32ULL * 1024 * 1024;
+      if (staging_bytes > STAGING_POOL_BYTES)
+        staging_bytes = STAGING_POOL_BYTES;
+    }
     ctx.pool_size = (VkDeviceSize)staging_bytes;
   }
 
@@ -4453,7 +4492,12 @@ int adamah_fusion_flush(void) {
         result = ret;
     }
   } else {
+    // Level-batched: skip per-dispatch barriers within each level,
+    // insert a single barrier between levels. This dramatically reduces
+    // barrier count on bandwidth-limited GPUs (V3DV/Broadcom).
     for (int level = 0; level <= fusion.max_level; level++) {
+      barrier_skip = 1; // Suppress per-dispatch barriers within level
+      int ops_in_level = 0;
       for (int i = 0; i < fusion.n_ops; i++) {
         FuseOp *fop = &fusion.ops[i];
         if (fop->level != level)
@@ -4461,6 +4505,12 @@ int adamah_fusion_flush(void) {
         int ret = fusion_exec_queued_op(fop);
         if (ret != ADAMAH_OK)
           result = ret;
+        ops_in_level++;
+      }
+      barrier_skip = 0;
+      // Insert one barrier after all ops in this level complete
+      if (ops_in_level > 0 && level < fusion.max_level) {
+        cmd_barrier_between_levels();
       }
     }
   }
@@ -7190,8 +7240,8 @@ static int exec_matmul_t_xq4_internal(uint32_t map_act_id, uint32_t map_wt_id,
   vkUpdateDescriptorSets(ctx.device, 6, writes, 0, NULL);
 
   uint32_t push[5] = {M, K, N, n_ops, m_wt->group_size};
-  uint32_t grid_x = (M + 15) / 16;
-  uint32_t grid_y = (N + 15) / 16;
+  uint32_t grid_x = (M + xq_matmul_wg_x - 1) / xq_matmul_wg_x;
+  uint32_t grid_y = (N + xq_matmul_wg_y - 1) / xq_matmul_wg_y;
 
   cmd_begin();
   vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -7285,8 +7335,8 @@ int map_matmul_xq4_dev(uint32_t map_act_id, uint32_t map_wt_id,
   vkUpdateDescriptorSets(ctx.device, 6, writes, 0, NULL);
 
   uint32_t push[5] = {M, K, N, n_ops, m_wt->group_size};
-  uint32_t grid_x = (M + 15) / 16;
-  uint32_t grid_y = (N + 15) / 16;
+  uint32_t grid_x = (M + xq_matmul_wg_x - 1) / xq_matmul_wg_x;
+  uint32_t grid_y = (N + xq_matmul_wg_y - 1) / xq_matmul_wg_y;
 
   cmd_begin();
   vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -7482,7 +7532,7 @@ static int exec_matmul_t_xq8_internal(uint32_t map_act_id, uint32_t map_wt_id,
                           ctx.matmul_t_xq8_pipe.pipe_layout, 0, 1, &ds, 0, NULL);
   vkCmdPushConstants(ctx.cmd, ctx.matmul_t_xq8_pipe.pipe_layout,
                      VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, push);
-  vkCmdDispatch(ctx.cmd, (M+15)/16, (N+15)/16, n_ops);
+  vkCmdDispatch(ctx.cmd, (M+xq_matmul_wg_x-1)/xq_matmul_wg_x, (N+xq_matmul_wg_y-1)/xq_matmul_wg_y, n_ops);
   cmd_barrier_after_dispatch(); cmd_submit();
   res_unpin(locs_a_handle); res_unpin(locs_b_handle); res_unpin(locs_c_handle);
   return ADAMAH_OK;
@@ -7760,7 +7810,7 @@ int map_matmul_xq8_dev(uint32_t map_act_id, uint32_t map_wt_id,
                           ctx.matmul_xq8_pipe.pipe_layout, 0, 1, &ds, 0, NULL);
   vkCmdPushConstants(ctx.cmd, ctx.matmul_xq8_pipe.pipe_layout,
                      VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, push);
-  vkCmdDispatch(ctx.cmd, (M+15)/16, (N+15)/16, n_ops);
+  vkCmdDispatch(ctx.cmd, (M+xq_matmul_wg_x-1)/xq_matmul_wg_x, (N+xq_matmul_wg_y-1)/xq_matmul_wg_y, n_ops);
   cmd_barrier_after_dispatch(); cmd_submit();
   res_unpin(locs_a_handle); res_unpin(locs_b_handle); res_unpin(locs_c_handle);
   return ADAMAH_OK;
@@ -7812,4 +7862,28 @@ int map_row_gather_xq8_dev(uint32_t map_act_id, uint32_t map_wt_id,
   cmd_barrier_after_dispatch();
   cmd_submit();
   return ADAMAH_OK;
+}
+
+// Query whether the GPU is integrated (unified memory, e.g. Raspberry Pi)
+int adamah_is_integrated_gpu(void) {
+  return is_integrated_gpu;
+}
+
+// Set cross-map matmul workgroup dimensions (must match shader compile profile)
+void adamah_set_xq_matmul_wg(uint32_t wg_x, uint32_t wg_y) {
+  if (wg_x > 0 && wg_x <= 256)
+    xq_matmul_wg_x = wg_x;
+  if (wg_y > 0 && wg_y <= 256)
+    xq_matmul_wg_y = wg_y;
+}
+
+// Query GPU capabilities for tuning
+void adamah_get_gpu_caps(uint32_t *max_workgroup_size, uint32_t *subgroup_size,
+                         uint64_t *vram_bytes) {
+  if (max_workgroup_size)
+    *max_workgroup_size = gpu_caps.max_workgroup_size;
+  if (subgroup_size)
+    *subgroup_size = gpu_caps.subgroup_size;
+  if (vram_bytes)
+    *vram_bytes = gpu_caps.vram_bytes;
 }

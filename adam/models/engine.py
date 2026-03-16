@@ -287,9 +287,28 @@ class ADAMEngine:
         if self._production_mode:
             self.release_host_state()
         self.timing = {}; self._reset_timing()
+        # Detect runtime profile for hardware-specific optimizations
+        self._runtime_profile = str(
+            os.environ.get('ADAMAH_SHADER_PROFILE', os.environ.get('ADAM_RUNTIME_PROFILE', ''))
+        ).strip().lower()
+        self._is_broadcom = self._runtime_profile.startswith('broadcom_v3dv')
+        self._is_integrated = getattr(self.gpu, '_is_integrated_gpu', False)
+        # Auto-tune for Broadcom / integrated GPU (Raspberry Pi)
+        if self._is_broadcom or self._is_integrated:
+            # Default to level_batched fusion scheduler (enables barrier coalescing)
+            default_scheduler = 'level_batched'
+            # Larger rows_per_group reduces dispatch count for LM head sampling
+            if self._gpu_fused_rows_per_group == self.SAMPLE_FUSED_ROWS_PER_GROUP:
+                self._gpu_fused_rows_per_group = 1024
+            if self.verbose:
+                print(f"[GPU] Broadcom/integrated GPU detected — "
+                      f"auto-tuning: scheduler={default_scheduler}, "
+                      f"rows_per_group={self._gpu_fused_rows_per_group}")
+        else:
+            default_scheduler = 'legacy'
         self._fusion_scheduler_mode = str(
-            kw.get('fusion_scheduler_mode', os.environ.get('ADAM_FUSION_SCHEDULER_MODE', 'legacy'))
-        ).strip().lower() or 'legacy'
+            kw.get('fusion_scheduler_mode', os.environ.get('ADAM_FUSION_SCHEDULER_MODE', default_scheduler))
+        ).strip().lower() or default_scheduler
         if hasattr(self.gpu, 'fusion_set_scheduler_mode'):
             self.gpu.fusion_set_scheduler_mode(self._fusion_scheduler_mode)
         if hasattr(self.gpu, 'fusion_get_scheduler_mode'):
@@ -1228,7 +1247,12 @@ class ADAMEngine:
 
     def _effective_gpu_fused_rows_per_group(self, cfg) -> int:
         del cfg
-        return max(1, int(self._gpu_fused_rows_per_group))
+        base = max(1, int(self._gpu_fused_rows_per_group))
+        # On Broadcom, use even larger groups for greedy (top_k=1) to minimize
+        # dispatch count — the LM head dominates decode time on low-end GPUs.
+        if (self._is_broadcom or self._is_integrated) and base < 2048:
+            return max(base, 1024)
+        return base
 
     def _can_gpu_fused_topk_sample(self, cfg) -> bool:
         if not self._gpu_fused_topk:
@@ -1818,7 +1842,10 @@ class ADAMEngine:
                                  1, seq_len, c.head_dim_kv, c.n_head)
                 # `attn_out` is produced through row-base handles but consumed as a
                 # contiguous slot by `o_proj`; keep that ordered for now.
-                g.fusion_flush()
+                # On Broadcom, the level-batched scheduler with barrier coalescing
+                # handles ordering correctly, so skip the expensive flush.
+                if not (self._is_broadcom or self._is_integrated):
+                    g.fusion_flush()
             if te: self.timing['attn'] += time.perf_counter() - t0
 
             # ---- Output projection ----

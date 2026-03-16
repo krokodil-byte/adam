@@ -1,5 +1,13 @@
 #version 450
+
+#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
+layout(local_size_x = 8, local_size_y = 8) in;
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+layout(local_size_x = 8, local_size_y = 16) in;
+#else
 layout(local_size_x = 16, local_size_y = 16) in;
+#endif
+
 layout(push_constant) uniform PushConstants {
     uint M; uint K; uint N; uint n_ops; uint group_size;
 } pc;
@@ -31,10 +39,35 @@ void main() {
     uint b_base = locs_b[op];
     uint c_base = locs_c[op];
     float sum = 0.0;
+#if defined(ADAMAH_PROFILE_BROADCOM_V3DV_NARROW) || defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+    // Packed Q4 accumulation: process 8 Q4 values per uint word
+    uint row_off = a_base + row * pc.K;
+    uint col_off = b_base + col * pc.K;
+    uint K_aligned = pc.K & ~7u;
+    for (uint k = 0u; k < K_aligned; k += 8u) {
+        uint word_addr = (col_off + k) / 8u;
+        uint packed = map_wt[word_addr];
+        uint group = (col_off + k) / pc.group_size;
+        float scale = qparams[group * 2u];
+        float zp = qparams[group * 2u + 1u];
+        sum += map_act[row_off + k + 0u] * (float((packed      ) & 0xFu) * scale + zp);
+        sum += map_act[row_off + k + 1u] * (float((packed >>  4u) & 0xFu) * scale + zp);
+        sum += map_act[row_off + k + 2u] * (float((packed >>  8u) & 0xFu) * scale + zp);
+        sum += map_act[row_off + k + 3u] * (float((packed >> 12u) & 0xFu) * scale + zp);
+        sum += map_act[row_off + k + 4u] * (float((packed >> 16u) & 0xFu) * scale + zp);
+        sum += map_act[row_off + k + 5u] * (float((packed >> 20u) & 0xFu) * scale + zp);
+        sum += map_act[row_off + k + 6u] * (float((packed >> 24u) & 0xFu) * scale + zp);
+        sum += map_act[row_off + k + 7u] * (float((packed >> 28u) & 0xFu) * scale + zp);
+    }
+    for (uint k = K_aligned; k < pc.K; k++) {
+        sum += map_act[row_off + k] * load_q4(col_off + k);
+    }
+#else
     for (uint k = 0u; k < pc.K; k++) {
         float a_val = map_act[a_base + row * pc.K + k];
         float b_val = load_q4(b_base + col * pc.K + k);
         sum += a_val * b_val;
     }
+#endif
     map_act[c_base + row * pc.N + col] = sum;
 }

@@ -1,13 +1,13 @@
 #version 450
 
 #ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
-#define WG_SIZE 32
-#define TILE_K 64
-#define ROWS_PER_ITER 2
-#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
-#define WG_SIZE 128
-#define TILE_K 128
+#define WG_SIZE 16
+#define TILE_K 32
 #define ROWS_PER_ITER 4
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+#define WG_SIZE 64
+#define TILE_K 64
+#define ROWS_PER_ITER 8
 #else
 #define WG_SIZE 128
 #define TILE_K 128
@@ -43,6 +43,19 @@ shared float partial[ROWS_PER_ITER * WG_SIZE];
 shared float a_tile[TILE_K];
 shared float top_vals[TOPK_MAX];
 shared uint  top_idxs[TOPK_MAX];
+
+// Packed Q4 load: decode 8 nibbles from one uint in registers
+float dot_q4_8(uint word_addr, float scale, float zp, uint tile_off) {
+    uint packed = map_wt[word_addr];
+    return a_tile[tile_off + 0u] * (float((packed      ) & 0xFu) * scale + zp)
+         + a_tile[tile_off + 1u] * (float((packed >>  4u) & 0xFu) * scale + zp)
+         + a_tile[tile_off + 2u] * (float((packed >>  8u) & 0xFu) * scale + zp)
+         + a_tile[tile_off + 3u] * (float((packed >> 12u) & 0xFu) * scale + zp)
+         + a_tile[tile_off + 4u] * (float((packed >> 16u) & 0xFu) * scale + zp)
+         + a_tile[tile_off + 5u] * (float((packed >> 20u) & 0xFu) * scale + zp)
+         + a_tile[tile_off + 6u] * (float((packed >> 24u) & 0xFu) * scale + zp)
+         + a_tile[tile_off + 7u] * (float((packed >> 28u) & 0xFu) * scale + zp);
+}
 
 float load_q4(uint idx) {
     uint word_idx = idx / 8u;
@@ -116,9 +129,22 @@ void main() {
                 uint row = row_block + r;
                 if (row >= row_end) break;
                 uint row_base = b_base + row * pc.K;
+#if defined(ADAMAH_PROFILE_BROADCOM_V3DV_NARROW) || defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+                // Packed Q4 path: 8 elements per word read
+                uint aligned_len = tile_len & ~7u;
+                for (uint i = tid * 8u; i < aligned_len; i += uint(WG_SIZE) * 8u) {
+                    uint abs_idx = row_base + tile + i;
+                    uint group = abs_idx / pc.group_size;
+                    sums[r] += dot_q4_8(abs_idx / 8u, qparams[group * 2u], qparams[group * 2u + 1u], i);
+                }
+                for (uint i = aligned_len + tid; i < tile_len; i += uint(WG_SIZE)) {
+                    sums[r] += a_tile[i] * load_q4(row_base + tile + i);
+                }
+#else
                 for (uint i = tid; i < tile_len; i += uint(WG_SIZE)) {
                     sums[r] += a_tile[i] * load_q4(row_base + tile + i);
                 }
+#endif
             }
             barrier();
         }
