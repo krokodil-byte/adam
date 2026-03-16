@@ -7,14 +7,9 @@ Checks the first building blocks for a stateful GPU decode loop:
   - scalar copy / increment / comparisons / OR for decode state
 """
 import os
-import sys
 import numpy as np
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ADAMAH_DIR = os.path.join(ROOT, "adamah-MAIN")
-for p in [ROOT, ADAMAH_DIR]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+from adam.paths import setup; setup()
 
 import adamah as A
 

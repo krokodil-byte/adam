@@ -14,12 +14,7 @@ import time
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-# Ensure the project root is in sys.path so 'adam' and 'adamah' are importable
-_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_ADAMAH_DIR = os.path.join(_ROOT, "adamah-MAIN")
-for _p in (_ROOT, _ADAMAH_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+from adam.paths import ROOT as _ROOT, setup; setup()
 
 BACKENDS = ("adam", "llama", "ollama")
 DEFAULT_PRESET = "exact_greedy_32_prewarmed"

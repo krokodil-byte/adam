@@ -20,11 +20,7 @@ Usage:
 import os, sys
 import numpy as np
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ADAMAH_DIR = os.path.join(ROOT, "adamah-MAIN")
-for p in [ROOT, ADAMAH_DIR]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+from adam.paths import ROOT, setup; setup()
 
 import adamah as A
 

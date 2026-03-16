@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """Prompt rendering smoke tests for metadata-driven chat templates."""
 import os
-import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for p in [ROOT, os.path.join(ROOT, "adamah-MAIN")]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+from adam.paths import setup; setup()
 
 from adamah_chat import (
     _assistant_history_message,

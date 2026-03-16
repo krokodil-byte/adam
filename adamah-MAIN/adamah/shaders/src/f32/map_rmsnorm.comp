@@ -1,42 +1,33 @@
 #version 450
-
-#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
-#define WG_RMS 32
-#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
-#define WG_RMS 64
-#else
-#define WG_RMS 256
-#endif
-
-layout(local_size_x = WG_RMS) in;
+layout(local_size_x = 256) in;
 layout(push_constant) uniform PushConstants {
-    uint n_rows; uint dim; float eps;
+    uint n_rows; uint dim; float eps; 
 } pc;
 layout(set = 0, binding = 0) buffer MapBuffer { float map_data[]; };
 layout(set = 0, binding = 1) buffer SrcLocs   { uint locs_src[]; };
 layout(set = 0, binding = 2) buffer WtLocs    { uint locs_wt[]; };
 layout(set = 0, binding = 3) buffer DstLocs   { uint locs_dst[]; };
 
-shared float sdata[WG_RMS];
+shared float sdata[256];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint ri = gl_WorkGroupID.x;
     if (ri >= pc.n_rows) return;
-    uint sb = locs_src[ri];
-    uint wb = locs_wt[ri];
-    uint db = locs_dst[ri];
+    uint sb = locs_src[ri] * pc.dim;
+    uint wb = locs_wt[ri] * pc.dim;
+    uint db = locs_dst[ri] * pc.dim;
     // Sum of squares
     float ss = 0.0;
-    for (uint i = tid; i < pc.dim; i += uint(WG_RMS)) {
+    for (uint i = tid; i < pc.dim; i += 256u) {
         float x = map_data[sb+i];
         ss += x * x;
     }
     sdata[tid] = ss; barrier();
-    for (uint s = uint(WG_RMS >> 1); s > 0u; s >>= 1u) { if(tid<s) sdata[tid]+=sdata[tid+s]; barrier(); }
+    for (uint s=128u; s>0u; s>>=1u) { if(tid<s) sdata[tid]+=sdata[tid+s]; barrier(); }
     float inv_rms = 1.0 / sqrt(sdata[0] / float(pc.dim) + pc.eps); barrier();
     // Normalize and scale by weight
-    for (uint i = tid; i < pc.dim; i += uint(WG_RMS)) {
+    for (uint i = tid; i < pc.dim; i += 256u) {
         float x = map_data[sb+i];
         float w = map_data[wb+i];
         map_data[db+i] = x * inv_rms * w;

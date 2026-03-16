@@ -10,15 +10,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 # ── Paths ──────────────────────────────────────────────────
-ROOT = os.path.dirname(os.path.abspath(__file__))
-ADAMAH_DIR = os.path.join(ROOT, "adamah-MAIN")
-
-# NOTE: Do NOT add adamah-MAIN/adamah to sys.path — that dir contains adamah.so
-# which Python would try to import as a C extension (PyInit_adamah).
-# The correct import path is adamah-MAIN (parent of the adamah package).
-for p in [ROOT, ADAMAH_DIR]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+from adam.paths import ROOT, ADAMAH_DIR, setup; setup()
 
 from runtime_bootstrap import compiled_shader_profile, ensure_runtime
 

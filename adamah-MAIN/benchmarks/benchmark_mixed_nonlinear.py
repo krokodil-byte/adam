@@ -12,15 +12,10 @@ Compares ADAMAH vs PyTorch vs CuPy with IDENTICAL logical structure.
 """
 
 import os
-import sys
 import time
 import numpy as np
 
-# Setup paths FIRST
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.abspath(os.path.join(HERE, ".."))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+from adam.paths import setup; setup()
 
 # Initialize ADAMAH BEFORE torch/cupy to get priority on GPU memory
 import adamah

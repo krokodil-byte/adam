@@ -7,25 +7,20 @@ layout(set = 0, binding = 0) buffer MapBuffer { uint map_data[]; };
 layout(set = 0, binding = 1) buffer LocsA     { uint locs_a[]; };
 layout(set = 0, binding = 2) buffer LocsB     { uint locs_b[]; };
 layout(set = 0, binding = 3) buffer LocsC     { uint locs_c[]; };
-layout(set = 0, binding = 4) buffer ScaleMap  { float scale_data[]; };
-layout(set = 0, binding = 5) buffer ZPMap     { float zp_data[]; };
+
+layout(set = 0, binding = 4) buffer ScaleMap { float scale_data[]; };
+layout(set = 0, binding = 5) buffer ZPMap { float zp_data[]; };
 
 float load_q8(uint idx) {
     uint word_idx = idx / 4u;
     uint sub_idx  = idx % 4u;
     uint raw = (map_data[word_idx] >> (sub_idx * 8u)) & 0xFFu;
-    float ival = float(raw);
     uint group = idx / pc.group_size;
-    float scale = scale_data[group];
-    float zp    = zp_data[group];
-    return ival * scale + zp;
+    return float(raw) * scale_data[group] + zp_data[group];
 }
-
 void store_q8(uint idx, float val) {
     uint group = idx / pc.group_size;
-    float scale = scale_data[group];
-    float zp    = zp_data[group];
-    float qf = (val - zp) / max(scale, 1e-10);
+    float qf = (val - zp_data[group]) / max(scale_data[group], 1e-10);
     uint qi = uint(clamp(round(qf), 0.0, 255.0));
     uint word_idx = idx / 4u;
     uint sub_idx  = idx % 4u;
@@ -33,6 +28,7 @@ void store_q8(uint idx, float val) {
     atomicAnd(map_data[word_idx], ~(0xFFu << shift));
     atomicOr(map_data[word_idx], (uint(qi) & 0xFFu) << shift);
 }
+
 void main() {
     uint row = gl_GlobalInvocationID.x;
     uint col = gl_GlobalInvocationID.y;
