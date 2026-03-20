@@ -318,6 +318,9 @@ class ADAMEngine:
         # any immediate op and before batch_end(), so decode can safely keep
         # fusion enabled and let unary/binary/broadcast ops batch together.
         self.gpu.fusion_enable(True)
+        self._decode_plan_active = False
+        self._decode_plan_id = 0
+        self._build_decode_plan()
         if self.verbose and self._cpu_attention_fallback:
             print("[GPU] Attention: CPU fallback enabled (workaround for batched attention kernel bug)")
 
@@ -1786,6 +1789,215 @@ class ADAMEngine:
                   attn_out.reshape(-1))
 
     # ============================================================
+    # B6: Decode plan — pre-compiled forward pass (zero Python overhead)
+    # ============================================================
+    def _build_decode_plan(self):
+        """Pre-compile the full forward pass into a flat DecodePlanOp array.
+
+        Requirements: fused QK-norm+RoPE path (Gemma3), no cpu_attention_fallback.
+        Falls back to Python loop if not supported.
+        """
+        A = self.A
+        if not getattr(self.gpu, '_has_decode_plan', False):
+            self._decode_plan_active = False
+            return
+        if self._cpu_attention_fallback:
+            self._decode_plan_active = False
+            return
+
+        c = self.cfg
+        ws_id = self.ws_map_id
+
+        # Require fused QK-norm+RoPE (Gemma3 only): both norm weights in same map
+        qnn0 = 'blk.0.attn_q_norm.weight'
+        knn0 = 'blk.0.attn_k_norm.weight'
+        if (qnn0 not in self._wh or self._qk_rope_out_h is None
+                or self.tensor_map_id.get(qnn0) != self.tensor_map_id.get(knn0)):
+            self._decode_plan_active = False
+            return
+
+        RTP = A.DECODE_RUNTIME_POS
+        RTS = A.DECODE_RUNTIME_SEQ_LEN
+
+        def _mk(**kw):
+            return A.DecodePlanOp(**kw)
+
+        def rmsnorm_op(src_h, wt_name, dst_h, n_rows, dim):
+            wt_mid = self.tensor_map_id[wt_name]
+            wt_h = self._wh[wt_name]
+            if wt_mid == ws_id:
+                return _mk(kind=A.DECODE_OP_RMSNORM, map_id=ws_id,
+                            h0=src_h, h1=wt_h, h2=dst_h,
+                            u0=n_rows, u1=dim, f0=c.norm_eps)
+            else:
+                return _mk(kind=A.DECODE_OP_RMSNORM_X, map_id=ws_id, map_id2=wt_mid,
+                            h0=src_h, h1=wt_h, h2=dst_h,
+                            u0=n_rows, u1=dim, f0=c.norm_eps)
+
+        def rmsnorm_add_op(norm_in_h, wt_name, res_h, dst_h, n_rows, dim):
+            wt_h = self._wh[wt_name]
+            return _mk(kind=A.DECODE_OP_RMSNORM_ADD, map_id=ws_id,
+                        h0=norm_in_h, h1=wt_h, h2=res_h, h3=dst_h,
+                        u0=n_rows, u1=dim, f0=c.norm_eps)
+
+        def proj_op(in_h, wt_name, out_h, M, K, N):
+            wt_mid = self.tensor_map_id[wt_name]
+            wt_h = self._wh[wt_name]
+            kind = self._weight_kind(wt_name)
+            trans = self._trans[wt_name]
+            if trans:
+                if wt_mid == ws_id:
+                    return _mk(kind=A.DECODE_OP_MATMUL_X, map_id=ws_id,
+                                h0=in_h, h1=wt_h, h2=out_h, u0=M, u1=K, u2=N, u3=1)
+                elif kind == 'q8':
+                    return _mk(kind=A.DECODE_OP_MATMUL_XQ8, map_id=ws_id, map_id2=wt_mid,
+                                h0=in_h, h1=wt_h, h2=out_h, u0=M, u1=K, u2=N, u3=1)
+                elif kind == 'q4':
+                    return _mk(kind=A.DECODE_OP_MATMUL_XQ4, map_id=ws_id, map_id2=wt_mid,
+                                h0=in_h, h1=wt_h, h2=out_h, u0=M, u1=K, u2=N, u3=1)
+                else:
+                    return _mk(kind=A.DECODE_OP_MATMUL_X, map_id=ws_id, map_id2=wt_mid,
+                                h0=in_h, h1=wt_h, h2=out_h, u0=M, u1=K, u2=N, u3=1)
+            else:
+                if wt_mid == ws_id:
+                    return _mk(kind=A.DECODE_OP_MATMUL_T, map_id=ws_id,
+                                h0=in_h, h1=wt_h, h2=out_h, u0=M, u1=K, u2=N, u3=1)
+                elif kind == 'q8':
+                    return _mk(kind=A.DECODE_OP_MATMUL_T_XQ8, map_id=ws_id, map_id2=wt_mid,
+                                h0=in_h, h1=wt_h, h2=out_h, u0=M, u1=K, u2=N, u3=1)
+                elif kind == 'q4':
+                    return _mk(kind=A.DECODE_OP_MATMUL_T_XQ4, map_id=ws_id, map_id2=wt_mid,
+                                h0=in_h, h1=wt_h, h2=out_h, u0=M, u1=K, u2=N, u3=1)
+                else:
+                    return _mk(kind=A.DECODE_OP_MATMUL_T_X, map_id=ws_id, map_id2=wt_mid,
+                                h0=in_h, h1=wt_h, h2=out_h, u0=M, u1=K, u2=N, u3=1)
+
+        hid_h    = self._ws_slots['hidden'][0]
+        normed_h = self._ws_slots['normed'][0]
+        q_h      = self._ws_slots['q'][0]
+        k_h      = self._ws_slots['k'][0]   # noqa: F841
+        v_h      = self._ws_slots['v'][0]
+        ao_h     = self._ws_slots['attn_out'][0]
+        op_h     = self._ws_slots['o_proj'][0]
+        n2_h     = self._ws_slots['normed2'][0]
+        gate_h   = self._ws_slots['gate'][0]
+        up_h     = self._ws_slots['up'][0]
+        act_h    = self._ws_slots['act'][0]
+        ffn_h    = self._ws_slots['ffn_out'][0]
+
+        q_dim  = c.n_head * c.head_dim
+        k_dim  = c.n_head_kv * c.head_dim_kv
+        fused_gate_op = A.OP_GEGLU if c.ffn_act == 'gelu' else A.OP_SWIGLU
+        attn_scale = float(1.0 / np.sqrt(c.head_dim))
+        softcap    = float(c.attn_softcap)
+
+        all_ops = []
+        for L in range(c.n_layer):
+            p  = self._blk_names[L]
+            gl = c.is_global(L)
+            freq = float(c.rope_base_global if gl else c.rope_base_local)
+            qnn  = f'{p}.attn_q_norm.weight'
+            knn  = f'{p}.attn_k_norm.weight'
+            pan  = f'{p}.post_attention_norm.weight'
+            pfn  = f'{p}.post_ffw_norm.weight'
+            norm_mid = self.tensor_map_id[qnn]
+
+            # 1. Pre-attention RMSNorm: hidden → normed
+            all_ops.append(rmsnorm_op(hid_h, f'{p}.attn_norm.weight', normed_h, 1, c.n_embd))
+
+            # 2-4. QKV projections
+            all_ops.append(proj_op(normed_h, f'{p}.attn_q.weight', q_h,  1, c.n_embd, q_dim))
+            all_ops.append(proj_op(normed_h, f'{p}.attn_k.weight', k_h,  1, c.n_embd, k_dim))
+            all_ops.append(proj_op(normed_h, f'{p}.attn_v.weight', v_h,  1, c.n_embd, k_dim))
+
+            # 5. Fused QK-norm + RoPE (cross-map, writes Q+K back into workspace)
+            all_ops.append(_mk(
+                kind=A.DECODE_OP_QK_NORM_ROPE_X,
+                map_id=ws_id, map_id2=norm_mid,
+                h0=self._ws_rms_q_h, h1=self._wh[qnn],
+                h2=self._ws_rms_k_h, h3=self._wh[knn],
+                h4=self._qk_rope_out_h,
+                u0=c.n_head, u1=c.head_dim,
+                u2=c.n_head_kv, u3=c.head_dim_kv,
+                u4=RTP,
+                f0=freq,
+            ))
+
+            # 6. KV copy to cache (K and V together; workspace layout has K then V contiguous)
+            all_ops.append(_mk(
+                kind=A.DECODE_OP_ROW_COPY_OFFSET,
+                map_id=ws_id,
+                h0=self._kc_kv_copy_h[L],
+                h1=self._k_src_base_h,
+                u0=RTP,
+                u1=2 * c.n_head_kv,
+                u2=c.head_dim_kv,
+            ))
+
+            # 7. Attention scores: Q @ K^T  [n_head × 1 × seq_len]
+            all_ops.append(_mk(
+                kind=A.DECODE_OP_MATMUL_T,
+                map_id=ws_id,
+                h0=self._ws_rms_q_h,
+                h1=self._kc_k_locs_h[L],
+                h2=self._scores_row_h,
+                u0=1, u1=c.head_dim, u2=RTS, u3=c.n_head,
+            ))
+
+            # 8. Fused softmax + weighted-V sum → attn_out
+            all_ops.append(_mk(
+                kind=A.DECODE_OP_ATTN_SOFTMAX_VALUE,
+                map_id=ws_id,
+                h0=self._scores_row_h,
+                h1=self._kc_v_locs_h[L],
+                h2=self._ao_locs_h,
+                u0=c.n_head, u1=RTS, u2=c.head_dim_kv,
+                f0=attn_scale, f1=softcap,
+            ))
+
+            # 9. Output projection
+            all_ops.append(proj_op(ao_h, f'{p}.attn_output.weight', op_h,
+                                   1, c.n_head * c.head_dim_kv, c.n_embd))
+
+            # 10. Post-attention norm + residual
+            if pan in self._wh:
+                all_ops.append(rmsnorm_add_op(op_h, pan, hid_h, hid_h, 1, c.n_embd))
+            else:
+                all_ops.append(_mk(kind=A.DECODE_OP_OP2, map_id=ws_id,
+                                   op_code=A.OP_ADD, h0=hid_h, h1=op_h, h2=hid_h, u0=c.n_embd))
+
+            # 11. FFN pre-norm: hidden → normed2
+            all_ops.append(rmsnorm_op(hid_h, f'{p}.ffn_norm.weight', n2_h, 1, c.n_embd))
+
+            # 12-13. Gate + Up projections
+            all_ops.append(proj_op(n2_h, f'{p}.ffn_gate.weight', gate_h, 1, c.n_embd, c.n_ff))
+            all_ops.append(proj_op(n2_h, f'{p}.ffn_up.weight',   up_h,   1, c.n_embd, c.n_ff))
+
+            # 14. GEGLU/SwiGLU activation
+            all_ops.append(_mk(kind=A.DECODE_OP_OP2, map_id=ws_id,
+                               op_code=fused_gate_op, h0=gate_h, h1=up_h, h2=act_h, u0=c.n_ff))
+
+            # 15. FFN down projection
+            all_ops.append(proj_op(act_h, f'{p}.ffn_down.weight', ffn_h, 1, c.n_ff, c.n_embd))
+
+            # 16. Post-FFN norm + residual
+            if pfn in self._wh:
+                all_ops.append(rmsnorm_add_op(ffn_h, pfn, hid_h, hid_h, 1, c.n_embd))
+            else:
+                all_ops.append(_mk(kind=A.DECODE_OP_OP2, map_id=ws_id,
+                                   op_code=A.OP_ADD, h0=hid_h, h1=ffn_h, h2=hid_h, u0=c.n_embd))
+
+        # Final output norm (included in plan so decode_step covers it)
+        all_ops.append(rmsnorm_op(hid_h, 'output_norm.weight', normed_h, 1, c.n_embd))
+
+        self._decode_plan_id = 0
+        self._decode_plan_n_layer = c.n_layer
+        self.gpu.register_decode_plan(self._decode_plan_id, all_ops)
+        self._decode_plan_active = True
+        if self.verbose:
+            print(f"[GPU] B6 decode plan: {len(all_ops)} ops ({c.n_layer} layers)")
+
+    # ============================================================
     # Forward pass
     # ============================================================
     def _forward(self, tok, pos, return_logits=True, sample_mode=None, sample_cfg=None, sample_prev=None):
@@ -1840,7 +2052,14 @@ class ADAMEngine:
         if use_gpu_embed:
             self._enqueue_gpu_embed_token(hid_h)
 
-        for L in range(c.n_layer):
+        _b6 = (self._decode_plan_active and not te
+               and c.n_layer == self._decode_plan_n_layer)
+        if _b6:
+            # B6: single C call replaces all Python layer ops + final norm
+            self.gpu.decode_step(self._decode_plan_id, pos, seq_len)
+
+        if not _b6:
+         for L in range(c.n_layer):
             p = self._blk_names[L]; gl = c.is_global(L)
             alias_fast = self._fusion_alias_fast_enabled()
 
@@ -2079,12 +2298,12 @@ class ADAMEngine:
                 g.map_op2_dev(ws_id, self.A.OP_ADD, hid_h, ffn_h, hid_h, c.n_embd)
             if te: self.timing['ffn'] += time.perf_counter() - t0
 
-        # ---- Final norm (still in batch) ----
-        # Out-of-place into 'normed' slot (free after all layers).
-        if te: t0 = time.perf_counter()
+        # ---- Final norm (still in batch; B6 path includes this in decode plan) ----
         normed_final_h, _ = self._wsh('normed')
-        self._gpu_rmsnorm(hid_h, 'output_norm.weight', normed_final_h, 1, c.n_embd, c.norm_eps)
-        if te: self.timing['norm'] += time.perf_counter() - t0
+        if not _b6:
+            if te: t0 = time.perf_counter()
+            self._gpu_rmsnorm(hid_h, 'output_norm.weight', normed_final_h, 1, c.n_embd, c.norm_eps)
+            if te: self.timing['norm'] += time.perf_counter() - t0
 
         if trace_split:
             t_batch = time.perf_counter()
