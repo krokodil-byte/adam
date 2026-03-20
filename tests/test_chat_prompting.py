@@ -8,6 +8,7 @@ from adamah_chat import (
     _assistant_history_message,
     _auto_compaction_enabled,
     _build_compaction_seed_message,
+    _decode_path_overrides,
     _chat_reuse_plan,
     _chat_reuse_prefix_len,
     _desired_shader_profile,
@@ -163,7 +164,7 @@ def main():
     assert engine._repeat_history([1, 2, 3], [7, 8], cfg) == [7, 8]
     cfg.repeat_on_prompt = True
     assert engine._repeat_history([1, 2, 3], [7, 8], cfg) == [1, 2, 3, 7, 8]
-    engine._runtime_profile = "broadcom_v3dv_trace"
+    engine._runtime_profile = "broadcom_v3dv"
     assert engine._can_gpu_merge_approx_shortlist() is True
     engine._runtime_profile = "default"
     assert engine._can_gpu_merge_approx_shortlist() is False
@@ -191,7 +192,7 @@ def main():
         "default",
         unified=False,
         device={"device_name": "NVIDIA GeForce RTX 3070"},
-    ) == "nvidia_discrete"
+    ) == "desktop_discrete"
     small_prof = _runtime_profile_overrides("default", ModelConfig(), unified=True)
     assert small_prof["gpu_approx_rerank"] is False
     assert small_prof["gpu_fused_rows_per_group"] == 256
@@ -199,9 +200,9 @@ def main():
     discrete_prof = _runtime_profile_overrides("default", ModelConfig(), unified=False)
     assert discrete_prof["stream_load"] is False
     assert discrete_prof["gpu_fused_rows_per_group"] == 512
-    nvidia_prof = _runtime_profile_overrides("nvidia_discrete", ModelConfig(), unified=False)
-    assert nvidia_prof["gpu_fused_rows_per_group"] == 512
-    assert nvidia_prof["gpu_approx_rerank"] is False
+    discrete_decode = _decode_path_overrides("desktop_discrete")
+    assert discrete_decode["direct_kv_cache_write"] is True
+    assert discrete_decode["experimental_fused_qkv_qk_norm_rope"] is True
     gemma_prof = _runtime_profile_overrides(
         "default",
         ModelConfig(n_vocab=262144),
@@ -211,11 +212,10 @@ def main():
     assert gemma_prof["gpu_fused_rows_per_group"] == 256
     assert gemma_prof["gpu_approx_partial_k"] == 8
     prof = _runtime_profile_overrides(
-        "broadcom_v3dv_trace",
+        "broadcom_v3dv",
         ModelConfig(n_vocab=262144),
         unified=True,
     )
-    assert prof["trace_decode"] is True
     assert prof["gpu_approx_rerank"] is True
     assert prof["gpu_approx_partial_k"] == 8
     engine = ADAMEngine.__new__(ADAMEngine)

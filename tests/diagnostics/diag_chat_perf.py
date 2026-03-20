@@ -27,6 +27,9 @@ def parse_args(argv=None):
         "--prompt2",
         default="don't think that's true ahahahah ants are smaller aren't they?",
     )
+    parser.add_argument("--trace", action="store_true", help="Print per-stage timing breakdown")
+    parser.add_argument("--rows-per-group", type=int, default=None,
+                        help="Override gpu_fused_rows_per_group (default: use profile value)")
     return parser.parse_args(argv)
 
 
@@ -37,17 +40,16 @@ def _render_ids(messages, cfg, tokenizer):
 
 def main(argv=None):
     args = parse_args(argv)
-    engine, tokenizer, cfg, GenConfig = load_model(
-        args.model,
-        startup={
-            "runtime_profile": args.profile,
-            "stream_load": False,
-            "stream_chunk_mb": 64,
-            "kv_cap": int(args.kv_cap),
-            "gpu_fused_topk": True,
-            "gpu_fused_rows_per_group": 512,
-        },
-    )
+    startup: dict = {
+        "runtime_profile": args.profile,
+        "stream_load": False,
+        "stream_chunk_mb": 64,
+        "kv_cap": int(args.kv_cap),
+        "gpu_fused_topk": True,
+    }
+    if args.rows_per_group is not None:
+        startup["gpu_fused_rows_per_group"] = args.rows_per_group
+    engine, tokenizer, cfg, GenConfig = load_model(args.model, startup=startup)
     gen_cfg = GenConfig(
         max_tokens=int(args.max_tokens),
         temperature=0.0,
@@ -59,7 +61,7 @@ def main(argv=None):
 
     turn1_messages = [{"role": "user", "content": args.prompt1}]
     _, turn1_ids, turn1_render_s, turn1_encode_s = _render_ids(turn1_messages, cfg, tokenizer)
-    turn1_tokens, turn1_stats = engine.generate(turn1_ids, gen_cfg, stream=False)
+    turn1_tokens, turn1_stats = engine.generate(turn1_ids, gen_cfg, stream=False, trace_decode=args.trace)
     turn1_text = tokenizer.decode(turn1_tokens)
 
     turn2_messages = turn1_messages + [
@@ -74,6 +76,7 @@ def main(argv=None):
         gen_cfg,
         stream=False,
         reuse_prefix=reuse_prefix,
+        trace_decode=args.trace,
     )
     turn2_text = tokenizer.decode(turn2_tokens)
 
@@ -101,6 +104,23 @@ def main(argv=None):
     print(f"decode         : {turn2_stats.get('decode_s', 0.0) * 1000.0:.2f} ms")
     print(f"decode tps     : {turn2_stats.get('decode_tps', 0.0):.2f}")
     print(f"reply preview  : {turn2_text[:100]!r}")
+
+    if args.trace:
+        ts = turn2_stats.get("trace_summary") or {}
+        tm = turn2_stats.get("timing") or {}
+        print("")
+        print("=== Trace (Turn 2 decode, avg per token) ===")
+        keys = ["embed", "norm", "qkv", "qk_norm", "rope", "attn", "attn_out",
+                "ffn", "lm_head", "sample_resolve", "core_batch"]
+        total_ms = ts.get("forward_ms_avg", 0.0) + ts.get("sample_ms_avg", 0.0)
+        for k in keys:
+            v = ts.get(f"{k}_ms_avg", tm.get(k, 0.0))
+            if isinstance(v, float) and v > 0.0:
+                print(f"  {k:<20}: {v:7.3f} ms")
+        print(f"  {'forward_avg':<20}: {ts.get('forward_ms_avg', 0.0):7.3f} ms")
+        print(f"  {'sample_avg':<20}: {ts.get('sample_ms_avg', 0.0):7.3f} ms")
+        print(f"  {'step_avg':<20}: {ts.get('step_ms_avg', total_ms):7.3f} ms")
+        print(f"  {'decode_tps':<20}: {ts.get('decode_tps', 0.0):7.2f} tok/s")
     return 0
 
 

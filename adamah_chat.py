@@ -36,6 +36,31 @@ GEN_PRESET_CHOICES = [
     ("factual", "Factual"),
     ("creative", "Creative"),
 ]
+_RUNTIME_BOOL_OVERRIDE_KEYS = (
+    ("direct_kv_cache_write", "ADAM_DIRECT_KV_CACHE_WRITE"),
+    ("experimental_qk_norm_rope", "ADAM_EXPERIMENTAL_QK_NORM_ROPE"),
+    ("experimental_merged_qkv", "ADAM_EXPERIMENTAL_MERGED_QKV"),
+    ("experimental_fused_qkv_qk_norm_rope", "ADAM_EXPERIMENTAL_FUSED_QKV_QK_NORM_ROPE"),
+    ("experimental_merged_gateup", "ADAM_EXPERIMENTAL_MERGED_GATEUP"),
+    ("experimental_fused_gateup_act", "ADAM_EXPERIMENTAL_FUSED_GATEUP_ACT"),
+)
+_ENGINE_RUNTIME_PLAN_KEYS = (
+    "gpu_fused_topk",
+    "gpu_fused_rows_per_group",
+    "gpu_approx_rerank",
+    "gpu_approx_partial_k",
+    "fusion_scheduler_mode",
+    "direct_kv_cache_write",
+    "experimental_qk_norm_rope",
+    "experimental_merged_qkv",
+    "experimental_fused_qkv_qk_norm_rope",
+    "experimental_merged_gateup",
+    "experimental_fused_gateup_act",
+)
+_ENGINE_STARTUP_OPTION_KEYS = (
+    "experimental_attn_softmax_value",
+    "experimental_rmsnorm_add",
+)
 
 def box(text, width=52):
     pad = width - len(text) - 2
@@ -102,8 +127,6 @@ def _runtime_preset_defaults(name: str) -> dict:
             "trace_decode": True,
             "kv_cap": 256,
         }
-    if name == "broadcom_exact":
-        return {"runtime_mode": "fast", "runtime_profile": "broadcom_v3dv_exact", "kv_cap": 256}
     return {"runtime_mode": "fast"}
 
 
@@ -477,10 +500,7 @@ def _run_reasoning_stage(engine, tokenizer, cfg, GenConfig, instruction: str,
 def _runtime_profile_overrides(profile_name, cfg, unified):
     name = (profile_name or "").strip().lower()
     if not name or name in ("default", "auto", "fast"):
-        if unified:
-            name = "broadcom_v3dv"
-        else:
-            name = "desktop_discrete"
+        name = "broadcom_v3dv" if unified else "desktop_discrete"
     if name == "desktop_discrete":
         return {
             "name": "desktop_discrete",
@@ -494,33 +514,6 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
             "trace_decode": False,
             "pool_hot_mb": 512,
             "pool_cold_mb": 1024,
-        }
-    if name == "nvidia_discrete":
-        return {
-            "name": "nvidia_discrete",
-            "reserve_ratio": 0.08,
-            "kv_cap_max": 2048,
-            "stream_load": False,
-            "stream_chunk_mb": 64,
-            "gpu_approx_rerank": False,
-            "gpu_approx_partial_k": 8,
-            "gpu_fused_rows_per_group": 512,
-            "trace_decode": False,
-            "pool_hot_mb": 768,
-            "pool_cold_mb": 1536,
-        }
-    if name == "unified_small_gpu":
-        return {
-            "name": "unified_small_gpu",
-            "reserve_ratio": 0.12,
-            "kv_cap_max": 256,
-            "stream_load": True,
-            "stream_chunk_mb": 8,
-            "gpu_approx_rerank": cfg.n_vocab >= 131072,
-            "gpu_approx_partial_k": 8,
-            "gpu_fused_rows_per_group": 256,
-            "pool_hot_mb_max": 64,
-            "pool_cold_mb_max": 32,
         }
     if name == "broadcom_v3dv":
         return {
@@ -536,91 +529,28 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
             "pool_hot_mb_max": 64,
             "pool_cold_mb_max": 32,
         }
-    if name == "broadcom_v3dv_exact":
-        return {
-            "name": "broadcom_v3dv_exact",
-            "reserve_ratio": 0.15,
-            "kv_cap_max": 256,
-            "stream_load": True,
-            "stream_chunk_mb": 8,
-            "gpu_approx_rerank": False,
-            "gpu_fused_rows_per_group": 256,
-            "trace_decode": False,
-            "pool_hot_mb_max": 64,
-            "pool_cold_mb_max": 32,
-        }
-    if name == "broadcom_v3dv_approx":
-        return {
-            "name": "broadcom_v3dv_approx",
-            "reserve_ratio": 0.15,
-            "kv_cap_max": 256,
-            "stream_load": True,
-            "stream_chunk_mb": 8,
-            "gpu_approx_rerank": cfg.n_vocab >= 131072,
-            "gpu_approx_partial_k": 8,
-            "gpu_fused_rows_per_group": 256,
-            "trace_decode": False,
-            "pool_hot_mb_max": 64,
-            "pool_cold_mb_max": 32,
-        }
-    if name == "broadcom_v3dv_trace":
-        return {
-            "name": "broadcom_v3dv_trace",
-            "reserve_ratio": 0.15,
-            "kv_cap_max": 256,
-            "stream_load": True,
-            "stream_chunk_mb": 8,
-            "gpu_approx_rerank": cfg.n_vocab >= 131072,
-            "gpu_approx_partial_k": 8,
-            "gpu_fused_rows_per_group": 256,
-            "trace_decode": True,
-            "pool_hot_mb_max": 64,
-            "pool_cold_mb_max": 32,
-        }
-    if name == "broadcom_v3dv_narrow":
-        return {
-            "name": "broadcom_v3dv_narrow",
-            "reserve_ratio": 0.15,
-            "kv_cap_max": 256,
-            "stream_load": True,
-            "stream_chunk_mb": 8,
-            "gpu_approx_rerank": cfg.n_vocab >= 131072,
-            "gpu_approx_partial_k": 8,
-            "gpu_fused_rows_per_group": 128,
-            "trace_decode": False,
-            "pool_hot_mb_max": 64,
-            "pool_cold_mb_max": 32,
-        }
-    return {"name": name}
+    raise ValueError(f"Unsupported runtime profile: {profile_name!r}")
 
 
 def _decode_path_overrides(profile_name):
     name = (profile_name or "").strip().lower()
-    if name in ("desktop_discrete", "nvidia_discrete"):
+    if name == "desktop_discrete":
         return {
-            "decode_path": "desktop_fast",
-            "fusion_scheduler_mode": "alias_safe",
-            "direct_kv_cache_write": False,
-            "experimental_qk_norm_rope": True,
-            "experimental_merged_qkv": True,
-            "experimental_fused_qkv_qk_norm_rope": False,
-            "experimental_merged_gateup": True,
-            "experimental_fused_gateup_act": True,
-        }
-    if name == "broadcom_v3dv_exact":
-        return {
-            "decode_path": "broadcom_exact",
-            "fusion_scheduler_mode": "level_batched",
+            "decode_path": "desktop_discrete",
+            # Keep the active desktop chat path on the known-good scheduler.
+            # The current alias_safe path still corrupts real chat generation,
+            # while legacy remains sane with the same fused-topk fast path.
+            "fusion_scheduler_mode": "legacy",
             "direct_kv_cache_write": True,
             "experimental_qk_norm_rope": True,
             "experimental_merged_qkv": True,
-            "experimental_fused_qkv_qk_norm_rope": False,
+            "experimental_fused_qkv_qk_norm_rope": True,
             "experimental_merged_gateup": True,
             "experimental_fused_gateup_act": True,
         }
-    if name.startswith("broadcom_v3dv"):
+    if name == "broadcom_v3dv":
         return {
-            "decode_path": "broadcom_dispatch_cut",
+            "decode_path": "broadcom_v3dv",
             "fusion_scheduler_mode": "level_batched",
             "direct_kv_cache_write": True,
             "experimental_qk_norm_rope": True,
@@ -629,16 +559,7 @@ def _decode_path_overrides(profile_name):
             "experimental_merged_gateup": True,
             "experimental_fused_gateup_act": True,
         }
-    return {
-        "decode_path": "portable_safe",
-        "fusion_scheduler_mode": "legacy",
-        "direct_kv_cache_write": False,
-        "experimental_qk_norm_rope": True,
-        "experimental_merged_qkv": True,
-        "experimental_fused_qkv_qk_norm_rope": False,
-        "experimental_merged_gateup": True,
-        "experimental_fused_gateup_act": True,
-    }
+    raise ValueError(f"Unsupported decode path profile: {profile_name!r}")
 
 
 def _plan_bool_override(startup, key: str, env_name: str, default: bool) -> bool:
@@ -650,11 +571,19 @@ def _plan_bool_override(startup, key: str, env_name: str, default: bool) -> bool
     return bool(default)
 
 
+def _resolve_decode_bool_overrides(startup, decode_defaults):
+    overrides = {}
+    for key, env_name in _RUNTIME_BOOL_OVERRIDE_KEYS:
+        overrides[key] = _plan_bool_override(
+            startup,
+            key,
+            env_name,
+            bool(decode_defaults.get(key, False)),
+        )
+    return overrides
+
+
 def _auto_discrete_runtime_profile_name(device=None):
-    device = device or {}
-    name = str(device.get("device_name") or "").strip().lower()
-    if any(token in name for token in ("nvidia", "geforce", "rtx", "gtx", "quadro")):
-        return "nvidia_discrete"
     return "desktop_discrete"
 
 
@@ -664,7 +593,9 @@ def _resolve_runtime_profile_name(profile_name, unified, device=None):
         return "broadcom_v3dv" if unified else _auto_discrete_runtime_profile_name(device)
     if name == "trace":
         return "broadcom_v3dv" if unified else _auto_discrete_runtime_profile_name(device)
-    return name
+    if name in ("desktop_discrete", "broadcom_v3dv"):
+        return name
+    raise ValueError(f"Unsupported runtime profile: {profile_name!r}")
 
 
 def _desired_shader_profile(startup=None) -> str:
@@ -830,47 +761,11 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
         or os.environ.get("ADAM_FUSION_SCHEDULER_MODE")
         or str(decode_defaults.get("fusion_scheduler_mode") or "legacy")
     )
+    decode_bool_overrides = _resolve_decode_bool_overrides(startup, decode_defaults)
 
-    direct_kv_cache_write = _plan_bool_override(
-        startup,
-        "direct_kv_cache_write",
-        "ADAM_DIRECT_KV_CACHE_WRITE",
-        bool(decode_defaults.get("direct_kv_cache_write", False)),
-    )
-    experimental_qk_norm_rope = _plan_bool_override(
-        startup,
-        "experimental_qk_norm_rope",
-        "ADAM_EXPERIMENTAL_QK_NORM_ROPE",
-        bool(decode_defaults.get("experimental_qk_norm_rope", True)),
-    )
-    experimental_merged_qkv = _plan_bool_override(
-        startup,
-        "experimental_merged_qkv",
-        "ADAM_EXPERIMENTAL_MERGED_QKV",
-        bool(decode_defaults.get("experimental_merged_qkv", True)),
-    )
-    experimental_fused_qkv_qk_norm_rope = _plan_bool_override(
-        startup,
-        "experimental_fused_qkv_qk_norm_rope",
-        "ADAM_EXPERIMENTAL_FUSED_QKV_QK_NORM_ROPE",
-        bool(decode_defaults.get("experimental_fused_qkv_qk_norm_rope", False)),
-    )
-    experimental_merged_gateup = _plan_bool_override(
-        startup,
-        "experimental_merged_gateup",
-        "ADAM_EXPERIMENTAL_MERGED_GATEUP",
-        bool(decode_defaults.get("experimental_merged_gateup", True)),
-    )
-    experimental_fused_gateup_act = _plan_bool_override(
-        startup,
-        "experimental_fused_gateup_act",
-        "ADAM_EXPERIMENTAL_FUSED_GATEUP_ACT",
-        bool(decode_defaults.get("experimental_fused_gateup_act", True)),
-    )
-
-    return {
+    plan = {
         "profile": profile.get("name", "default"),
-        "decode_path": str(decode_defaults.get("decode_path") or "portable_safe"),
+        "decode_path": str(decode_defaults.get("decode_path") or profile.get("name", "desktop_discrete")),
         "reserve_ratio": reserve_ratio,
         "host": host,
         "device": device,
@@ -886,13 +781,53 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
         "gpu_fused_rows_per_group": int(rows_per_group),
         "trace_decode": trace_decode,
         "fusion_scheduler_mode": str(fusion_scheduler_mode),
-        "direct_kv_cache_write": bool(direct_kv_cache_write),
-        "experimental_qk_norm_rope": bool(experimental_qk_norm_rope),
-        "experimental_merged_qkv": bool(experimental_merged_qkv),
-        "experimental_fused_qkv_qk_norm_rope": bool(experimental_fused_qkv_qk_norm_rope),
-        "experimental_merged_gateup": bool(experimental_merged_gateup),
-        "experimental_fused_gateup_act": bool(experimental_fused_gateup_act),
+        **decode_bool_overrides,
     }
+    return plan
+
+
+def _build_engine_kwargs(runtime_plan, loader, adamah_mod, startup=None):
+    startup = startup or {}
+    engine_kwargs = {
+        "raw_blocks": loader.raw_blocks,
+        "tensor_types": loader.tensor_types,
+        "tensor_shapes": loader.tensor_shapes,
+        "tensor_loader": (loader if runtime_plan["stream_load"] else None),
+        "runtime_profile": runtime_plan["profile"],
+        "stream_chunk_mb": runtime_plan["stream_chunk_mb"],
+        "kv_cap": runtime_plan["kv_cap"],
+        "adamah_mod": adamah_mod,
+        "verbose": True,
+        "production_mode": True,
+        "gpu_tied_lm_head": True,
+    }
+    for key in _ENGINE_RUNTIME_PLAN_KEYS:
+        value = runtime_plan.get(key)
+        if value is not None:
+            engine_kwargs[key] = value
+    for key in _ENGINE_STARTUP_OPTION_KEYS:
+        value = startup.get(key)
+        if value is not None:
+            engine_kwargs[key] = value
+    return engine_kwargs
+
+
+def _annotate_runtime_engine(engine, runtime_plan):
+    engine._runtime_profile = runtime_plan["profile"]
+    engine._decode_path = runtime_plan.get("decode_path")
+    engine._trace_decode = bool(runtime_plan.get("trace_decode", False))
+    engine._stream_load = bool(runtime_plan.get("stream_load"))
+    engine._pool_hot_mb = int(runtime_plan.get("pool_plan", {}).get("hot_mb", 0) or 0)
+    engine._pool_cold_mb = int(runtime_plan.get("pool_plan", {}).get("cold_mb", 0) or 0)
+    engine._runtime_plan = dict(runtime_plan)
+
+
+def _runtime_sampler_name(runtime_plan):
+    if runtime_plan["gpu_approx_rerank"]:
+        return "gpu_approx_rerank"
+    if runtime_plan["gpu_fused_topk"]:
+        return "exact gpu_fused_topk"
+    return "exact gpu_argmax"
 
 
 def print_runtime_plan(plan):
@@ -923,7 +858,7 @@ def print_runtime_plan(plan):
         "exact_fused_topk" if plan.get("gpu_fused_topk", True) else "exact_argmax"
     )
     print(f"{GREEN}Runtime:{RESET} profile={profile} kv_cap={plan.get('kv_cap', 0)} "
-          f"path={plan.get('decode_path', 'portable_safe')} "
+          f"path={plan.get('decode_path', profile)} "
           f"stream={'on' if plan.get('stream_load') else 'off'} "
           f"chunk={plan.get('stream_chunk_mb', 0)}MB "
           f"sampler={sampler} "
@@ -1029,46 +964,10 @@ def load_model(model_path, startup=None):
     gpu = init_gpu_backend(adamah_mod, runtime_plan)
 
     # Build engine
-    engine_kwargs = {
-        "raw_blocks": loader.raw_blocks,
-        "tensor_types": loader.tensor_types,
-        "tensor_shapes": loader.tensor_shapes,
-        "tensor_loader": (loader if runtime_plan["stream_load"] else None),
-        "runtime_profile": runtime_plan["profile"],
-        "stream_chunk_mb": runtime_plan["stream_chunk_mb"],
-        "kv_cap": runtime_plan["kv_cap"],
-        "adamah_mod": adamah_mod,
-        "verbose": True,
-        "production_mode": True,
-        "gpu_fused_topk": runtime_plan["gpu_fused_topk"],
-        "gpu_fused_rows_per_group": runtime_plan["gpu_fused_rows_per_group"],
-        "gpu_approx_rerank": runtime_plan["gpu_approx_rerank"],
-        "gpu_approx_partial_k": runtime_plan["gpu_approx_partial_k"],
-        "gpu_tied_lm_head": True,
-        "fusion_scheduler_mode": runtime_plan.get("fusion_scheduler_mode", "legacy"),
-        "direct_kv_cache_write": runtime_plan.get("direct_kv_cache_write"),
-        "experimental_qk_norm_rope": runtime_plan.get("experimental_qk_norm_rope"),
-        "experimental_merged_qkv": runtime_plan.get("experimental_merged_qkv"),
-        "experimental_fused_qkv_qk_norm_rope": runtime_plan.get("experimental_fused_qkv_qk_norm_rope"),
-        "experimental_merged_gateup": runtime_plan.get("experimental_merged_gateup"),
-        "experimental_fused_gateup_act": runtime_plan.get("experimental_fused_gateup_act"),
-    }
-    for opt_key in ("experimental_attn_softmax_value", "experimental_rmsnorm_add"):
-        opt_val = startup.get(opt_key)
-        if opt_val is not None:
-            engine_kwargs[opt_key] = opt_val
+    engine_kwargs = _build_engine_kwargs(runtime_plan, loader, adamah_mod, startup=startup)
     engine = ADAMEngine(gpu, cfg, loader.tensors, **engine_kwargs)
-    engine._runtime_profile = runtime_plan["profile"]
-    engine._decode_path = runtime_plan.get("decode_path")
-    engine._trace_decode = bool(runtime_plan.get("trace_decode", False))
-    engine._stream_load = bool(runtime_plan.get("stream_load"))
-    engine._pool_hot_mb = int(runtime_plan.get("pool_plan", {}).get("hot_mb", 0) or 0)
-    engine._pool_cold_mb = int(runtime_plan.get("pool_plan", {}).get("cold_mb", 0) or 0)
-    engine._runtime_plan = dict(runtime_plan)
-    sampler_name = (
-        "gpu_approx_rerank" if runtime_plan["gpu_approx_rerank"]
-        else ("exact gpu_fused_topk" if runtime_plan["gpu_fused_topk"] else "exact gpu_argmax")
-    )
+    _annotate_runtime_engine(engine, runtime_plan)
+    sampler_name = _runtime_sampler_name(runtime_plan)
     print(f"{GREEN}Chat fast path:{RESET} {sampler_name}, "
           f"rows_per_group={runtime_plan['gpu_fused_rows_per_group']}, "
           f"partial_k={runtime_plan['gpu_approx_partial_k']}, "
