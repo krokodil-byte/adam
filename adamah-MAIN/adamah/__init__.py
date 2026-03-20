@@ -41,6 +41,29 @@ _FUSION_SCHEDULER_NAMES = {
     FUSION_SCHEDULER_LEVEL_BATCHED: "level_batched",
 }
 
+DECODE_RUNTIME_POS = 0xFFFFFFFE
+DECODE_RUNTIME_SEQ_LEN = 0xFFFFFFFD
+
+DECODE_OP_NOP = 0
+DECODE_OP_FUSION_FLUSH = 1
+DECODE_OP_FUSION_ENABLE = 2
+DECODE_OP_OP1 = 10
+DECODE_OP_OP2 = 11
+DECODE_OP_RMSNORM = 12
+DECODE_OP_RMSNORM_X = 13
+DECODE_OP_RMSNORM_ADD = 14
+DECODE_OP_ROPE = 15
+DECODE_OP_MATMUL_T = 16
+DECODE_OP_MATMUL_T_X = 17
+DECODE_OP_MATMUL_X = 18
+DECODE_OP_MATMUL_T_XQ4 = 19
+DECODE_OP_MATMUL_XQ4 = 20
+DECODE_OP_MATMUL_T_XQ8 = 21
+DECODE_OP_MATMUL_XQ8 = 22
+DECODE_OP_QK_NORM_ROPE_X = 23
+DECODE_OP_ROW_COPY_OFFSET = 24
+DECODE_OP_ATTN_SOFTMAX_VALUE = 25
+
 # Import UUCIS wrapper for benchmark compatibility
 try:
     from .uucis import UUCISView
@@ -341,6 +364,31 @@ def recommend_pool_sizes(working_set_bytes: int = 0,
         "device_type_name": device.get("device_type_name", "other"),
         "is_unified_memory": unified,
     }
+
+
+class DecodePlanOp(ctypes.Structure):
+    """Flat decode-plan op record mirrored from the native backend."""
+
+    _fields_ = [
+        ("kind", ctypes.c_uint32),
+        ("map_id", ctypes.c_uint32),
+        ("map_id2", ctypes.c_uint32),
+        ("op_code", ctypes.c_uint32),
+        ("h0", ctypes.c_uint32),
+        ("h1", ctypes.c_uint32),
+        ("h2", ctypes.c_uint32),
+        ("h3", ctypes.c_uint32),
+        ("h4", ctypes.c_uint32),
+        ("h5", ctypes.c_uint32),
+        ("u0", ctypes.c_uint32),
+        ("u1", ctypes.c_uint32),
+        ("u2", ctypes.c_uint32),
+        ("u3", ctypes.c_uint32),
+        ("u4", ctypes.c_uint32),
+        ("u5", ctypes.c_uint32),
+        ("f0", ctypes.c_float),
+        ("f1", ctypes.c_float),
+    ]
 
 # ============================================
 # ArrayHandle - Wrapper for GPU arrays
@@ -805,6 +853,23 @@ class Adamah:
             self._has_fusion_scheduler = True
         except AttributeError:
             self._has_fusion_scheduler = False
+
+        try:
+            self._lib.adamah_register_decode_plan.argtypes = [
+                ctypes.c_uint32,
+                ctypes.POINTER(DecodePlanOp),
+                ctypes.c_uint32,
+            ]
+            self._lib.adamah_register_decode_plan.restype = ctypes.c_int
+            self._lib.adamah_clear_decode_plan.argtypes = [ctypes.c_uint32]
+            self._lib.adamah_clear_decode_plan.restype = None
+            self._lib.adamah_decode_step.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32
+            ]
+            self._lib.adamah_decode_step.restype = ctypes.c_int
+            self._has_decode_plan = True
+        except AttributeError:
+            self._has_decode_plan = False
 
         # GPU capability queries (integrated GPU detection, caps)
         try:
@@ -2125,6 +2190,53 @@ class Adamah:
         if not getattr(self, '_has_fusion_scheduler', False):
             return
         self._lib.adamah_clear_loc_alias_meta(ctypes.c_uint32(handle))
+
+    def _coerce_decode_plan_ops(self, ops):
+        ops = list(ops)
+        if not ops:
+            return None, 0
+        packed = (DecodePlanOp * len(ops))()
+        for i, op in enumerate(ops):
+            if isinstance(op, DecodePlanOp):
+                packed[i] = op
+            elif isinstance(op, dict):
+                packed[i] = DecodePlanOp(**op)
+            else:
+                raise TypeError(
+                    "decode plan ops must be DecodePlanOp instances or dicts"
+                )
+        return packed, len(ops)
+
+    def register_decode_plan(self, plan_id: int, ops):
+        """Upload a flat decode dispatch list to the native backend."""
+        if not getattr(self, '_has_decode_plan', False):
+            raise NotImplementedError("decode-plan support is not available in the loaded backend")
+        packed, n_ops = self._coerce_decode_plan_ops(ops)
+        ret = self._lib.adamah_register_decode_plan(
+            ctypes.c_uint32(plan_id),
+            packed,
+            ctypes.c_uint32(n_ops),
+        )
+        if ret != 0:
+            raise RuntimeError(f"adamah_register_decode_plan failed with code {ret}")
+
+    def clear_decode_plan(self, plan_id: int):
+        """Remove a previously registered native decode plan."""
+        if not getattr(self, '_has_decode_plan', False):
+            return
+        self._lib.adamah_clear_decode_plan(ctypes.c_uint32(plan_id))
+
+    def decode_step(self, plan_id: int, pos: int, seq_len: int):
+        """Run one registered decode plan with runtime position arguments."""
+        if not getattr(self, '_has_decode_plan', False):
+            raise NotImplementedError("decode-plan support is not available in the loaded backend")
+        ret = self._lib.adamah_decode_step(
+            ctypes.c_uint32(plan_id),
+            ctypes.c_uint32(pos),
+            ctypes.c_uint32(seq_len),
+        )
+        if ret != 0:
+            raise RuntimeError(f"adamah_decode_step failed with code {ret}")
 
     @contextmanager
     def fusion_disabled(self):

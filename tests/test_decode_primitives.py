@@ -504,6 +504,75 @@ def test_fusion_batch_order(gpu, u):
     return winner == 2 and np.allclose(neg_vals, [-1.0, -2.0, -3.0], atol=1e-6)
 
 
+def test_decode_plan_runtime_args(gpu, u):
+    if not getattr(gpu, '_has_decode_plan', False):
+        print("[decode_plan] skipped (backend primitive not available)")
+        return True
+
+    plan_id = 1
+    direct_map = 6
+    plan_map = 7
+    seed = np.zeros(24, dtype=np.float32)
+    seed[0:6] = np.array([1.0, 2.0, 3.0, 10.0, 20.0, 30.0], dtype=np.float32)
+
+    u.array_init(direct_map, 24, 4)
+    u.array_init(plan_map, 24, 4)
+    u.scatter(direct_map, u.cache_locs(direct_map, np.arange(24, dtype=np.uint32)), seed)
+    u.scatter(plan_map, u.cache_locs(plan_map, np.arange(24, dtype=np.uint32)), seed)
+
+    src_h, _ = gpu.upload_dev(np.array([0, 1, 2], dtype=np.uint32))
+    dst_h, _ = gpu.upload_dev(np.array([12, 13, 14], dtype=np.uint32))
+    spec_h, _ = gpu.upload_dev(np.array([1, 0], dtype=np.uint32))
+    base_h, _ = gpu.upload_dev(np.array([0], dtype=np.uint32))
+
+    gpu.batch_begin()
+    gpu.map_op2_dev(direct_map, A.OP_ADD, src_h, src_h, dst_h, 3)
+    gpu.map_row_copy_offset_dev(direct_map, spec_h, base_h, 8, 1, 3)
+    gpu.batch_end()
+
+    ops = [
+        A.DecodePlanOp(
+            kind=A.DECODE_OP_OP2,
+            map_id=plan_map,
+            op_code=A.OP_ADD,
+            h0=src_h,
+            h1=src_h,
+            h2=dst_h,
+            u0=A.DECODE_RUNTIME_SEQ_LEN,
+        ),
+        A.DecodePlanOp(
+            kind=A.DECODE_OP_ROW_COPY_OFFSET,
+            map_id=plan_map,
+            h0=spec_h,
+            h1=base_h,
+            u0=A.DECODE_RUNTIME_POS,
+            u1=1,
+            u2=3,
+        ),
+    ]
+
+    try:
+        gpu.register_decode_plan(plan_id, ops)
+        gpu.decode_step(plan_id, pos=8, seq_len=3)
+    finally:
+        gpu.clear_decode_plan(plan_id)
+
+    probe_copy = np.array([8, 9, 10], dtype=np.uint32)
+    probe_add = np.array([12, 13, 14], dtype=np.uint32)
+    direct_copied = gpu.gather(direct_map, probe_copy).view(np.float32)
+    direct_added = gpu.gather(direct_map, probe_add).view(np.float32)
+    plan_copied = gpu.gather(plan_map, probe_copy).view(np.float32)
+    plan_added = gpu.gather(plan_map, probe_add).view(np.float32)
+    print(
+        f"[decode_plan] direct_copy={direct_copied.tolist()} plan_copy={plan_copied.tolist()} "
+        f"direct_add={direct_added.tolist()} plan_add={plan_added.tolist()}"
+    )
+    return (
+        np.allclose(direct_copied, plan_copied, atol=1e-6)
+        and np.allclose(direct_added, plan_added, atol=1e-6)
+    )
+
+
 def main():
     gpu = A.init()
     try:
@@ -527,6 +596,7 @@ def main():
         ok_row_copy_fusion = test_fusion_row_copy_then_matmul(gpu, u)
         ok_state = test_scalar_state(u)
         ok_fusion = test_fusion_batch_order(gpu, u)
+        ok_decode_plan = test_decode_plan_runtime_args(gpu, u)
     finally:
         gpu.shutdown()
 
@@ -534,7 +604,8 @@ def main():
         ok_argmax and ok_topk and ok_topp and ok_resolve_sample and ok_softmax_abs and ok_attn_softmax_abs and
         ok_q8 and ok_row_gather and ok_matvec_q8 and ok_matvec_topk_q8 and
         ok_matvec_topk_q4 and ok_matvec_rerank_q8 and ok_matvec_q4 and
-        ok_batch_gather and ok_row_copy and ok_row_copy_fusion and ok_state and ok_fusion
+        ok_batch_gather and ok_row_copy and ok_row_copy_fusion and ok_state and ok_fusion and
+        ok_decode_plan
     )
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1

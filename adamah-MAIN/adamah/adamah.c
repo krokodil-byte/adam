@@ -67,6 +67,31 @@
 #define FUSION_SCHEDULER_ALIAS_SAFE 1
 #define FUSION_SCHEDULER_LEVEL_BATCHED 2
 
+#define ADAMAH_DECODE_MAX_PLANS 8
+#define ADAMAH_DECODE_MAX_OPS 4096
+#define ADAMAH_DECODE_RUNTIME_POS 0xFFFFFFFEu
+#define ADAMAH_DECODE_RUNTIME_SEQ_LEN 0xFFFFFFFDu
+
+#define ADAMAH_DECODE_OP_NOP 0
+#define ADAMAH_DECODE_OP_FUSION_FLUSH 1
+#define ADAMAH_DECODE_OP_FUSION_ENABLE 2
+#define ADAMAH_DECODE_OP_OP1 10
+#define ADAMAH_DECODE_OP_OP2 11
+#define ADAMAH_DECODE_OP_RMSNORM 12
+#define ADAMAH_DECODE_OP_RMSNORM_X 13
+#define ADAMAH_DECODE_OP_RMSNORM_ADD 14
+#define ADAMAH_DECODE_OP_ROPE 15
+#define ADAMAH_DECODE_OP_MATMUL_T 16
+#define ADAMAH_DECODE_OP_MATMUL_T_X 17
+#define ADAMAH_DECODE_OP_MATMUL_X 18
+#define ADAMAH_DECODE_OP_MATMUL_T_XQ4 19
+#define ADAMAH_DECODE_OP_MATMUL_XQ4 20
+#define ADAMAH_DECODE_OP_MATMUL_T_XQ8 21
+#define ADAMAH_DECODE_OP_MATMUL_XQ8 22
+#define ADAMAH_DECODE_OP_QK_NORM_ROPE_X 23
+#define ADAMAH_DECODE_OP_ROW_COPY_OFFSET 24
+#define ADAMAH_DECODE_OP_ATTN_SOFTMAX_VALUE 25
+
 // Operation types for fusion
 #define FUSE_OP_UNARY 1
 #define FUSE_OP_BINARY 2
@@ -102,6 +127,7 @@ int map_set_qparams(uint32_t map_id, const float *scales,
                     const float *zero_points, uint32_t n_groups);
 int adamah_probe_device(uint64_t *heap_bytes, uint64_t *budget_bytes,
                         uint64_t *usage_bytes, uint32_t *device_type);
+static void decode_plan_reset_all(void);
 
 typedef struct {
   uint8_t valid;
@@ -113,6 +139,34 @@ typedef struct {
   uint32_t stride;
   uint32_t row_size;
 } LocAliasMeta;
+
+typedef struct {
+  uint32_t kind;
+  uint32_t map_id;
+  uint32_t map_id2;
+  uint32_t op_code;
+  uint32_t h0;
+  uint32_t h1;
+  uint32_t h2;
+  uint32_t h3;
+  uint32_t h4;
+  uint32_t h5;
+  uint32_t u0;
+  uint32_t u1;
+  uint32_t u2;
+  uint32_t u3;
+  uint32_t u4;
+  uint32_t u5;
+  float f0;
+  float f1;
+} AdamahDecodePlanOp;
+
+typedef struct {
+  uint8_t valid;
+  uint8_t reserved[3];
+  uint32_t n_ops;
+  AdamahDecodePlanOp ops[ADAMAH_DECODE_MAX_OPS];
+} AdamahDecodePlan;
 
 // Fusion operation entry
 typedef struct {
@@ -151,6 +205,7 @@ typedef struct {
 
 static GpuCaps gpu_caps = {0};
 static int is_integrated_gpu = 0; // Detected at init: 1 for unified-memory GPUs
+static int is_broadcom_v3d = 0;   // Broadcom V3D is integrated, but zero-copy is unsafe
 
 // Fusion context
 typedef struct {
@@ -178,6 +233,22 @@ typedef struct {
 
 static AdamahStats native_stats = {0};
 static LocAliasMeta loc_alias_meta[MAX_RES + 1] = {0};
+static AdamahDecodePlan decode_plans[ADAMAH_DECODE_MAX_PLANS] = {0};
+
+static int device_is_broadcom_v3d(const VkPhysicalDeviceProperties *props) {
+  if (!props) {
+    return 0;
+  }
+  if (props->vendorID == 0x14E4) {
+    return 1;
+  }
+  const char *name = props->deviceName;
+  if (!name) {
+    return 0;
+  }
+  return strstr(name, "V3D") != NULL || strstr(name, "v3d") != NULL ||
+         strstr(name, "Broadcom") != NULL || strstr(name, "broadcom") != NULL;
+}
 
 void adamah_stats_reset(void) {
   memset(&native_stats, 0, sizeof(native_stats));
@@ -472,6 +543,10 @@ static void loc_alias_meta_reset_all(void) {
   memset(loc_alias_meta, 0, sizeof(loc_alias_meta));
 }
 
+static void decode_plan_reset_all(void) {
+  memset(decode_plans, 0, sizeof(decode_plans));
+}
+
 static LocAliasMeta *loc_alias_meta_mut(uint32_t handle) {
   if (handle == 0 || handle > MAX_RES)
     return NULL;
@@ -600,8 +675,10 @@ static uint32_t find_mem_type(uint32_t bits, VkMemoryPropertyFlags props) {
 static uint32_t find_device_local(uint32_t bits) {
   VkPhysicalDeviceMemoryProperties mp;
   vkGetPhysicalDeviceMemoryProperties(ctx.phys, &mp);
-  // On integrated GPU (unified memory), prefer DEVICE_LOCAL + HOST_VISIBLE
-  // so the CPU can directly access GPU buffers without staging copies.
+  // On integrated GPUs with genuinely unified zero-copy memory, prefer
+  // DEVICE_LOCAL + HOST_VISIBLE so the CPU can access GPU buffers directly.
+  // Broadcom V3D is excluded: it reports integrated/unified traits but still
+  // needs explicit staging for correctness.
   if (is_integrated_gpu) {
     for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
       if (!(bits & (1u << i)))
@@ -1738,6 +1815,7 @@ int adamah_init_ex(uint64_t hot_bytes, uint64_t cold_bytes) {
   fusion.enabled = 0;
   fusion.scheduler_mode = FUSION_SCHEDULER_LEGACY;
   loc_alias_meta_reset_all();
+  decode_plan_reset_all();
   adamah_stats_reset();
 
   // Create instance
@@ -1801,9 +1879,16 @@ int adamah_init_ex(uint64_t hot_bytes, uint64_t cold_bytes) {
   vkGetPhysicalDeviceProperties(ctx.phys, &props);
   fprintf(stderr, "[ADAMAH] Selected: %s\n", props.deviceName);
   printf("ADAMAH v4: %s\n", props.deviceName);
-  is_integrated_gpu = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ? 1 : 0;
+  is_broadcom_v3d = device_is_broadcom_v3d(&props);
+  is_integrated_gpu =
+      (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) &&
+      !is_broadcom_v3d;
   if (is_integrated_gpu) {
     fprintf(stderr, "[ADAMAH] Integrated GPU detected — enabling unified memory optimizations\n");
+  } else if (is_broadcom_v3d) {
+    fprintf(stderr,
+            "[ADAMAH] Broadcom/V3D detected — keeping staging-based memory path "
+            "(zero-copy disabled)\n");
   }
   ctx.copy_align = props.limits.optimalBufferCopyOffsetAlignment;
   if (ctx.copy_align < 4)
@@ -1974,8 +2059,8 @@ int adamah_init_ex(uint64_t hot_bytes, uint64_t cold_bytes) {
   }
 
   // Scale staging pool with cache allocation; bounded to [16 MB, 512 MB].
-  // Integrated GPUs (RPi/Broadcom) get a much smaller staging pool since
-  // memory is unified and staging copies are cheaper (same physical RAM).
+  // Only zero-copy-safe integrated GPUs get the smaller staging pool.
+  // Broadcom V3D still uses the discrete-style staging path.
   {
     uint64_t staging_bytes;
     if (is_integrated_gpu) {
@@ -2035,6 +2120,8 @@ fail_cleanup:
   if (ctx.instance)
     vkDestroyInstance(ctx.instance, NULL);
   memset(&ctx, 0, sizeof(ctx));
+  is_integrated_gpu = 0;
+  is_broadcom_v3d = 0;
   return ADAMAH_ERR_MEMORY;
 }
 
@@ -2302,10 +2389,13 @@ void adamah_shutdown(void) {
     vkDestroyInstance(ctx.instance, NULL);
 
   memset(&ctx, 0, sizeof(ctx));
+  is_integrated_gpu = 0;
+  is_broadcom_v3d = 0;
   fusion_reset();
   fusion.enabled = 0;
   fusion.scheduler_mode = FUSION_SCHEDULER_LEGACY;
   loc_alias_meta_reset_all();
+  decode_plan_reset_all();
   adamah_stats_reset();
 }
 
@@ -8600,6 +8690,145 @@ int map_row_gather_xq8_dev(uint32_t map_act_id, uint32_t map_wt_id,
   cmd_barrier_after_dispatch();
   cmd_submit();
   return ADAMAH_OK;
+}
+
+static uint32_t decode_resolve_u32(uint32_t value, uint32_t pos,
+                                   uint32_t seq_len) {
+  if (value == ADAMAH_DECODE_RUNTIME_POS)
+    return pos;
+  if (value == ADAMAH_DECODE_RUNTIME_SEQ_LEN)
+    return seq_len;
+  return value;
+}
+
+static int decode_exec_op(const AdamahDecodePlanOp *op, uint32_t pos,
+                          uint32_t seq_len) {
+  if (!op)
+    return ADAMAH_ERR_INVALID;
+
+  uint32_t u0 = decode_resolve_u32(op->u0, pos, seq_len);
+  uint32_t u1 = decode_resolve_u32(op->u1, pos, seq_len);
+  uint32_t u2 = decode_resolve_u32(op->u2, pos, seq_len);
+  uint32_t u3 = decode_resolve_u32(op->u3, pos, seq_len);
+  uint32_t u4 = decode_resolve_u32(op->u4, pos, seq_len);
+  uint32_t u5 = decode_resolve_u32(op->u5, pos, seq_len);
+
+  switch (op->kind) {
+  case ADAMAH_DECODE_OP_NOP:
+    return ADAMAH_OK;
+  case ADAMAH_DECODE_OP_FUSION_FLUSH:
+    return adamah_fusion_flush();
+  case ADAMAH_DECODE_OP_FUSION_ENABLE:
+    adamah_fusion_enable((int)u0);
+    return ADAMAH_OK;
+  case ADAMAH_DECODE_OP_OP1:
+    return map_op1_dev(op->map_id, op->op_code, op->h0, op->h1, u0);
+  case ADAMAH_DECODE_OP_OP2:
+    return map_op2_dev(op->map_id, op->op_code, op->h0, op->h1, op->h2, u0);
+  case ADAMAH_DECODE_OP_RMSNORM:
+    return map_rmsnorm_dev(op->map_id, op->h0, op->h1, op->h2, u0, u1,
+                           op->f0);
+  case ADAMAH_DECODE_OP_RMSNORM_X:
+    return map_rmsnorm_x_dev(op->map_id, op->map_id2, op->h0, op->h1, op->h2,
+                             u0, u1, op->f0);
+  case ADAMAH_DECODE_OP_RMSNORM_ADD:
+    return map_rmsnorm_add_dev(op->map_id, op->h0, op->h1, op->h2, op->h3, u0,
+                               u1, op->f0);
+  case ADAMAH_DECODE_OP_ROPE:
+    return map_rope_dev(op->map_id, op->h0, op->h1, u0, u1, u2, u3, op->f0);
+  case ADAMAH_DECODE_OP_MATMUL_T:
+    return map_matmul_t_dev(op->map_id, op->h0, op->h1, op->h2, u0, u1, u2,
+                            u3);
+  case ADAMAH_DECODE_OP_MATMUL_T_X:
+    return map_matmul_t_x_dev(op->map_id, op->map_id2, op->h0, op->h1, op->h2,
+                              u0, u1, u2, u3);
+  case ADAMAH_DECODE_OP_MATMUL_X:
+    return map_matmul_x_dev(op->map_id, op->map_id2, op->h0, op->h1, op->h2,
+                            u0, u1, u2, u3);
+  case ADAMAH_DECODE_OP_MATMUL_T_XQ4:
+    return map_matmul_t_xq4_dev(op->map_id, op->map_id2, op->h0, op->h1,
+                                op->h2, u0, u1, u2, u3);
+  case ADAMAH_DECODE_OP_MATMUL_XQ4:
+    return map_matmul_xq4_dev(op->map_id, op->map_id2, op->h0, op->h1, op->h2,
+                              u0, u1, u2, u3);
+  case ADAMAH_DECODE_OP_MATMUL_T_XQ8:
+    return map_matmul_t_xq8_dev(op->map_id, op->map_id2, op->h0, op->h1,
+                                op->h2, u0, u1, u2, u3);
+  case ADAMAH_DECODE_OP_MATMUL_XQ8:
+    return map_matmul_xq8_dev(op->map_id, op->map_id2, op->h0, op->h1, op->h2,
+                              u0, u1, u2, u3);
+  case ADAMAH_DECODE_OP_QK_NORM_ROPE_X:
+    return map_qk_norm_rope_x_dev(op->map_id, op->map_id2, op->h0, op->h1,
+                                  op->h2, op->h3, op->h4, u0, u1, u2, u3, u4,
+                                  op->f0);
+  case ADAMAH_DECODE_OP_ROW_COPY_OFFSET:
+    return map_row_copy_offset_dev(op->map_id, op->h0, op->h1, u0, u1, u2);
+  case ADAMAH_DECODE_OP_ATTN_SOFTMAX_VALUE:
+    return map_attn_softmax_value_dev(op->map_id, op->h0, op->h1, op->h2, u0,
+                                      u1, u2, op->f0, op->f1);
+  default:
+    (void)u5;
+    return ADAMAH_ERR_INVALID;
+  }
+}
+
+int adamah_register_decode_plan(uint32_t plan_id,
+                                const AdamahDecodePlanOp *ops,
+                                uint32_t n_ops) {
+  if (plan_id >= ADAMAH_DECODE_MAX_PLANS)
+    return ADAMAH_ERR_INVALID;
+  if (n_ops > ADAMAH_DECODE_MAX_OPS)
+    return ADAMAH_ERR_INVALID;
+  if (n_ops > 0 && !ops)
+    return ADAMAH_ERR_INVALID;
+
+  AdamahDecodePlan *plan = &decode_plans[plan_id];
+  memset(plan, 0, sizeof(*plan));
+  if (n_ops > 0) {
+    memcpy(plan->ops, ops, sizeof(AdamahDecodePlanOp) * (size_t)n_ops);
+  }
+  plan->n_ops = n_ops;
+  plan->valid = 1;
+  return ADAMAH_OK;
+}
+
+void adamah_clear_decode_plan(uint32_t plan_id) {
+  if (plan_id >= ADAMAH_DECODE_MAX_PLANS)
+    return;
+  memset(&decode_plans[plan_id], 0, sizeof(decode_plans[plan_id]));
+}
+
+int adamah_decode_step(uint32_t plan_id, uint32_t pos, uint32_t seq_len) {
+  if (plan_id >= ADAMAH_DECODE_MAX_PLANS)
+    return ADAMAH_ERR_INVALID;
+
+  AdamahDecodePlan *plan = &decode_plans[plan_id];
+  if (!plan->valid)
+    return ADAMAH_ERR_NOT_FOUND;
+
+  int opened_batch = 0;
+  int ret = ADAMAH_OK;
+  if (!batch_mode) {
+    if (batch_submitted)
+      batch_wait();
+    if (fusion.enabled && fusion.n_ops > 0) {
+      ret = adamah_fusion_flush();
+      if (ret != ADAMAH_OK)
+        return ret;
+    }
+    batch_begin();
+    opened_batch = 1;
+  }
+
+  for (uint32_t i = 0; i < plan->n_ops; i++) {
+    ret = decode_exec_op(&plan->ops[i], pos, seq_len);
+    if (ret != ADAMAH_OK)
+      break;
+  }
+
+  if (opened_batch)
+    batch_end();
+  return ret;
 }
 
 // Query whether the GPU is integrated (unified memory, e.g. Raspberry Pi)

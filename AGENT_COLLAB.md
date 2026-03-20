@@ -93,7 +93,7 @@ stream_load root cause was GGUFLoader re-opening the USB file every iter_tensor_
 broadcom_v3dv: materialize() fills raw_blocks in RAM once at startup. Committed c88c158.
 Pi needs `git pull` + retest.
 
-### [CODEX] B6 — TODO (HIGH IMPACT: move forward-pass loop from Python to C)
+### [CODEX] B6 — IN PROGRESS (backend decode-plan scaffold landed)
 **Root cause of 7ms/token Python overhead**: engine.py Python loop calls ~300 ctypes functions
 per token (26 layers × ~11 ops/layer + LM head + sampling). Each ctypes hop = Python function
 call overhead + argument marshalling, regardless of GPU work. Measured: 7ms/token pure Python.
@@ -124,6 +124,11 @@ Constraints:
 Alternative (simpler): pre-record Vulkan secondary command buffer with push constants for pos.
 Replay via vkCmdExecuteCommands — zero CPU dispatch overhead, pos injected via push constants.
 This requires Vulkan 1.1+ and push constant support (RTX 3070: yes; V3D 6.x: check).
+
+Current Codex increment:
+- `adamah.c` now exposes `adamah_register_decode_plan()`, `adamah_clear_decode_plan()`, `adamah_decode_step()`.
+- Runtime placeholders for `pos` / `seq_len` are supported in the flat op list.
+- `adamah/__init__.py` exposes `DecodePlanOp` + wrapper helpers so Claude can wire real plans from `engine.py` without touching the backend ABI again.
 
 ---
 
@@ -157,6 +162,10 @@ This requires Vulkan 1.1+ and push constant support (RTX 3070: yes; V3D 6.x: che
 | 2026-03-21 | Claude | **Trace decode_tps=0.00 BUG**: trace summary dict missing 'decode_tps' key — displayed as 0.00 but actual tps is correct in Turn output. Minor display bug only. Fixed in diag_chat_perf.py. |
 | 2026-03-21 | Claude | **B3 DONE (no-op finding)**: Removed fusion_flush() after attn on desktop_discrete. 8 PASS, perf unchanged (50.3 tok/s). Root cause: fusion_enable(False) makes all fusion_flush() calls no-ops already — was never costing anything. |
 | 2026-03-21 | Claude | **CPU overhead analysis**: step_avg=19.9ms, core_batch=12.9ms → 7ms/token pure Python overhead (ctypes dispatch, 26-layer loop, staging). GPU exec is 12.9ms. To reach 100 tok/s (10ms/step) need BOTH: core_batch < 6ms AND Python overhead < 4ms. Next lever: Codex shader optimization OR reduce ctypes call count per token. |
+| 2026-03-21 | Codex | **A4 local guard landed**: `adamah.c` now excludes Broadcom/V3D from the integrated zero-copy path. Detection uses `vendorID/deviceName`, keeps `is_integrated_gpu=0` for V3D, and preserves the staging-based memory path instead of the unsafe HOST_VISIBLE+DEVICE_LOCAL preference. |
+| 2026-03-21 | Codex | **A4 desktop regression check**: rebuilt a test DLL (`adamah_test.dll`) and ran `diag_inference.py` on RTX 3070 with `ADAMAH_LIB_PATH` set to that DLL: 8 PASS, correct `2 + 2 = 4`, no desktop regression observed. Pi retest is still required to confirm the V3D MMU crash is gone on the real device. |
+| 2026-03-20 | Codex | **B6 scaffold landed**: added native decode-plan APIs (`adamah_register_decode_plan`, `adamah_clear_decode_plan`, `adamah_decode_step`) plus Python wrapper exposure (`DecodePlanOp`, `register_decode_plan`, `decode_step`). Runtime placeholders for `pos` / `seq_len` are resolved inside C. |
+| 2026-03-20 | Codex | **B6 verification**: rebuilt `adamah_test.dll`; a placeholder-backed decode plan matches the same direct primitive sequence 1:1 on RTX 3070, and `tests/diagnostics/diag_inference.py gemma3-1b.gguf` still returns 8 PASS with correct `2 + 2 = 4`. |
 
 ---
 
