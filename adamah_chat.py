@@ -520,7 +520,7 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
             "name": "broadcom_v3dv",
             "reserve_ratio": 0.15,
             "kv_cap_max": 256,
-            "stream_load": True,
+            "stream_load": False,
             "stream_chunk_mb": 256,
             "gpu_approx_rerank": cfg.n_vocab >= 131072,
             "gpu_approx_partial_k": 8,
