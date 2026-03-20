@@ -223,6 +223,66 @@ GPU_TELEMETRY_DEFAULTS: Dict[str, Any] = {
     "power_w_max": 0.0,
     "error": None,
 }
+_RUNTIME_OPTION_KEYS = (
+    "decode_path",
+    "stream_load",
+    "stream_chunk_mb",
+    "kv_cap",
+    "pool_hot_mb",
+    "pool_cold_mb",
+    "gpu_fused_rows_per_group",
+    "gpu_fused_topk",
+    "fusion_scheduler_mode",
+    "direct_kv_cache_write",
+    "experimental_qk_norm_rope",
+    "experimental_merged_qkv",
+    "experimental_fused_qkv_qk_norm_rope",
+    "experimental_merged_gateup",
+    "experimental_attn_softmax_value",
+    "experimental_rmsnorm_add",
+    "gpu_approx_rerank",
+    "gpu_approx_partial_k",
+    "trace_decode",
+)
+_RUNTIME_ENGINE_ATTRS = {
+    "decode_path": "_decode_path",
+    "stream_load": "_stream_load",
+    "stream_chunk_mb": "_stream_chunk_mb",
+    "kv_cap": "_kv_cap",
+    "gpu_fused_rows_per_group": "_gpu_fused_rows_per_group",
+    "gpu_fused_topk": "_gpu_fused_topk",
+    "fusion_scheduler_mode": "_fusion_scheduler_mode",
+    "direct_kv_cache_write": "_direct_kv_cache_write",
+    "experimental_qk_norm_rope": "_experimental_qk_norm_rope",
+    "experimental_merged_qkv": "_experimental_merged_qkv",
+    "experimental_fused_qkv_qk_norm_rope": "_experimental_fused_qkv_qk_norm_rope",
+    "experimental_merged_gateup": "_experimental_merged_gateup",
+    "experimental_attn_softmax_value": "_experimental_attn_softmax_value",
+    "experimental_rmsnorm_add": "_experimental_rmsnorm_add",
+    "gpu_approx_rerank": "_gpu_approx_rerank",
+    "gpu_approx_partial_k": "_gpu_approx_partial_k",
+}
+_ARG_INT_STARTUP_KEYS = (
+    "stream_chunk_mb",
+    "kv_cap",
+    "pool_hot_mb",
+    "pool_cold_mb",
+    "gpu_fused_rows_per_group",
+)
+_ARG_SWITCH_STARTUP_KEYS = (
+    "stream_load",
+    "gpu_fused_topk",
+    "direct_kv_cache_write",
+    "experimental_qk_norm_rope",
+    "experimental_merged_qkv",
+    "experimental_fused_qkv_qk_norm_rope",
+    "experimental_merged_gateup",
+    "experimental_attn_softmax_value",
+    "experimental_rmsnorm_add",
+)
+_ARG_STRING_STARTUP_KEYS = (
+    "fusion_scheduler_mode",
+)
 
 
 def _empty_trace_summary() -> Dict[str, Any]:
@@ -235,6 +295,25 @@ def _empty_chat_turn_metrics() -> Dict[str, Any]:
 
 def _empty_gpu_telemetry() -> Dict[str, Any]:
     return dict(GPU_TELEMETRY_DEFAULTS)
+
+
+def _runtime_option_defaults() -> Dict[str, Any]:
+    return {key: None for key in _RUNTIME_OPTION_KEYS}
+
+
+def _first_record_value(source: List[Dict[str, Any]], key: str) -> Any:
+    for record in source:
+        value = record.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value:
+            continue
+        return value
+    return None
+
+
+def _cli_flag_name(key: str) -> str:
+    return "--" + str(key).replace("_", "-")
 
 
 def _default_experiment_name(args: argparse.Namespace) -> str:
@@ -700,25 +779,7 @@ def _error_record(backend: str, error: str) -> Dict[str, Any]:
         "total_s": 0.0,
         "sampling_mode": None,
         "runtime_profile": None,
-        "decode_path": None,
-        "stream_load": None,
-        "stream_chunk_mb": None,
-        "kv_cap": None,
-        "pool_hot_mb": None,
-        "pool_cold_mb": None,
-        "gpu_fused_rows_per_group": None,
-        "gpu_fused_topk": None,
-        "fusion_scheduler_mode": None,
-        "direct_kv_cache_write": None,
-        "experimental_qk_norm_rope": None,
-        "experimental_merged_qkv": None,
-        "experimental_fused_qkv_qk_norm_rope": None,
-        "experimental_merged_gateup": None,
-        "experimental_attn_softmax_value": None,
-        "experimental_rmsnorm_add": None,
-        "gpu_approx_rerank": None,
-        "gpu_approx_partial_k": None,
-        "trace_decode": None,
+        **_runtime_option_defaults(),
         "trace_summary": _empty_trace_summary(),
         "gpu_telemetry": _empty_gpu_telemetry(),
         "prompt_render_ms": None,
@@ -799,6 +860,9 @@ def summarize_records(backend: str, records: List[Dict[str, Any]]) -> Dict[str, 
         if breakdown:
             descriptor_cache_breakdown = breakdown
             break
+    runtime_summary = {
+        key: _first_record_value(source, key) for key in _RUNTIME_OPTION_KEYS
+    }
     return {
         "backend": backend,
         "status": "ok" if valid else ("short_run" if short else ("error" if errors else "skipped")),
@@ -816,64 +880,7 @@ def summarize_records(backend: str, records: List[Dict[str, Any]]) -> Dict[str, 
         "n_gen": _median([float(_safe_int(r.get("n_gen"))) for r in source]),
         "sampling_mode": next((r.get("sampling_mode") for r in source if r.get("sampling_mode")), None),
         "runtime_profile": next((r.get("runtime_profile") for r in source if r.get("runtime_profile")), None),
-        "decode_path": next((r.get("decode_path") for r in source if r.get("decode_path")), None),
-        "stream_load": next((r.get("stream_load") for r in source if r.get("stream_load") is not None), None),
-        "stream_chunk_mb": next((r.get("stream_chunk_mb") for r in source if r.get("stream_chunk_mb") is not None), None),
-        "kv_cap": next((r.get("kv_cap") for r in source if r.get("kv_cap") is not None), None),
-        "pool_hot_mb": next((r.get("pool_hot_mb") for r in source if r.get("pool_hot_mb") is not None), None),
-        "pool_cold_mb": next((r.get("pool_cold_mb") for r in source if r.get("pool_cold_mb") is not None), None),
-        "gpu_fused_rows_per_group": next(
-            (r.get("gpu_fused_rows_per_group") for r in source if r.get("gpu_fused_rows_per_group") is not None),
-            None,
-        ),
-        "gpu_fused_topk": next((r.get("gpu_fused_topk") for r in source if r.get("gpu_fused_topk") is not None), None),
-        "fusion_scheduler_mode": next(
-            (r.get("fusion_scheduler_mode") for r in source if r.get("fusion_scheduler_mode")),
-            None,
-        ),
-        "direct_kv_cache_write": next(
-            (r.get("direct_kv_cache_write") for r in source if r.get("direct_kv_cache_write") is not None),
-            None,
-        ),
-        "experimental_qk_norm_rope": next(
-            (r.get("experimental_qk_norm_rope") for r in source if r.get("experimental_qk_norm_rope") is not None),
-            None,
-        ),
-        "experimental_merged_qkv": next(
-            (r.get("experimental_merged_qkv") for r in source if r.get("experimental_merged_qkv") is not None),
-            None,
-        ),
-        "experimental_fused_qkv_qk_norm_rope": next(
-            (
-                r.get("experimental_fused_qkv_qk_norm_rope")
-                for r in source if r.get("experimental_fused_qkv_qk_norm_rope") is not None
-            ),
-            None,
-        ),
-        "experimental_merged_gateup": next(
-            (r.get("experimental_merged_gateup") for r in source if r.get("experimental_merged_gateup") is not None),
-            None,
-        ),
-        "experimental_attn_softmax_value": next(
-            (
-                r.get("experimental_attn_softmax_value")
-                for r in source if r.get("experimental_attn_softmax_value") is not None
-            ),
-            None,
-        ),
-        "experimental_rmsnorm_add": next(
-            (r.get("experimental_rmsnorm_add") for r in source if r.get("experimental_rmsnorm_add") is not None),
-            None,
-        ),
-        "gpu_approx_rerank": next(
-            (r.get("gpu_approx_rerank") for r in source if r.get("gpu_approx_rerank") is not None),
-            None,
-        ),
-        "gpu_approx_partial_k": next(
-            (r.get("gpu_approx_partial_k") for r in source if r.get("gpu_approx_partial_k") is not None),
-            None,
-        ),
-        "trace_decode": next((r.get("trace_decode") for r in source if r.get("trace_decode") is not None), None),
+        **runtime_summary,
         "prompt_render_ms": _median([
             _safe_float(r.get("prompt_render_ms")) for r in source if r.get("prompt_render_ms") is not None
         ]),
@@ -1181,48 +1188,20 @@ def append_experiment_log(path: str, entry: Dict[str, Any]) -> None:
 def _collect_runtime_knobs(engine: Any, trace_decode: bool) -> Dict[str, Any]:
     runtime_plan = dict(getattr(engine, "_runtime_plan", {}) or {})
     pool_plan = dict(runtime_plan.get("pool_plan", {}) or {})
-    return {
+    knobs = {
+        key: runtime_plan.get(key, getattr(engine, attr_name, None))
+        for key, attr_name in _RUNTIME_ENGINE_ATTRS.items()
+    }
+    knobs.update({
         "decode_path": runtime_plan.get("decode_path", getattr(engine, "_decode_path", None)),
         "stream_load": runtime_plan.get("stream_load", getattr(engine, "_stream_load", None)),
         "stream_chunk_mb": runtime_plan.get("stream_chunk_mb", getattr(engine, "_stream_chunk_mb", None)),
         "kv_cap": runtime_plan.get("kv_cap", getattr(engine, "_kv_cap", None)),
         "pool_hot_mb": pool_plan.get("hot_mb", getattr(engine, "_pool_hot_mb", None)),
         "pool_cold_mb": pool_plan.get("cold_mb", getattr(engine, "_pool_cold_mb", None)),
-        "gpu_fused_rows_per_group": runtime_plan.get(
-            "gpu_fused_rows_per_group", getattr(engine, "_gpu_fused_rows_per_group", None)
-        ),
-        "gpu_fused_topk": runtime_plan.get("gpu_fused_topk", getattr(engine, "_gpu_fused_topk", None)),
-        "fusion_scheduler_mode": runtime_plan.get(
-            "fusion_scheduler_mode", getattr(engine, "_fusion_scheduler_mode", None)
-        ),
-        "direct_kv_cache_write": runtime_plan.get(
-            "direct_kv_cache_write", getattr(engine, "_direct_kv_cache_write", None)
-        ),
-        "experimental_qk_norm_rope": runtime_plan.get(
-            "experimental_qk_norm_rope", getattr(engine, "_experimental_qk_norm_rope", None)
-        ),
-        "experimental_merged_qkv": runtime_plan.get(
-            "experimental_merged_qkv", getattr(engine, "_experimental_merged_qkv", None)
-        ),
-        "experimental_fused_qkv_qk_norm_rope": runtime_plan.get(
-            "experimental_fused_qkv_qk_norm_rope",
-            getattr(engine, "_experimental_fused_qkv_qk_norm_rope", None),
-        ),
-        "experimental_merged_gateup": runtime_plan.get(
-            "experimental_merged_gateup", getattr(engine, "_experimental_merged_gateup", None)
-        ),
-        "experimental_attn_softmax_value": runtime_plan.get(
-            "experimental_attn_softmax_value", getattr(engine, "_experimental_attn_softmax_value", None)
-        ),
-        "experimental_rmsnorm_add": runtime_plan.get(
-            "experimental_rmsnorm_add", getattr(engine, "_experimental_rmsnorm_add", None)
-        ),
-        "gpu_approx_rerank": runtime_plan.get("gpu_approx_rerank", getattr(engine, "_gpu_approx_rerank", None)),
-        "gpu_approx_partial_k": runtime_plan.get(
-            "gpu_approx_partial_k", getattr(engine, "_gpu_approx_partial_k", None)
-        ),
         "trace_decode": bool(trace_decode),
-    }
+    })
+    return knobs
 
 
 def _build_adam_startup(args: argparse.Namespace, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1234,38 +1213,18 @@ def _build_adam_startup(args: argparse.Namespace, extra: Optional[Dict[str, Any]
     }
     if args.profile:
         startup["runtime_profile"] = args.profile
-    if getattr(args, "stream_load", None) is not None:
-        startup["stream_load"] = (args.stream_load == "on")
-    if getattr(args, "stream_chunk_mb", None) is not None:
-        startup["stream_chunk_mb"] = int(args.stream_chunk_mb)
-    if getattr(args, "kv_cap", None) is not None:
-        startup["kv_cap"] = int(args.kv_cap)
-    if getattr(args, "pool_hot_mb", None) is not None:
-        startup["pool_hot_mb"] = int(args.pool_hot_mb)
-    if getattr(args, "pool_cold_mb", None) is not None:
-        startup["pool_cold_mb"] = int(args.pool_cold_mb)
-    if getattr(args, "gpu_fused_rows_per_group", None) is not None:
-        startup["gpu_fused_rows_per_group"] = int(args.gpu_fused_rows_per_group)
-    if getattr(args, "gpu_fused_topk", None) is not None:
-        startup["gpu_fused_topk"] = (args.gpu_fused_topk == "on")
-    if getattr(args, "fusion_scheduler_mode", None):
-        startup["fusion_scheduler_mode"] = str(args.fusion_scheduler_mode)
-    if getattr(args, "direct_kv_cache_write", None) is not None:
-        startup["direct_kv_cache_write"] = (args.direct_kv_cache_write == "on")
-    if getattr(args, "experimental_qk_norm_rope", None) is not None:
-        startup["experimental_qk_norm_rope"] = (args.experimental_qk_norm_rope == "on")
-    if getattr(args, "experimental_merged_qkv", None) is not None:
-        startup["experimental_merged_qkv"] = (args.experimental_merged_qkv == "on")
-    if getattr(args, "experimental_fused_qkv_qk_norm_rope", None) is not None:
-        startup["experimental_fused_qkv_qk_norm_rope"] = (
-            args.experimental_fused_qkv_qk_norm_rope == "on"
-        )
-    if getattr(args, "experimental_merged_gateup", None) is not None:
-        startup["experimental_merged_gateup"] = (args.experimental_merged_gateup == "on")
-    if getattr(args, "experimental_attn_softmax_value", None) is not None:
-        startup["experimental_attn_softmax_value"] = (args.experimental_attn_softmax_value == "on")
-    if getattr(args, "experimental_rmsnorm_add", None) is not None:
-        startup["experimental_rmsnorm_add"] = (args.experimental_rmsnorm_add == "on")
+    for key in _ARG_INT_STARTUP_KEYS:
+        value = getattr(args, key, None)
+        if value is not None:
+            startup[key] = int(value)
+    for key in _ARG_SWITCH_STARTUP_KEYS:
+        value = getattr(args, key, None)
+        if value is not None:
+            startup[key] = (value == "on")
+    for key in _ARG_STRING_STARTUP_KEYS:
+        value = getattr(args, key, None)
+        if value:
+            startup[key] = str(value)
     if extra:
         startup.update({key: value for key, value in extra.items() if value is not None})
     return startup
@@ -1793,10 +1752,8 @@ def _gpu_telemetry_line(gpu_telemetry: Dict[str, Any]) -> str:
 
 def _fixed_pool_pair(profile: Optional[str]) -> Dict[str, int]:
     name = (profile or "").strip().lower()
-    if name.startswith("broadcom") or name == "unified_small_gpu":
+    if name.startswith("broadcom"):
         return {"pool_hot_mb": 64, "pool_cold_mb": 32}
-    if name == "nvidia_discrete":
-        return {"pool_hot_mb": 768, "pool_cold_mb": 1536}
     return {"pool_hot_mb": 512, "pool_cold_mb": 1024}
 
 
@@ -1864,42 +1821,15 @@ def _print_sweep_summary(sweep_results: List[Dict[str, Any]]) -> None:
 
 def _apply_case_args(base_cmd: List[str], startup: Dict[str, Any]) -> List[str]:
     cmd = list(base_cmd)
-    if startup.get("stream_load") is not None:
-        cmd.extend(["--stream-load", "on" if startup.get("stream_load") else "off"])
-    if startup.get("stream_chunk_mb") is not None:
-        cmd.extend(["--stream-chunk-mb", str(int(startup["stream_chunk_mb"]))])
-    if startup.get("kv_cap") is not None:
-        cmd.extend(["--kv-cap", str(int(startup["kv_cap"]))])
-    if startup.get("pool_hot_mb") is not None:
-        cmd.extend(["--pool-hot-mb", str(int(startup["pool_hot_mb"]))])
-    if startup.get("pool_cold_mb") is not None:
-        cmd.extend(["--pool-cold-mb", str(int(startup["pool_cold_mb"]))])
-    if startup.get("gpu_fused_rows_per_group") is not None:
-        cmd.extend(["--gpu-fused-rows-per-group", str(int(startup["gpu_fused_rows_per_group"]))])
-    if startup.get("gpu_fused_topk") is not None:
-        cmd.extend(["--gpu-fused-topk", "on" if startup.get("gpu_fused_topk") else "off"])
-    if startup.get("fusion_scheduler_mode"):
-        cmd.extend(["--fusion-scheduler-mode", str(startup["fusion_scheduler_mode"])])
-    if startup.get("direct_kv_cache_write") is not None:
-        cmd.extend(["--direct-kv-cache-write", "on" if startup.get("direct_kv_cache_write") else "off"])
-    if startup.get("experimental_qk_norm_rope") is not None:
-        cmd.extend(["--experimental-qk-norm-rope", "on" if startup.get("experimental_qk_norm_rope") else "off"])
-    if startup.get("experimental_merged_qkv") is not None:
-        cmd.extend(["--experimental-merged-qkv", "on" if startup.get("experimental_merged_qkv") else "off"])
-    if startup.get("experimental_fused_qkv_qk_norm_rope") is not None:
-        cmd.extend([
-            "--experimental-fused-qkv-qk-norm-rope",
-            "on" if startup.get("experimental_fused_qkv_qk_norm_rope") else "off",
-        ])
-    if startup.get("experimental_merged_gateup") is not None:
-        cmd.extend(["--experimental-merged-gateup", "on" if startup.get("experimental_merged_gateup") else "off"])
-    if startup.get("experimental_attn_softmax_value") is not None:
-        cmd.extend([
-            "--experimental-attn-softmax-value",
-            "on" if startup.get("experimental_attn_softmax_value") else "off",
-        ])
-    if startup.get("experimental_rmsnorm_add") is not None:
-        cmd.extend(["--experimental-rmsnorm-add", "on" if startup.get("experimental_rmsnorm_add") else "off"])
+    for key in _ARG_SWITCH_STARTUP_KEYS:
+        if startup.get(key) is not None:
+            cmd.extend([_cli_flag_name(key), "on" if startup.get(key) else "off"])
+    for key in _ARG_INT_STARTUP_KEYS:
+        if startup.get(key) is not None:
+            cmd.extend([_cli_flag_name(key), str(int(startup[key]))])
+    for key in _ARG_STRING_STARTUP_KEYS:
+        if startup.get(key):
+            cmd.extend([_cli_flag_name(key), str(startup[key])])
     return cmd
 
 

@@ -266,6 +266,7 @@ class ADAMEngine:
         self._gpu_tied_lm_head = bool(kw.get('gpu_tied_lm_head', True))
         self._gpu_approx_rerank = bool(kw.get('gpu_approx_rerank', False))
         self._gpu_fused_topk = bool(kw.get('gpu_fused_topk', True))
+        self._direct_kv_cache_write = bool(kw.get('direct_kv_cache_write', False))
         self._gpu_approx_partial_k = max(
             1, min(self.SAMPLE_TOPK_MAX,
                    int(kw.get('gpu_approx_partial_k', self.SAMPLE_TOPK_MAX))))
@@ -856,11 +857,14 @@ class ADAMEngine:
         # Merged Q+K rope handles (valid when head_dim == head_dim_kv and Q,K are contiguous)
         if c.head_dim == c.head_dim_kv:
             qk_locs = np.arange(pos_q, pos_q + q_dim + k_dim, dtype=np.uint32)
+            self._qk_ws_out_h, _ = g.upload_dev(qk_locs.copy())
             self._qk_rope_src_h, _ = g.upload_dev(qk_locs.copy())
             self._qk_rope_out_h, _ = g.upload_dev(qk_locs.copy())
+            self._register_loc_span(self._qk_ws_out_h, 0, pos_q, q_dim + k_dim)
             self._register_loc_span(self._qk_rope_src_h, 0, pos_q, q_dim + k_dim)
             self._register_loc_span(self._qk_rope_out_h, 0, pos_q, q_dim + k_dim)
         else:
+            self._qk_ws_out_h = None
             self._qk_rope_src_h = None
 
         # --- Merged QKV workspace output handle (q/k/v slots are contiguous) ---
@@ -880,6 +884,11 @@ class ADAMEngine:
         pos_v = self._ws_slots['v'][2]
         self._v_src_base_h, _ = g.upload_dev(np.array([pos_v], dtype=np.uint32))
         self._register_loc_span(self._v_src_base_h, 0, pos_v, 1)
+        # Direct KV projection reuses the same normalized hidden row for each KV
+        # head; keep a small handle ready instead of rebuilding it every token.
+        kv_src_locs = np.full(max(1, c.n_head_kv), self._ws_slots['normed'][2], dtype=np.uint32)
+        self._kv_proj_src_h, _ = g.upload_dev(kv_src_locs)
+        self._register_loc_span(self._kv_proj_src_h, 0, self._ws_slots['normed'][2], c.n_embd)
 
         # --- KV cache: per-head-contiguous layout ---
         # Each KV head g of layer L occupies kv_cap * head_dim_kv elements:
@@ -887,6 +896,7 @@ class ADAMEngine:
         #   V: kc_v_base[L] + g * kv_cap * head_dim_kv
         # Align start to head_dim_kv so dst_loc = element_off / head_dim_kv is integer.
         kv_step = kv_cap * c.head_dim_kv        # elements per KV head
+        self._kv_step = kv_step
         kv_per_layer = 2 * c.n_head_kv * kv_step
         if pos % c.head_dim_kv != 0:
             pos += c.head_dim_kv - (pos % c.head_dim_kv)
@@ -926,6 +936,10 @@ class ADAMEngine:
                                dtype=np.uint32)
             hk, _ = g.upload_dev(k_locs); hv, _ = g.upload_dev(v_locs)
             self._kc_k_locs_h.append(hk); self._kc_v_locs_h.append(hv)
+            # The attention read handles contain repeated GQA groups, but the
+            # alias model only needs the covered KV-head regions.
+            self._register_row_base_span(hk, 0, kb, c.n_head_kv, kv_step, kv_step)
+            self._register_row_base_span(hv, 0, vb, c.n_head_kv, kv_step, kv_step)
 
         # locs_c for weighted sum output (fixed)
         pos_ao = self._ws_slots['attn_out'][2]
@@ -946,6 +960,23 @@ class ADAMEngine:
                 kv_spec[base + 3] = self._kc_v_row_base[L][gi]
             hk, _ = g.upload_dev(kv_spec)
             self._kc_kv_copy_h.append(hk)
+
+        # Direct-V writes target one token slot per KV head. The handle contents
+        # move every token, but the per-head stride stays fixed.
+        self._kv_head_offsets = (
+            np.arange(c.n_head_kv, dtype=np.uint32) * np.uint32(kv_step)
+        )
+        self._kc_v_write_arr = []
+        self._kc_v_write_h = []
+        self._kc_v_write_pos = [-1] * c.n_layer
+        for L in range(c.n_layer):
+            v_write = (self._kc_v_base[L] + self._kv_head_offsets).astype(np.uint32)
+            hv, _ = g.upload_dev(v_write)
+            self._kc_v_write_arr.append(v_write)
+            self._kc_v_write_h.append(hv)
+            self._register_row_base_span(
+                hv, 0, self._kc_v_base[L], c.n_head_kv, kv_step, c.head_dim_kv
+            )
 
         # --- Pre-allocated gather/scatter locs ---
         self._hid_locs = np.arange(self._ws_slots['hidden'][2],
@@ -1085,8 +1116,13 @@ class ADAMEngine:
 
         self._qkv_merged_layers = set()
         self._wh_qkv_wt = {}; self._qkv_map_id = {}
+        self._qk_merged_layers = set()
+        self._wh_qk_wt = {}; self._qk_map_id = {}
         self._gateup_merged_layers = set()
         self._wh_gateup_wt = {}; self._gateup_map_id = {}
+        self._wh_v_heads = {}
+        self._v_head_map_id = {}
+        self._v_head_kind = {}
         for L in range(c.n_layer):
             p = f'blk.{L}'
             qn = f'{p}.attn_q.weight'; kn = f'{p}.attn_k.weight'; vn = f'{p}.attn_v.weight'
@@ -1094,6 +1130,19 @@ class ADAMEngine:
             if r:
                 self._qkv_merged_layers.add(L)
                 self._wh_qkv_wt[L], self._qkv_map_id[L] = r
+            r = _detect_merge([qn, kn])
+            if r:
+                self._qk_merged_layers.add(L)
+                self._wh_qk_wt[L], self._qk_map_id[L] = r
+            if vn in self._wh and not self._trans.get(vn, False):
+                head_span = c.head_dim_kv * c.n_embd
+                v_head_locs = (
+                    np.uint32(self._off[vn]) +
+                    np.arange(c.n_head_kv, dtype=np.uint32) * np.uint32(head_span)
+                )
+                self._wh_v_heads[L], _ = self.gpu.upload_dev(v_head_locs)
+                self._v_head_map_id[L] = self.tensor_map_id[vn]
+                self._v_head_kind[L] = self._weight_kind(vn)
             gn = f'{p}.ffn_gate.weight'; un = f'{p}.ffn_up.weight'
             r = _detect_merge([gn, un])
             if r:
@@ -1249,9 +1298,23 @@ class ADAMEngine:
     def _effective_gpu_fused_rows_per_group(self, cfg) -> int:
         del cfg
         base = max(1, int(self._gpu_fused_rows_per_group))
+        is_broadcom = bool(
+            getattr(
+                self,
+                '_is_broadcom',
+                str(getattr(self, '_runtime_profile', '')).startswith('broadcom_v3dv'),
+            )
+        )
+        is_integrated = bool(
+            getattr(
+                self,
+                '_is_integrated',
+                getattr(getattr(self, 'gpu', None), '_is_integrated_gpu', False),
+            )
+        )
         # On Broadcom, use even larger groups for greedy (top_k=1) to minimize
-        # dispatch count — the LM head dominates decode time on low-end GPUs.
-        if (self._is_broadcom or self._is_integrated) and base < 2048:
+        # dispatch count - the LM head dominates decode time on low-end GPUs.
+        if (is_broadcom or is_integrated) and base < 2048:
             return max(base, 1024)
         return base
 
@@ -1621,6 +1684,34 @@ class ADAMEngine:
             else:
                 g.map_matmul_t_x_dev(ws_id, wt_map_id, in_h, wt_handle, out_h, M, K, N)
 
+    def _gpu_proj_heads_direct(self, src_h, wt_handle, wt_map_id, weight_kind, dst_h, K, N, n_ops):
+        g = self.gpu
+        ws_id = self.ws_map_id
+        if wt_map_id == ws_id:
+            g.map_matmul_t_dev(ws_id, src_h, wt_handle, dst_h, 1, K, N, n_ops)
+        elif weight_kind == 'q8':
+            g.map_matmul_t_xq8_dev(ws_id, wt_map_id, src_h, wt_handle, dst_h, 1, K, N, n_ops)
+        elif weight_kind == 'q4':
+            g.map_matmul_t_xq4_dev(ws_id, wt_map_id, src_h, wt_handle, dst_h, 1, K, N, n_ops)
+        else:
+            g.map_matmul_t_x_dev(ws_id, wt_map_id, src_h, wt_handle, dst_h, 1, K, N, n_ops)
+
+    def _prepare_direct_v_write(self, layer_idx: int, pos: int):
+        if self._kc_v_write_pos[layer_idx] == pos:
+            return
+        base = np.uint32(self._kc_v_base[layer_idx] + pos * self.cfg.head_dim_kv)
+        np.add(base, self._kv_head_offsets, out=self._kc_v_write_arr[layer_idx])
+        self.gpu.upload_dev(self._kc_v_write_arr[layer_idx], handle=self._kc_v_write_h[layer_idx])
+        self._register_row_base_span(
+            self._kc_v_write_h[layer_idx],
+            0,
+            int(base),
+            self.cfg.n_head_kv,
+            self._kv_step,
+            self.cfg.head_dim_kv,
+        )
+        self._kc_v_write_pos[layer_idx] = pos
+
     def _prepare_gpu_embed_token(self, tok: int):
         name = self._gpu_token_embd_name
         if name is None:
@@ -1764,7 +1855,9 @@ class ADAMEngine:
             q_name = f'{p}.attn_q.weight'
             k_name = f'{p}.attn_k.weight'
             v_name = f'{p}.attn_v.weight'
-            if alias_fast and L in self._qkv_merged_layers:
+            direct_kv = self._direct_kv_cache_write and L in self._wh_v_heads
+            direct_v_queued = False
+            if alias_fast and L in self._qkv_merged_layers and not direct_kv:
                 self._gpu_proj_merged(
                     normed_h,
                     self._wh_qkv_wt[L],
@@ -1776,10 +1869,54 @@ class ADAMEngine:
                     c.n_embd,
                     q_dim + k_dim + k_dim,
                 )
+            elif alias_fast and direct_kv and self._qk_ws_out_h is not None and L in self._qk_merged_layers:
+                self._gpu_proj_merged(
+                    normed_h,
+                    self._wh_qk_wt[L],
+                    self._qk_map_id[L],
+                    self._weight_kind(q_name),
+                    self._trans[q_name],
+                    self._qk_ws_out_h,
+                    1,
+                    c.n_embd,
+                    q_dim + k_dim,
+                )
+                self._prepare_direct_v_write(L, pos)
+                if self._fusion_scheduler_mode == 'alias_safe':
+                    self._gpu_proj_heads_direct(
+                        self._kv_proj_src_h,
+                        self._wh_v_heads[L],
+                        self._v_head_map_id[L],
+                        self._v_head_kind[L],
+                        self._kc_v_write_h[L],
+                        c.n_embd,
+                        c.head_dim_kv,
+                        c.n_head_kv,
+                    )
+                    direct_v_queued = True
             else:
                 self._gpu_proj(normed_h, q_name, q_h, 1, c.n_embd, q_dim)
                 self._gpu_proj(normed_h, k_name, k_h, 1, c.n_embd, k_dim)
-                self._gpu_proj(normed_h, v_name, v_h, 1, c.n_embd, k_dim)
+                if direct_kv:
+                    self._prepare_direct_v_write(L, pos)
+                    # In alias_safe we can keep this queued and let the
+                    # upcoming K row_copy flush materialize it. Level-batched
+                    # still cannot prove the normed_h alias, so execute it
+                    # after the row_copy boundary below.
+                    if self._fusion_scheduler_mode == 'alias_safe':
+                        self._gpu_proj_heads_direct(
+                            self._kv_proj_src_h,
+                            self._wh_v_heads[L],
+                            self._v_head_map_id[L],
+                            self._v_head_kind[L],
+                            self._kc_v_write_h[L],
+                            c.n_embd,
+                            c.head_dim_kv,
+                            c.n_head_kv,
+                        )
+                        direct_v_queued = True
+                else:
+                    self._gpu_proj(normed_h, v_name, v_h, 1, c.n_embd, k_dim)
             if te: self.timing['qkv'] += time.perf_counter() - t0
 
             # ---- QK Norm (Gemma 3 only): out-of-place (in-place silently fails in batch) ----
@@ -1787,17 +1924,40 @@ class ADAMEngine:
             qnn = f'{p}.attn_q_norm.weight'
             if qnn in self._wh:
                 knn = f'{p}.attn_k_norm.weight'
-                # Keep the Q/K temp views immediate and ordered until the alias
-                # model proves this subgraph safe end-to-end.
-                g.fusion_flush()
-                with g.fusion_disabled():
-                    self._gpu_rmsnorm(self._ws_rms_q_h, qnn, self._ws_rms_q_dst_h,
-                                      c.n_head, c.head_dim, c.norm_eps)
-                    self._gpu_rmsnorm(self._ws_rms_k_h, knn, self._ws_rms_k_dst_h,
-                                      c.n_head_kv, c.head_dim_kv, c.norm_eps)
-                    freq = c.rope_base_global if gl else c.rope_base_local
-                    g.map_rope_dev(ws_id, normed_h, q_h, 1, c.n_head, c.head_dim, pos, freq)
-                    g.map_rope_dev(ws_id, n2_h, k_h, 1, c.n_head_kv, c.head_dim_kv, pos, freq)
+                freq = c.rope_base_global if gl else c.rope_base_local
+                fused_qk_norm_rope = (
+                    self._qk_rope_out_h is not None
+                    and self.tensor_map_id[qnn] == self.tensor_map_id[knn]
+                )
+                if fused_qk_norm_rope:
+                    g.map_qk_norm_rope_x_dev(
+                        ws_id,
+                        self.tensor_map_id[qnn],
+                        self._ws_rms_q_h,
+                        self._wh[qnn],
+                        self._ws_rms_k_h,
+                        self._wh[knn],
+                        self._qk_rope_out_h,
+                        c.n_head,
+                        c.head_dim,
+                        c.n_head_kv,
+                        c.head_dim_kv,
+                        pos,
+                        freq,
+                    )
+                else:
+                    # Keep the Q/K temp views immediate and ordered until the
+                    # alias model proves the unfused subgraph safe end-to-end.
+                    g.fusion_flush()
+                    with g.fusion_disabled():
+                        self._gpu_rmsnorm(self._ws_rms_q_h, qnn, self._ws_rms_q_dst_h,
+                                          c.n_head, c.head_dim, c.norm_eps)
+                        self._gpu_rmsnorm(self._ws_rms_k_h, knn, self._ws_rms_k_dst_h,
+                                          c.n_head_kv, c.head_dim_kv, c.norm_eps)
+                        g.map_rope_dev(ws_id, self._ws_rms_q_dst_h, q_h,
+                                       1, c.n_head, c.head_dim, pos, freq)
+                        g.map_rope_dev(ws_id, self._ws_rms_k_dst_h, k_h,
+                                       1, c.n_head_kv, c.head_dim_kv, pos, freq)
             else:
                 freq = c.rope_base_global if gl else c.rope_base_local
                 g.map_rope_dev(ws_id, self._q_rope_src_h, q_h, 1, c.n_head, c.head_dim, pos, freq)
@@ -1815,9 +1975,21 @@ class ADAMEngine:
                 self._kc_kv_copy_h[L],
                 self._k_src_base_h,
                 pos,
-                2 * c.n_head_kv,
+                c.n_head_kv if direct_kv else 2 * c.n_head_kv,
                 c.head_dim_kv,
             )
+            if direct_kv and not direct_v_queued:
+                with g.fusion_disabled():
+                    self._gpu_proj_heads_direct(
+                        self._kv_proj_src_h,
+                        self._wh_v_heads[L],
+                        self._v_head_map_id[L],
+                        self._v_head_kind[L],
+                        self._kc_v_write_h[L],
+                        c.n_embd,
+                        c.head_dim_kv,
+                        c.n_head_kv,
+                    )
 
             # ---- Attention ----
             if te: t0 = time.perf_counter()
@@ -1840,25 +2012,17 @@ class ADAMEngine:
 
 
                 # row INDICES [0..n_head-1] — NOT element positions [h*seq_len].
-                g.map_attn_softmax_abs_dev(
+                g.map_attn_softmax_value_dev(
                     ws_id,
                     self._scores_row_h,
-                    self._scores_row_h,
-                    seq_len,
+                    self._kc_v_locs_h[L],
+                    self._ao_locs_h,
                     c.n_head,
+                    seq_len,
+                    c.head_dim_kv,
                     float(1.0 / np.sqrt(c.head_dim)),
                     float(c.attn_softcap),
                 )
-
-                # attn_out[h, d] = sum_t attn[h,t] * V_cache_{h//gs}[t, d]
-                # locs_a[h] = fixed score row base for head h
-                # locs_b[h] = kc_v_base[L] + (h//gs)*kv_step
-                # locs_c[h] = pos_ao + h*head_dim_kv  (fixed)
-                g.map_matmul_dev(ws_id,
-                                 self._scores_row_h,
-                                 self._kc_v_locs_h[L],
-                                 self._ao_locs_h,
-                                 1, seq_len, c.head_dim_kv, c.n_head)
                 # `attn_out` is produced through row-base handles but consumed as a
                 # contiguous slot by `o_proj`; keep that ordered for now.
                 # On Broadcom, the level-batched scheduler with barrier coalescing
@@ -1874,9 +2038,8 @@ class ADAMEngine:
 
             pan = f'{p}.post_attention_norm.weight'
             if pan in self._wh:
-                # Out-of-place: normed_h slot is free after QKV projections+RoPE.
-                self._gpu_rmsnorm(op_h, pan, normed_h, 1, c.n_embd, c.norm_eps)
-                g.map_op2_dev(ws_id, self.A.OP_ADD, hid_h, normed_h, hid_h, c.n_embd)
+                g.map_rmsnorm_add_dev(ws_id, op_h, self._wh[pan], hid_h, hid_h,
+                                      1, c.n_embd, c.norm_eps)
             else:
                 g.map_op2_dev(ws_id, self.A.OP_ADD, hid_h, op_h, hid_h, c.n_embd)
             if te: self.timing['attn_out'] += time.perf_counter() - t0
@@ -1908,9 +2071,8 @@ class ADAMEngine:
 
             pfn = f'{p}.post_ffw_norm.weight'
             if pfn in self._wh:
-                # Out-of-place: n2_h ('normed2') slot is free after FFW projections.
-                self._gpu_rmsnorm(ffn_h, pfn, n2_h, 1, c.n_embd, c.norm_eps)
-                g.map_op2_dev(ws_id, self.A.OP_ADD, hid_h, n2_h, hid_h, c.n_embd)
+                g.map_rmsnorm_add_dev(ws_id, ffn_h, self._wh[pfn], hid_h, hid_h,
+                                      1, c.n_embd, c.norm_eps)
             else:
                 g.map_op2_dev(ws_id, self.A.OP_ADD, hid_h, ffn_h, hid_h, c.n_embd)
             if te: self.timing['ffn'] += time.perf_counter() - t0

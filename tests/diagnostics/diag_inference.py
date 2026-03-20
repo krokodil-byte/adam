@@ -27,6 +27,7 @@ from adam.paths import ROOT, setup; setup()
 from adam.loaders.gguf import GGUFLoader
 from adam.tokenizers.gguf_tok import GGUFTokenizer
 from adam.models.engine import ADAMEngine, ModelConfig, GenerationConfig
+from adamah_chat import prepare_chat_prompt
 import adamah as A
 
 PASS = "\033[32mPASS\033[0m"
@@ -62,6 +63,36 @@ def _should_stream_loader() -> bool:
     except Exception:
         device = {}
     return bool(device.get("is_unified_memory")) or _is_broadcom_like_profile()
+
+
+def _token_vocab(tokenizer):
+    vocab = getattr(tokenizer, "_vocab", None)
+    return vocab if vocab else None
+
+
+def _token_str(tokenizer, tid, limit=None):
+    vocab = _token_vocab(tokenizer)
+    if vocab and 0 <= tid < len(vocab):
+        text = vocab[tid]
+        return text[:limit] if limit is not None else text
+    return f"<id={tid}>"
+
+
+def _encode_chat_prompt(prompt: str, cfg, tokenizer):
+    template_text, add_bos = prepare_chat_prompt(
+        prompt, cfg.arch, tokenizer, chat_template=getattr(cfg, "chat_template", None)
+    )
+    tokens = tokenizer.encode(template_text, add_bos=add_bos)
+    return template_text, add_bos, tokens
+
+
+def _chat_eos_ids(tokenizer):
+    eos_ids = {int(tokenizer.eos_id)}
+    for tok_str, tok_id in getattr(tokenizer, "_specials", {}).items():
+        lowered = str(tok_str).lower()
+        if "end" in lowered or "eot" in lowered:
+            eos_ids.add(int(tok_id))
+    return eos_ids
 
 # ── Model path ───────────────────────────────────────────────────────────────
 def find_model(argv):
@@ -211,21 +242,15 @@ def check_scale(engine, cfg, gpu):
 # ── CHECK 2: Tokenizer ────────────────────────────────────────────────────────
 def check_tokenizer(tokenizer, cfg):
     print(f"\n{BOLD}=== Check 2: Tokenizer (chat template) ==={RST}")
-    from adamah_chat import prepare_chat_prompt
-
-    template_text, add_bos = prepare_chat_prompt(
-        "Hello", cfg.arch, tokenizer, chat_template=getattr(cfg, "chat_template", None)
-    )
-    ids = tokenizer.encode(template_text, add_bos=add_bos)
+    template_text, add_bos, ids = _encode_chat_prompt("Hello", cfg, tokenizer)
 
     print(f"  Template: {template_text!r}")
     print(f"  Token sequence ({len(ids)} tokens):")
 
-    vocab = tokenizer._vocab if hasattr(tokenizer, '_vocab') and tokenizer._vocab else None
     problems = []
     prev_str = ""
     for i, tid in enumerate(ids):
-        tok_str = vocab[tid] if vocab and 0 <= tid < len(vocab) else f"<id={tid}>"
+        tok_str = _token_str(tokenizer, tid)
         marker = ""
         if tok_str == '▁' and prev_str and '<end_of_turn>' in prev_str:
             marker = f"  ← {WARN} spurious ▁ (Bug 2: add_space_prefix not honored)"
@@ -252,12 +277,11 @@ def check_forward(engine, tokenizer, cfg, gpu):
     print(f"  _forward took {dt:.2f}s")
 
     top10 = np.argsort(logits)[-10:][::-1]
-    vocab = tokenizer._vocab if hasattr(tokenizer, '_vocab') and tokenizer._vocab else None
     print("  Top-10 predictions after BOS:")
 
     unused_count = 0
     for rank, tid in enumerate(top10):
-        tok_str = vocab[tid] if vocab and 0 <= tid < len(vocab) else f"<id={tid}>"
+        tok_str = _token_str(tokenizer, tid)
         is_unused = '<unused' in tok_str
         if is_unused:
             unused_count += 1
@@ -284,13 +308,9 @@ def check_forward(engine, tokenizer, cfg, gpu):
 # ── CHECK 4: Brief generation ─────────────────────────────────────────────────
 def check_topk_sampling(engine, tokenizer, cfg):
     print(f"\n{BOLD}=== Check 4b: GPU top-k shortlist ==={RST}")
-    from adamah_chat import prepare_chat_prompt
 
     prompt = "Say hello in one short sentence."
-    template_text, add_bos = prepare_chat_prompt(
-        prompt, cfg.arch, tokenizer, chat_template=getattr(cfg, "chat_template", None)
-    )
-    tokens = tokenizer.encode(template_text, add_bos=add_bos)
+    _template_text, _add_bos, tokens = _encode_chat_prompt(prompt, cfg, tokenizer)
 
     sample_cfg = GenerationConfig(
         max_tokens=1,
@@ -313,13 +333,10 @@ def check_topk_sampling(engine, tokenizer, cfg):
     np.random.seed(sample_cfg.seed)
     gpu_tok = engine._sample_gpu_topk(sample_cfg, list(tokens))
 
-    vocab = tokenizer._vocab if hasattr(tokenizer, '_vocab') and tokenizer._vocab else None
-    def ts(tid): return vocab[tid] if vocab and 0 <= tid < len(vocab) else f"<id={tid}>"
-
     can_gpu_topk = engine._can_gpu_topk_sample(sample_cfg)
     print(f"  GPU top-k available: {can_gpu_topk}")
-    print(f"  CPU sample token: {cpu_tok}  {ts(cpu_tok)!r}")
-    print(f"  GPU sample token: {gpu_tok}  {ts(gpu_tok)!r}")
+    print(f"  CPU sample token: {cpu_tok}  {_token_str(tokenizer, cpu_tok)!r}")
+    print(f"  GPU sample token: {gpu_tok}  {_token_str(tokenizer, gpu_tok)!r}")
 
     ok = can_gpu_topk and cpu_tok == gpu_tok
     print("  " + (PASS + " GPU shortlist matches CPU sampling"
@@ -328,28 +345,19 @@ def check_topk_sampling(engine, tokenizer, cfg):
 
 def check_generation(engine, tokenizer, cfg, n_tokens=8):
     print(f"\n{BOLD}=== Check 4: Greedy generation ({n_tokens} tokens) ==={RST}")
-    from adamah_chat import prepare_chat_prompt
-
     prompt = "What is 2 + 2?"
-    template_text, add_bos = prepare_chat_prompt(
-        prompt, cfg.arch, tokenizer, chat_template=getattr(cfg, "chat_template", None)
-    )
-    tokens = tokenizer.encode(template_text, add_bos=add_bos)
+    _template_text, _add_bos, tokens = _encode_chat_prompt(prompt, cfg, tokenizer)
 
     print(f"  Prompt: {prompt!r}  ({len(tokens)} input tokens)")
 
-    eos_ids = {tokenizer.eos_id}
-    for tok_str, tok_id in tokenizer._specials.items():
-        if 'end' in tok_str.lower() or 'eot' in tok_str.lower():
-            eos_ids.add(tok_id)
+    eos_ids = _chat_eos_ids(tokenizer)
     gen_cfg = GenerationConfig(max_tokens=n_tokens, temperature=0.0, top_k=1,
                                repeat_penalty=1.0, seed=0,
-                               eos_token_ids=tuple(eos_ids))
+                               eos_token_ids=tuple(sorted(eos_ids)))
     # Prefill: run every token through the model.
     # Print top-5 logits and hidden state norm at pos 0, 1, 2, and final pos.
     # A healthy model should predict sensible tokens, not all <unused> at max logit.
     engine.reset()
-    vocab = tokenizer._vocab if hasattr(tokenizer, '_vocab') and tokenizer._vocab else None
     hid_locs = np.arange(engine._ws_slots['hidden'][2],
                          engine._ws_slots['hidden'][2] + cfg.n_embd, dtype=np.uint32)
     # Norm diagnostics for Gemma3 internal weights
@@ -375,7 +383,7 @@ def check_generation(engine, tokenizer, cfg, n_tokens=8):
         logits_b = engine._forward(tokenizer.bos_id, 1)  # pos=1
         hid_b = engine.gpu.gather(engine.ws_map_id, hid_locs).view(np.float32)
         top1 = int(np.argmax(logits_b))
-        tn = vocab[top1] if vocab and 0 <= top1 < len(vocab) else f"<id={top1}>"
+        tn = _token_str(tokenizer, top1)
         print(f"    n_layers={n_layers:2d}: |hid|={np.linalg.norm(hid_b):.2f}  "
               f"top1={tn!r}={logits_b[top1]:.2f}")
     engine.cfg.n_layer = true_n_layer
@@ -383,14 +391,13 @@ def check_generation(engine, tokenizer, cfg, n_tokens=8):
     print("  Per-token logit scan:")
     for i, t in enumerate(tokens):
         logits_pre = engine._forward(t, i)
-        tok_str = vocab[t] if vocab and 0 <= t < len(vocab) else f"<id={t}>"
+        tok_str = _token_str(tokenizer, t)
         # Gather hidden state for norm (outside batch is OK — engine already ended batch)
         hid = engine.gpu.gather(engine.ws_map_id, hid_locs).view(np.float32)
         hid_norm = float(np.linalg.norm(hid))
         top5 = np.argsort(logits_pre)[-5:][::-1]
         top5_str = ", ".join(
-            f"{vocab[tid]!r}={logits_pre[tid]:.1f}" if vocab and 0 <= tid < len(vocab)
-            else f"<id={tid}>={logits_pre[tid]:.1f}"
+            f"{_token_str(tokenizer, tid)!r}={logits_pre[tid]:.1f}"
             for tid in top5
         )
         lo, hi = logits_pre.min(), logits_pre.max()
@@ -419,7 +426,7 @@ def check_generation(engine, tokenizer, cfg, n_tokens=8):
 
     unused_count = sum(
         1 for t in out_tokens
-        if vocab and 0 <= t < len(vocab) and '<unused' in vocab[t]
+        if '<unused' in _token_str(tokenizer, t)
     )
     same_as_cpu = (ref_decoded is None or decoded.rstrip() == ref_decoded.rstrip())
     used_gpu_greedy = stats.get('sampling_mode') in {
@@ -450,7 +457,6 @@ def check_cpu_reference(engine, tokenizer, cfg):
 
     c = cfg
     tensors = engine.tensors   # float32 dequantised by GGUF loader
-    gemma_norm = c.arch.startswith('gemma')
     eps = c.norm_eps
     gs = max(1, c.n_head // c.n_head_kv)  # GQA group size
 
@@ -616,8 +622,7 @@ def check_cpu_reference(engine, tokenizer, cfg):
     std  = float(max(np.std(cpu_logits), 1e-8))
     rel  = rmse / std
 
-    vocab = tokenizer._vocab if hasattr(tokenizer, '_vocab') and tokenizer._vocab else None
-    def tok_str(tid): return vocab[tid] if vocab and 0 <= tid < len(vocab) else f"<id={tid}>"
+    def tok_str(tid): return _token_str(tokenizer, tid)
 
     gpu_top1 = int(np.argmax(gpu_logits))
     cpu_top1 = int(np.argmax(cpu_logits))
@@ -655,7 +660,6 @@ def check_multilayer_cpu(engine, tokenizer, cfg):
 
     c = cfg
     tensors = engine.tensors
-    gemma_norm = c.arch.startswith('gemma')
     eps = c.norm_eps
     gs = max(1, c.n_head // c.n_head_kv)
 
@@ -694,9 +698,7 @@ def check_multilayer_cpu(engine, tokenizer, cfg):
     print(f"  {'n':>4}  {'|hid|_gpu':>12}  {'|hid|_cpu':>12}  {'ratio':>7}  "
           f"{'gpu_top1':>12}  {'cpu_top1':>12}  status")
     prev_n = 0
-    vocab = tokenizer._vocab if hasattr(tokenizer, '_vocab') and tokenizer._vocab else None
-    def ts(tid): return (vocab[tid][:10] if vocab and 0 <= tid < len(vocab)
-                         else f"<{tid}>")
+    def ts(tid): return _token_str(tokenizer, tid, limit=10)
     for n in test_layers:
         # ---- CPU: advance from prev_n to n ----
         for L in range(prev_n, n):
@@ -796,11 +798,10 @@ def check_cpu_generation(engine, tokenizer, cfg, n_tokens=8):
     double Q4 quantisation (GGUF Q4_K → f32 → engine Q4 re-quantisation).
     """
     print(f"\n{BOLD}=== Check 7: CPU F32 autoregressive generation ==={RST}")
-    from adamah_chat import prepare_chat_prompt
     import time as _time
 
     c = cfg; tensors = engine.tensors
-    gemma_norm = c.arch.startswith('gemma'); eps = c.norm_eps
+    eps = c.norm_eps
     gs = max(1, c.n_head // c.n_head_kv)
 
     def norm_w(name):
@@ -910,19 +911,12 @@ def check_cpu_generation(engine, tokenizer, cfg, n_tokens=8):
         return logits
 
     prompt = "What is 2 + 2?"
-    template_text, add_bos = prepare_chat_prompt(
-        prompt, c.arch, tokenizer, chat_template=getattr(c, "chat_template", None)
-    )
-    tokens = tokenizer.encode(template_text, add_bos=add_bos)
+    _template_text, _add_bos, tokens = _encode_chat_prompt(prompt, c, tokenizer)
     print(f"  Prompt: {prompt!r}  ({len(tokens)} tokens)")
 
-    vocab = tokenizer._vocab if hasattr(tokenizer, '_vocab') and tokenizer._vocab else None
-    def ts(tid): return vocab[tid] if vocab and 0 <= tid < len(vocab) else f"<id={tid}>"
+    def ts(tid): return _token_str(tokenizer, tid)
 
-    eos_ids = {tokenizer.eos_id}
-    for tok_str, tok_id in tokenizer._specials.items():
-        if 'end' in tok_str.lower() or 'eot' in tok_str.lower():
-            eos_ids.add(tok_id)
+    eos_ids = _chat_eos_ids(tokenizer)
 
     t0 = _time.perf_counter()
     logits = None
