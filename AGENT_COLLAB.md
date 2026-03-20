@@ -95,6 +95,11 @@ Shader WG tuning for V3D 6.x if GPU confirmed working but slow.
 | 2026-03-21 | Claude | **B2 recheck**: direct_kv_cache_write=True passes all 8 checks and same perf (~52 tok/s). Restored to True (matches Codex's intent and test expectations). |
 | 2026-03-21 | Claude | **Test fix**: test_chat_prompting.py updated: rows_per_group assertion 1024→512. |
 | 2026-03-21 | Claude | **desktop_discrete final state**: fusion_scheduler_mode=legacy, direct_kv=True, rows=512, fused_qkv_qk_norm_rope=True (dead flag). 8 PASS, ~52 tok/s on diag_chat_perf. |
+| 2026-03-21 | Codex | **B5 answer baseline**: RTX 3070 with `fusion_scheduler_mode=legacy`, `direct_kv_cache_write=True`, `experimental_fused_qkv_qk_norm_rope=False`, `gpu_fused_rows_per_group=512` passes `diag_inference.py` (8 PASS, correct `2 + 2 = 4`). |
+| 2026-03-21 | Codex | **B5 answer**: switching only `fusion_scheduler_mode` to `level_batched` on RTX 3070 makes `diag_inference.py` fail (`5_cpu_ref`, `6_multilayer`, `4b_topk`, `4_generation`). Conclusion: `level_batched` is not safe on desktop discrete today, even with `direct_kv=True` and fused-qkv-qk-norm-rope forced off. |
+| 2026-03-21 | Codex | **Backend root cause for B5**: `level_batched` skipped alias-overlap tracking in `fusion_calc_level_handles()`, and `adamah_fusion_flush()` emitted no final barrier after the last fused level when flushing inside an already-open batch. This left immediate sampling ops able to see stale data. |
+| 2026-03-21 | Codex | **Backend fix candidate**: patched `adamah.c` so `level_batched` reuses alias-overlap checks and inserts a final barrier when flushing inside an active batch. Validated via test-only DLL (`ADAMAH_LIB_PATH=.../adamah_test.dll`): `diag_inference.py` now returns 8 PASS with `fusion_scheduler_mode=level_batched`, `direct_kv=True`, `experimental_fused_qkv_qk_norm_rope=False`, `rows=512`. |
+| 2026-03-21 | Codex | **Patched perf check** (`adamah_test.dll`, RTX 3070, `diag_chat_perf.py`, Turn 2 decode): `legacy` = 35.1 tok/s, `core_batch=20.1ms`; `level_batched` = 39.4 tok/s, `core_batch=17.8ms` (~12% faster). Not yet promoted to the default DLL because `adamah_opt.dll` was locked during rebuild. |
 
 ---
 
