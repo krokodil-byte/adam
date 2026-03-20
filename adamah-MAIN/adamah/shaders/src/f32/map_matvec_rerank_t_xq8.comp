@@ -28,7 +28,7 @@ shared float partial[128];
 float load_q8(uint idx) {
     uint word_idx = idx / 4u;
     uint sub_idx  = idx % 4u;
-    uint raw_uint = (map_wt[word_idx] >> (sub_idx * 8u)) & 0xFFu;
+    uint raw_uint = bitfieldExtract(map_wt[word_idx], int(sub_idx * 8u), 8);
     uint group = idx / pc.group_size;
     return float(raw_uint) * qparams[group * 2u] + qparams[group * 2u + 1u];
 }

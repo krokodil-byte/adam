@@ -152,7 +152,8 @@ def _sync_root_shader_copies(pkg_dir: Path) -> None:
 
 def _write_shader_header(pkg_dir: Path) -> Path:
     shader_hdr = pkg_dir / "_shader_path.h"
-    shader_hdr.write_text(f'#define SHADER_PATH "{pkg_dir / "shaders"}"\n', encoding="utf-8")
+    shader_path = (pkg_dir / "shaders").as_posix()
+    shader_hdr.write_text(f'#define SHADER_PATH "{shader_path}"\n', encoding="utf-8")
     return shader_hdr
 
 

@@ -30,6 +30,16 @@ void main() {
         case 17u: r=atan(a,b); break;
         case 18u: r=step(a,b); break;
         case 19u: r=smoothstep(a,b,0.5); break;
+        case 34u: {
+            float gelu = 0.5 * a * (1.0 + tanh(0.797884583 * (a + 0.0447149985 * a * a * a)));
+            r = gelu * b;
+            break;
+        }
+        case 35u: {
+            float silu = a / (1.0 + exp(-a));
+            r = silu * b;
+            break;
+        }
         default: r=a; break;
     }
     map_data[locs_dst[li]*pc.pack_size+ei] = r;

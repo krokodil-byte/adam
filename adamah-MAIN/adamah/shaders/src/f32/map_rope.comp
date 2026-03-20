@@ -26,9 +26,8 @@ void main() {
     float cos_a = cos(angle);
     float sin_a = sin(angle);
 
-    uint stride = pc.n_heads * pc.head_dim;
-    uint base_src = locs_src[token] * stride + head * pc.head_dim;
-    uint base_dst = locs_dst[token] * stride + head * pc.head_dim;
+    uint base_src = locs_src[token] + head * pc.head_dim;
+    uint base_dst = locs_dst[token] + head * pc.head_dim;
 
     float x0 = map_data[base_src + d];
     float x1 = map_data[base_src + d + half_dim];

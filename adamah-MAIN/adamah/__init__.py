@@ -571,6 +571,11 @@ class Adamah:
                                                        ctypes.c_uint32, ctypes.c_uint32,
                                                        ctypes.c_float, ctypes.c_float]
         self._lib.map_attn_softmax_abs_dev.restype = ctypes.c_int
+        self._lib.map_attn_softmax_value_dev.argtypes = [
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_float, ctypes.c_float]
+        self._lib.map_attn_softmax_value_dev.restype = ctypes.c_int
         self._lib.map_layernorm_dev.argtypes = [ctypes.c_uint32,
                                                 ctypes.c_uint32, ctypes.c_uint32,
                                                 ctypes.c_uint32, ctypes.c_uint32,
@@ -687,6 +692,12 @@ class Adamah:
                                               ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
                                               ctypes.c_uint32, ctypes.c_uint32, ctypes.c_float]
         self._lib.map_rmsnorm_dev.restype = ctypes.c_int
+        self._lib.map_rmsnorm_add_dev.argtypes = [ctypes.c_uint32,
+                                                  ctypes.c_uint32, ctypes.c_uint32,
+                                                  ctypes.c_uint32, ctypes.c_uint32,
+                                                  ctypes.c_uint32, ctypes.c_uint32,
+                                                  ctypes.c_float]
+        self._lib.map_rmsnorm_add_dev.restype = ctypes.c_int
         self._lib.map_rope_dev.argtypes = [ctypes.c_uint32,
                                            ctypes.c_uint32, ctypes.c_uint32,
                                            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
@@ -732,6 +743,16 @@ class Adamah:
                                                  ctypes.c_uint32, ctypes.c_uint32,
                                                  ctypes.c_uint32, ctypes.c_float]
         self._lib.map_rmsnorm_x_dev.restype = ctypes.c_int
+        self._lib.map_qk_norm_rope_x_dev.argtypes = [
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_float,
+        ]
+        self._lib.map_qk_norm_rope_x_dev.restype = ctypes.c_int
 
         # Sync for async tickets
         self._lib.adamah_synchronize.argtypes = [ctypes.c_uint64]
@@ -1274,6 +1295,26 @@ class Adamah:
         if ret != 0:
             raise RuntimeError(f"map_attn_softmax_abs_dev failed with code {ret}")
 
+    def map_attn_softmax_value_dev(self, map_id: int, locs_scores_handle: int,
+                                   locs_values_handle: int, locs_out_handle: int,
+                                   n_ops: int, row_size: int, value_dim: int,
+                                   scale: float, cap: float):
+        """Fused softmax(scores) @ value rows into attention output rows."""
+        self._metrics['op_calls'] += 1
+        ret = self._lib.map_attn_softmax_value_dev(
+            ctypes.c_uint32(map_id),
+            ctypes.c_uint32(locs_scores_handle),
+            ctypes.c_uint32(locs_values_handle),
+            ctypes.c_uint32(locs_out_handle),
+            ctypes.c_uint32(n_ops),
+            ctypes.c_uint32(row_size),
+            ctypes.c_uint32(value_dim),
+            ctypes.c_float(scale),
+            ctypes.c_float(cap),
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_attn_softmax_value_dev failed with code {ret}")
+
     def map_layernorm(self, map_id: int, locs_src: np.ndarray, locs_dst: np.ndarray,
                       locs_gamma: np.ndarray, locs_beta: np.ndarray,
                       dim: int, eps: float = 1e-5, n_rows: Optional[int] = None):
@@ -1577,6 +1618,52 @@ class Adamah:
         )
         if ret != 0:
             raise RuntimeError(f"map_fma_dev failed with code {ret}")
+
+    def map_rmsnorm_add_dev(self, map_id: int, locs_src_handle: int,
+                            locs_wt_handle: int, locs_resid_handle: int,
+                            locs_dst_handle: int, n_rows: int,
+                            dim: int, eps: float = 1e-5):
+        """RMSNorm followed by residual add: dst = rmsnorm(src, wt) + resid."""
+        self._metrics['op_calls'] += 1
+        ret = self._lib.map_rmsnorm_add_dev(
+            ctypes.c_uint32(map_id),
+            ctypes.c_uint32(locs_src_handle),
+            ctypes.c_uint32(locs_wt_handle),
+            ctypes.c_uint32(locs_resid_handle),
+            ctypes.c_uint32(locs_dst_handle),
+            ctypes.c_uint32(n_rows),
+            ctypes.c_uint32(dim),
+            ctypes.c_float(eps),
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_rmsnorm_add_dev failed with code {ret}")
+
+    def map_qk_norm_rope_x_dev(self, map_act_id: int, map_wt_id: int,
+                               locs_q_src_handle: int, locs_q_wt_handle: int,
+                               locs_k_src_handle: int, locs_k_wt_handle: int,
+                               locs_qk_dst_handle: int, q_rows: int,
+                               q_dim: int, k_rows: int, k_dim: int,
+                               pos_offset: int,
+                               freq_base: float):
+        """Fused cross-map Q/K RMSNorm + RoPE into a contiguous q+k output span."""
+        self._metrics['op_calls'] += 1
+        ret = self._lib.map_qk_norm_rope_x_dev(
+            ctypes.c_uint32(map_act_id),
+            ctypes.c_uint32(map_wt_id),
+            ctypes.c_uint32(locs_q_src_handle),
+            ctypes.c_uint32(locs_q_wt_handle),
+            ctypes.c_uint32(locs_k_src_handle),
+            ctypes.c_uint32(locs_k_wt_handle),
+            ctypes.c_uint32(locs_qk_dst_handle),
+            ctypes.c_uint32(q_rows),
+            ctypes.c_uint32(q_dim),
+            ctypes.c_uint32(k_rows),
+            ctypes.c_uint32(k_dim),
+            ctypes.c_uint32(pos_offset),
+            ctypes.c_float(freq_base),
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_qk_norm_rope_x_dev failed with code {ret}")
 
     def map_broadcast(self, map_id: int, op: int, locs_src: np.ndarray, locs_scalar: np.ndarray,
                       locs_dst: np.ndarray, n: Optional[int] = None):

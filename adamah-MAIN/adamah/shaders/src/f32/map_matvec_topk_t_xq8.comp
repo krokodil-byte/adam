@@ -47,16 +47,16 @@ shared uint  top_idxs[TOPK_MAX];
 // Packed Q8 load: decode 4 bytes from one uint
 float dot_q8_4(uint word_addr, float scale, float zp, uint tile_off) {
     uint packed = map_wt[word_addr];
-    return a_tile[tile_off + 0u] * (float((packed      ) & 0xFFu) * scale + zp)
-         + a_tile[tile_off + 1u] * (float((packed >>  8u) & 0xFFu) * scale + zp)
-         + a_tile[tile_off + 2u] * (float((packed >> 16u) & 0xFFu) * scale + zp)
-         + a_tile[tile_off + 3u] * (float((packed >> 24u)        ) * scale + zp);
+    return a_tile[tile_off + 0u] * (float(bitfieldExtract(packed,  0, 8)) * scale + zp)
+         + a_tile[tile_off + 1u] * (float(bitfieldExtract(packed,  8, 8)) * scale + zp)
+         + a_tile[tile_off + 2u] * (float(bitfieldExtract(packed, 16, 8)) * scale + zp)
+         + a_tile[tile_off + 3u] * (float(bitfieldExtract(packed, 24, 8)) * scale + zp);
 }
 
 float load_q8(uint idx) {
     uint word_idx = idx / 4u;
     uint sub_idx  = idx % 4u;
-    uint raw_uint = (map_wt[word_idx] >> (sub_idx * 8u)) & 0xFFu;
+    uint raw_uint = bitfieldExtract(map_wt[word_idx], int(sub_idx * 8u), 8);
     uint group = idx / pc.group_size;
     return float(raw_uint) * qparams[group * 2u] + qparams[group * 2u + 1u];
 }

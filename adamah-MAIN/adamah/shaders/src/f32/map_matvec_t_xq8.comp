@@ -38,16 +38,16 @@ void load_q8_4(uint word_addr, float scale, float zp, inout float acc0,
                inout float acc1, inout float acc2, inout float acc3,
                uint tile_off) {
     uint packed = map_wt[word_addr];
-    acc0 += a_tile[tile_off + 0u] * (float((packed      ) & 0xFFu) * scale + zp);
-    acc1 += a_tile[tile_off + 1u] * (float((packed >>  8u) & 0xFFu) * scale + zp);
-    acc2 += a_tile[tile_off + 2u] * (float((packed >> 16u) & 0xFFu) * scale + zp);
-    acc3 += a_tile[tile_off + 3u] * (float((packed >> 24u)        ) * scale + zp);
+    acc0 += a_tile[tile_off + 0u] * (float(bitfieldExtract(packed,  0, 8)) * scale + zp);
+    acc1 += a_tile[tile_off + 1u] * (float(bitfieldExtract(packed,  8, 8)) * scale + zp);
+    acc2 += a_tile[tile_off + 2u] * (float(bitfieldExtract(packed, 16, 8)) * scale + zp);
+    acc3 += a_tile[tile_off + 3u] * (float(bitfieldExtract(packed, 24, 8)) * scale + zp);
 }
 
 float load_q8(uint idx) {
     uint word_idx = idx / 4u;
     uint sub_idx  = idx % 4u;
-    uint raw_uint = (map_wt[word_idx] >> (sub_idx * 8u)) & 0xFFu;
+    uint raw_uint = bitfieldExtract(map_wt[word_idx], int(sub_idx * 8u), 8);
     uint group = idx / pc.group_size;
     return float(raw_uint) * qparams[group * 2u] + qparams[group * 2u + 1u];
 }
