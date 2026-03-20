@@ -42,7 +42,6 @@ def main(argv=None):
     args = parse_args(argv)
     startup: dict = {
         "runtime_profile": args.profile,
-        "stream_load": False,
         "stream_chunk_mb": 64,
         "kv_cap": int(args.kv_cap),
         "gpu_fused_topk": True,
