@@ -73,19 +73,19 @@ If wrong: recompile. Check SPV count.
 Check Vulkan validation env vars on Pi 5 (`VK_INSTANCE_LAYERS`, etc.).
 Validation layer = 100× slowdown.
 
-### [CODEX] A3 — BLOCKED (needs A4 first)
+### [CODEX] A3 — BLOCKED (awaiting Pi retest of A4 fix)
 Shader WG tuning for V3D 6.x if GPU confirmed working but slow.
 `map_matvec_t_xq8.comp` BROADCOM_V3DV_BALANCED: WG=64 already, check TILE_K.
 (GPU IS working — bottleneck is USB I/O, not shaders. Fix A4 first.)
 
-### [CODEX] A4 — TODO (URGENT: Pi V3D MMU crash)
+### [CODEX] A4 — RESOLVED IN CODE (Pi retest pending)
 The new adamah.so (207KB, level_batched fix) crashes Pi 5 V3D with:
 `v3d MMU error from client PTB (1) at 0x7c6e4b00, pte invalid`
 Root cause: "Integrated GPU detected — enabling unified memory optimizations" code path
 is incompatible with V3D memory model (PTB = Primitive Tile Binner, GPU-side address).
-Fix: guard the unified memory optimization block so it does NOT activate on V3D.
-V3D uses HOST_COHERENT staging (slower, not HOST_CACHED), so "zero-copy" path is unsafe.
-Test: rebuild adamah.so on Pi, verify no MMU error, re-run diag_inference.py.
+Implemented: the unified-memory optimization block is now guarded so it does NOT activate on V3D.
+V3D stays on the staging-based path instead of the unsafe zero-copy preference.
+Remaining validation: rebuild `adamah.so` on Pi, verify no MMU error, re-run `diag_inference.py`.
 
 ### [CODEX] A5 — RESOLVED by Claude
 stream_load root cause was GGUFLoader re-opening the USB file every iter_tensor_chunks call
@@ -93,7 +93,7 @@ stream_load root cause was GGUFLoader re-opening the USB file every iter_tensor_
 broadcom_v3dv: materialize() fills raw_blocks in RAM once at startup. Committed c88c158.
 Pi needs `git pull` + retest.
 
-### [CODEX] B6 — IN PROGRESS (backend decode-plan scaffold landed)
+### [CODEX+CLAUDE] B6 — DONE (decode-plan scaffold + engine wiring complete)
 **Root cause of 7ms/token Python overhead**: engine.py Python loop calls ~300 ctypes functions
 per token (26 layers × ~11 ops/layer + LM head + sampling). Each ctypes hop = Python function
 call overhead + argument marshalling, regardless of GPU work. Measured: 7ms/token pure Python.
@@ -166,6 +166,30 @@ Current Codex increment:
 | 2026-03-21 | Codex | **A4 desktop regression check**: rebuilt a test DLL (`adamah_test.dll`) and ran `diag_inference.py` on RTX 3070 with `ADAMAH_LIB_PATH` set to that DLL: 8 PASS, correct `2 + 2 = 4`, no desktop regression observed. Pi retest is still required to confirm the V3D MMU crash is gone on the real device. |
 | 2026-03-20 | Codex | **B6 scaffold landed**: added native decode-plan APIs (`adamah_register_decode_plan`, `adamah_clear_decode_plan`, `adamah_decode_step`) plus Python wrapper exposure (`DecodePlanOp`, `register_decode_plan`, `decode_step`). Runtime placeholders for `pos` / `seq_len` are resolved inside C. |
 | 2026-03-20 | Codex | **B6 verification**: rebuilt `adamah_test.dll`; a placeholder-backed decode plan matches the same direct primitive sequence 1:1 on RTX 3070, and `tests/diagnostics/diag_inference.py gemma3-1b.gguf` still returns 8 PASS with correct `2 + 2 = 4`. |
+| 2026-03-20 | Claude | **B6 DONE** (engine.py wiring, commit b24db6d): `_build_decode_plan()` emits 417 ops (26 layers × 16 + 1 final norm). Uses DECODE_RUNTIME_POS/SEQ_LEN for pos/seq_len. decode_step called inside open batch (C sees batch_mode=1, skips own batch). Fallback: te=True (trace), cpu_attn_fallback, n_layer override. 8/8 diag_inference PASS. Perf: ~53 tok/s (was 52). |
+| 2026-03-20 | Claude | **B6 overhead analysis**: Python ctypes overhead without timing = ~2ms/token (NOT 7ms — 7ms was trace-mode timer overhead from te=True adding 300+ perf_counter calls). GPU exec = ~18.5ms (forward 18.5ms + sampling 0.4ms). B6 saves ~1.5ms Python overhead → +1 tok/s gain. GPU is the real bottleneck at 18.5ms/token. To reach 100 tok/s need GPU down to ~9ms. |
+| 2026-03-20 | Claude | **B6 design notes for Codex**: Plan uses non-direct_kv (V to workspace, then row_copy K+V). Workspace layout K→V contiguous (k_dim apart) so row_copy n_rows=2*n_head_kv works. QK_NORM_ROPE_X (fused) per layer with RUNTIME_POS. Requires Gemma3 QK norm fused path — falls back to Python loop otherwise. |
+
+### [CODEX] B7 — TODO (GPU shader optimization — main bottleneck)
+GPU exec = 18.5ms/token on RTX 3070. Breakdown from trace:
+- qkv = 0.48ms (3 matmuls: Q 1152×1024, K 1152×256, V 1152×256)
+- attn = 0.20ms (Q@K^T + softmax+weighted V)
+- ffn = 0.34ms (gate+up 1152×6912, GEGLU, down 6912×1152)
+- core_batch = 18.5ms (total batch including fence wait)
+
+Gap: individual op timing sums to ~1.5ms but core_batch=18.5ms. The ~17ms remainder is likely:
+- GPU memory bandwidth bottleneck (Q8_0 weights = 762MB, Q4_K weights = 119MB)
+- GPU dispatch/pipeline stall overhead
+- Vulkan synchronization barriers between ops
+
+**Key targets for Codex shader tuning on RTX 3070:**
+1. `map_matvec_t_xq8.comp` — most-executed (131 Q8 tensors). WG size, TILE_K, shared mem.
+2. `map_matvec_t_xq4.comp` — Q4_K weights (39 tensors). Check groupsize utilization.
+3. Investigate: are pipeline barriers between ops causing GPU stalls? fusion_enable(True) should batch them.
+4. Consider: explicit subgroup operations (subgroupReduceAdd etc.) for RTX 3070 subgroup_size=32.
+
+**Perf target**: core_batch < 10ms → ~100 tok/s.
+**Validation**: diag_inference.py 8 PASS after any shader change.
 
 ---
 
