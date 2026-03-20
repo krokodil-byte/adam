@@ -123,6 +123,9 @@ Likely approach: keep weight map persistent across generate() calls (do not tear
 | 2026-03-21 | Claude | **Pi 5 root cause**: USB streaming bottleneck. Q4 upload=369s (52 tensors), Q8 upload=298s (131 tensors). stream_load re-reads entire 1.3GB model from USB on every forward pass. decode_tps=0.03 — almost entirely I/O, not GPU compute. One decode step ≈39s. |
 | 2026-03-21 | Claude | **Pi 5 new adamah.so (207KB) CRASHES**: `v3d 1002000000.v3d: MMU error from client PTB (1) at 0x7c6e4b00, pte invalid` — triggered by new "Integrated GPU detected — enabling unified memory optimizations" code path in Codex's patch. Pi is currently running old adamah.so (pre-unified-memory). |
 | 2026-03-21 | Claude | **stream_chunk_mb**: broadcom_v3dv profile updated 8MB→256MB. This reduces read syscall count 32× but does NOT fix re-streaming per token (stream_load=True re-reads on every forward pass). True fix requires stream_load to cache weights after first upload — needs Codex investigation. |
+| 2026-03-21 | Claude | **Pi stream_load ROOT FIX**: `stream_load=False` on broadcom_v3dv. GGUFLoader with keep_raw_blocks=False re-opens USB file every iter_tensor_chunks call. With False, materialize() fills RAM cache once at startup. 1.3GB fits in Pi 4GB RAM. Committed c88c158. |
+| 2026-03-21 | Claude | **New fused ops TESTED** (RTX 3070, desktop_discrete, legacy): diag_inference.py 8 PASS, output "2+2=4" correct. Perf: ~50 tok/s, core_batch=12.9ms (was 13.1ms). No regression, no major improvement on desktop — legacy scheduler already batches efficiently, dispatch reduction from fused ops doesn't move the needle here. GPU work slightly reduced, CPU dispatch overhead slightly increased (net ~neutral). |
+| 2026-03-21 | Claude | **Trace decode_tps=0.00 BUG**: trace summary dict missing 'decode_tps' key — displayed as 0.00 but actual tps is correct in Turn output. Minor display bug only. |
 
 ---
 

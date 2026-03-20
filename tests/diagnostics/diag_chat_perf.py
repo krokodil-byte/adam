@@ -119,7 +119,8 @@ def main(argv=None):
         print(f"  {'forward_avg':<20}: {ts.get('forward_ms_avg', 0.0):7.3f} ms")
         print(f"  {'sample_avg':<20}: {ts.get('sample_ms_avg', 0.0):7.3f} ms")
         print(f"  {'step_avg':<20}: {ts.get('step_ms_avg', total_ms):7.3f} ms")
-        print(f"  {'decode_tps':<20}: {ts.get('decode_tps', 0.0):7.2f} tok/s")
+        tps = ts.get('decode_tps') or turn2_stats.get('decode_tps', 0.0)
+        print(f"  {'decode_tps':<20}: {tps:7.2f} tok/s")
     return 0
 
 
