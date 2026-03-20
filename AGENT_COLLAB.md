@@ -87,14 +87,43 @@ Fix: guard the unified memory optimization block so it does NOT activate on V3D.
 V3D uses HOST_COHERENT staging (slower, not HOST_CACHED), so "zero-copy" path is unsafe.
 Test: rebuild adamah.so on Pi, verify no MMU error, re-run diag_inference.py.
 
-### [CODEX] A5 — TODO (Pi streaming: investigate stream_load caching)
-stream_load=True re-streams 1.3GB from USB on EVERY forward pass (369s Q4 + 298s Q8).
-This is the primary <0.1 tok/s root cause. Expected behavior: upload once, cache on GPU.
-Investigate whether stream_load is designed to cache after first upload or always re-reads.
-If always re-reads: implement per-session weight caching or persistent GPU map across tokens.
-Note: stream_chunk_mb updated 8→256MB (reduces syscalls 32×) but does not fix re-streaming.
-Pi system RAM: ~4GB available. GPU pool: 512MB (broadcom_v3dv). Model: 1.3GB Q4/Q8.
-Likely approach: keep weight map persistent across generate() calls (do not teardown between tokens).
+### [CODEX] A5 — RESOLVED by Claude
+stream_load root cause was GGUFLoader re-opening the USB file every iter_tensor_chunks call
+(keep_raw_blocks=False in stream mode → no RAM cache). Fixed by setting stream_load=False on
+broadcom_v3dv: materialize() fills raw_blocks in RAM once at startup. Committed c88c158.
+Pi needs `git pull` + retest.
+
+### [CODEX] B6 — TODO (HIGH IMPACT: move forward-pass loop from Python to C)
+**Root cause of 7ms/token Python overhead**: engine.py Python loop calls ~300 ctypes functions
+per token (26 layers × ~11 ops/layer + LM head + sampling). Each ctypes hop = Python function
+call overhead + argument marshalling, regardless of GPU work. Measured: 7ms/token pure Python.
+
+**Proposed solution: `adamah_decode_step()` in adamah.c**
+All layer handles (weight handles, norm handles, KV cache handles, workspace slot locs) are
+pre-computed and static after init. Only `pos` (token position) changes per token.
+
+Implementation sketch:
+1. At engine init, Python builds a flat `dispatch_list[]` array describing every op in order:
+   (op_type, map_id, handle_a, handle_b, ..., n_rows, n_cols, ...) — one entry per GPU dispatch
+2. Python uploads this list to C via a new `adamah_register_decode_plan(plan_ptr, n_ops)` call
+3. Per token: Python calls `adamah_decode_step(pos, seq_len)` once — C loops over dispatch_list
+   in a tight loop, calling each GPU op directly, handles the batch_begin/batch_end, returns
+4. Python handles only sampling (top-k shortlist is already GPU-side via gpu_fused_topk)
+
+Expected result: Python overhead 7ms → <0.5ms per token.
+step_avg: 20ms → ~14ms → **~71 tok/s from overhead alone** (before any shader tuning).
+
+Constraints:
+- dispatch_list must be rebuilt if pos changes RoPE freq (global vs local layers — every 6th)
+  → simplest: two lists (local_plan, global_plan), alternate based on layer index
+- KV cache write position in locs changes per token — handle via push constant or offset param
+  passed to adamah_decode_step(pos, seq_len)
+- No changes to batch_begin/batch_end structure or locs handles
+- Test: diag_inference.py 8 PASS after switch
+
+Alternative (simpler): pre-record Vulkan secondary command buffer with push constants for pos.
+Replay via vkCmdExecuteCommands — zero CPU dispatch overhead, pos injected via push constants.
+This requires Vulkan 1.1+ and push constant support (RTX 3070: yes; V3D 6.x: check).
 
 ---
 
