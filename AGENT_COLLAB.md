@@ -125,7 +125,9 @@ Likely approach: keep weight map persistent across generate() calls (do not tear
 | 2026-03-21 | Claude | **stream_chunk_mb**: broadcom_v3dv profile updated 8MB→256MB. This reduces read syscall count 32× but does NOT fix re-streaming per token (stream_load=True re-reads on every forward pass). True fix requires stream_load to cache weights after first upload — needs Codex investigation. |
 | 2026-03-21 | Claude | **Pi stream_load ROOT FIX**: `stream_load=False` on broadcom_v3dv. GGUFLoader with keep_raw_blocks=False re-opens USB file every iter_tensor_chunks call. With False, materialize() fills RAM cache once at startup. 1.3GB fits in Pi 4GB RAM. Committed c88c158. |
 | 2026-03-21 | Claude | **New fused ops TESTED** (RTX 3070, desktop_discrete, legacy): diag_inference.py 8 PASS, output "2+2=4" correct. Perf: ~50 tok/s, core_batch=12.9ms (was 13.1ms). No regression, no major improvement on desktop — legacy scheduler already batches efficiently, dispatch reduction from fused ops doesn't move the needle here. GPU work slightly reduced, CPU dispatch overhead slightly increased (net ~neutral). |
-| 2026-03-21 | Claude | **Trace decode_tps=0.00 BUG**: trace summary dict missing 'decode_tps' key — displayed as 0.00 but actual tps is correct in Turn output. Minor display bug only. |
+| 2026-03-21 | Claude | **Trace decode_tps=0.00 BUG**: trace summary dict missing 'decode_tps' key — displayed as 0.00 but actual tps is correct in Turn output. Minor display bug only. Fixed in diag_chat_perf.py. |
+| 2026-03-21 | Claude | **B3 DONE (no-op finding)**: Removed fusion_flush() after attn on desktop_discrete. 8 PASS, perf unchanged (50.3 tok/s). Root cause: fusion_enable(False) makes all fusion_flush() calls no-ops already — was never costing anything. |
+| 2026-03-21 | Claude | **CPU overhead analysis**: step_avg=19.9ms, core_batch=12.9ms → 7ms/token pure Python overhead (ctypes dispatch, 26-layer loop, staging). GPU exec is 12.9ms. To reach 100 tok/s (10ms/step) need BOTH: core_batch < 6ms AND Python overhead < 4ms. Next lever: Codex shader optimization OR reduce ctypes call count per token. |
 
 ---
 

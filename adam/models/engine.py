@@ -2025,9 +2025,11 @@ class ADAMEngine:
                 )
                 # `attn_out` is produced through row-base handles but consumed as a
                 # contiguous slot by `o_proj`; keep that ordered for now.
-                # On Broadcom, the level-batched scheduler with barrier coalescing
-                # handles ordering correctly, so skip the expensive flush.
-                if not (self._is_broadcom or self._is_integrated):
+                # Broadcom (level_batched) and desktop_discrete (direct_kv path with
+                # map_attn_softmax_value_dev) both write attn_out as a single fused op —
+                # the fusion system can order o_proj correctly without an explicit flush.
+                if not (self._is_broadcom or self._is_integrated
+                        or self._runtime_profile == 'desktop_discrete'):
                     g.fusion_flush()
             if te: self.timing['attn'] += time.perf_counter() - t0
 
