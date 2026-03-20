@@ -1,0 +1,89 @@
+#version 450
+
+#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
+#define WG_ASV 32
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+#define WG_ASV 64
+#else
+#define WG_ASV 64
+#endif
+
+#define MAX_ATTN_SEQ 2048
+
+layout(local_size_x = WG_ASV) in;
+
+layout(push_constant) uniform PushConstants {
+    uint n_ops;
+    uint row_size;
+    uint value_dim;
+    float scale;
+    float cap;
+} pc;
+
+layout(set = 0, binding = 0) buffer MapBuffer    { float data[]; };
+layout(set = 0, binding = 1) buffer ScoreLocs    { uint locs_scores[]; };
+layout(set = 0, binding = 2) buffer ValueLocs    { uint locs_values[]; };
+layout(set = 0, binding = 3) buffer OutLocs      { uint locs_out[]; };
+
+shared float sreduce[WG_ASV];
+shared float sprob[MAX_ATTN_SEQ];
+
+float prep(float v) {
+    v *= pc.scale;
+    if (pc.cap > 0.0) {
+        v = tanh(v / pc.cap) * pc.cap;
+    }
+    return v;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint op = gl_WorkGroupID.y;
+    if (op >= pc.n_ops || pc.row_size == 0u || pc.value_dim == 0u) return;
+    if (pc.row_size > MAX_ATTN_SEQ) return;
+
+    uint score_base = locs_scores[op];
+    uint value_base = locs_values[op];
+    uint out_base = locs_out[op];
+
+    float max_val = -9.99999968e+37;
+    for (uint t = tid; t < pc.row_size; t += uint(WG_ASV)) {
+        max_val = max(max_val, prep(data[score_base + t]));
+    }
+    sreduce[tid] = max_val;
+    barrier();
+    for (uint s = uint(WG_ASV >> 1); s > 0u; s >>= 1u) {
+        if (tid < s) sreduce[tid] = max(sreduce[tid], sreduce[tid + s]);
+        barrier();
+    }
+    float row_max = sreduce[0];
+    barrier();
+
+    float sum_val = 0.0;
+    for (uint t = tid; t < pc.row_size; t += uint(WG_ASV)) {
+        float p = exp(prep(data[score_base + t]) - row_max);
+        sprob[t] = p;
+        sum_val += p;
+    }
+    sreduce[tid] = sum_val;
+    barrier();
+    for (uint s = uint(WG_ASV >> 1); s > 0u; s >>= 1u) {
+        if (tid < s) sreduce[tid] += sreduce[tid + s];
+        barrier();
+    }
+    float inv_sum = 1.0 / sreduce[0];
+    barrier();
+
+    for (uint t = tid; t < pc.row_size; t += uint(WG_ASV)) {
+        sprob[t] *= inv_sum;
+    }
+    barrier();
+
+    for (uint d = tid; d < pc.value_dim; d += uint(WG_ASV)) {
+        float acc = 0.0;
+        for (uint t = 0u; t < pc.row_size; ++t) {
+            acc += sprob[t] * data[value_base + t * pc.value_dim + d];
+        }
+        data[out_base + d] = acc;
+    }
+}

@@ -1,0 +1,84 @@
+#version 450
+
+#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
+#define WG_QK 32
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+#define WG_QK 64
+#else
+#define WG_QK 256
+#endif
+
+layout(local_size_x = WG_QK) in;
+
+layout(push_constant) uniform PushConstants {
+    uint q_rows;
+    uint q_dim;
+    uint k_rows;
+    uint k_dim;
+    uint pos_offset;
+    float freq_base;
+} pc;
+
+layout(set = 0, binding = 0) buffer ActBuffer   { float map_act[]; };
+layout(set = 0, binding = 1) buffer WtBuffer    { float map_wt[]; };
+layout(set = 0, binding = 2) buffer QSrcLocs    { uint locs_q_src[]; };
+layout(set = 0, binding = 3) buffer QWtLocs     { uint locs_q_wt[]; };
+layout(set = 0, binding = 4) buffer KSrcLocs    { uint locs_k_src[]; };
+layout(set = 0, binding = 5) buffer KWtLocs     { uint locs_k_wt[]; };
+layout(set = 0, binding = 6) buffer QKDstLocs   { uint locs_qk_dst[]; };
+
+shared float sdata[WG_QK];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint total_rows = pc.q_rows + pc.k_rows;
+    if (row >= total_rows) return;
+
+    bool is_q = row < pc.q_rows;
+    uint local_row = is_q ? row : (row - pc.q_rows);
+    uint row_dim = is_q ? pc.q_dim : pc.k_dim;
+    uint half_dim = row_dim / 2u;
+    if (half_dim == 0u) return;
+
+    uint src_base = is_q ? locs_q_src[local_row] : locs_k_src[local_row];
+    uint wt_base = is_q ? locs_q_wt[local_row] : locs_k_wt[local_row];
+    uint dst_base = locs_qk_dst[0];
+    if (is_q) {
+        dst_base += local_row * pc.q_dim;
+    } else {
+        dst_base += pc.q_rows * pc.q_dim + local_row * pc.k_dim;
+    }
+
+    float ss = 0.0;
+    for (uint i = tid; i < row_dim; i += uint(WG_QK)) {
+        float x = map_act[src_base + i];
+        ss += x * x;
+    }
+    sdata[tid] = ss;
+    barrier();
+    for (uint s = uint(WG_QK >> 1); s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float inv_rms = 1.0 / sqrt(sdata[0] / float(row_dim) + 1e-6);
+    float pos_f = float(pc.pos_offset);
+    barrier();
+
+    for (uint i = tid; i < half_dim; i += uint(WG_QK)) {
+        float x0 = map_act[src_base + i];
+        float x1 = map_act[src_base + i + half_dim];
+        float w0 = map_wt[wt_base + i];
+        float w1 = map_wt[wt_base + i + half_dim];
+        float y0 = x0 * inv_rms * w0;
+        float y1 = x1 * inv_rms * w1;
+
+        float freq = 1.0 / pow(pc.freq_base, float(2u * i) / float(row_dim));
+        float angle = pos_f * freq;
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
+
+        map_act[dst_base + i] = y0 * cos_a - y1 * sin_a;
+        map_act[dst_base + i + half_dim] = y0 * sin_a + y1 * cos_a;
+    }
+}

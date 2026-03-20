@@ -521,7 +521,7 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
             "reserve_ratio": 0.15,
             "kv_cap_max": 256,
             "stream_load": True,
-            "stream_chunk_mb": 8,
+            "stream_chunk_mb": 256,
             "gpu_approx_rerank": cfg.n_vocab >= 131072,
             "gpu_approx_partial_k": 8,
             "gpu_fused_rows_per_group": 256,
@@ -537,9 +537,9 @@ def _decode_path_overrides(profile_name):
     if name == "desktop_discrete":
         return {
             "decode_path": "desktop_discrete",
-            # Keep the active desktop chat path on the known-good scheduler.
-            # The current alias_safe path still corrupts real chat generation,
-            # while legacy remains sane with the same fused-topk fast path.
+            # legacy is faster on RTX 3070: merged QKV/gateup (alias_fast)
+            # hurts GPU throughput (big monolithic shaders vs many small parallel).
+            # level_batched is correct (adamah.c fix) but not beneficial here.
             "fusion_scheduler_mode": "legacy",
             "direct_kv_cache_write": True,
             "experimental_qk_norm_rope": True,
