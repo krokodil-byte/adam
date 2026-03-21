@@ -537,10 +537,9 @@ def _decode_path_overrides(profile_name):
     if name == "desktop_discrete":
         return {
             "decode_path": "desktop_discrete",
-            # legacy is faster on RTX 3070: merged QKV/gateup (alias_fast)
-            # hurts GPU throughput (big monolithic shaders vs many small parallel).
-            # level_batched is correct (adamah.c fix) but not beneficial here.
-            "fusion_scheduler_mode": "legacy",
+            # level_batched: B5 fix validated (8 PASS + "2+2=4") — 61-62 tok/s vs legacy 56 tok/s.
+            # Fewer barriers between independent ops (QKV, gate+up) gives ~8% perf gain.
+            "fusion_scheduler_mode": "level_batched",
             "direct_kv_cache_write": True,
             "experimental_qk_norm_rope": True,
             "experimental_merged_qkv": True,

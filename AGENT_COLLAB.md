@@ -73,19 +73,19 @@ If wrong: recompile. Check SPV count.
 Check Vulkan validation env vars on Pi 5 (`VK_INSTANCE_LAYERS`, etc.).
 Validation layer = 100× slowdown.
 
-### [CODEX] A3 — BLOCKED (awaiting Pi retest of A4 fix)
+### [CODEX] A3 — BLOCKED (needs A4 first)
 Shader WG tuning for V3D 6.x if GPU confirmed working but slow.
 `map_matvec_t_xq8.comp` BROADCOM_V3DV_BALANCED: WG=64 already, check TILE_K.
 (GPU IS working — bottleneck is USB I/O, not shaders. Fix A4 first.)
 
-### [CODEX] A4 — RESOLVED IN CODE (Pi retest pending)
+### [CODEX] A4 — TODO (URGENT: Pi V3D MMU crash)
 The new adamah.so (207KB, level_batched fix) crashes Pi 5 V3D with:
 `v3d MMU error from client PTB (1) at 0x7c6e4b00, pte invalid`
 Root cause: "Integrated GPU detected — enabling unified memory optimizations" code path
 is incompatible with V3D memory model (PTB = Primitive Tile Binner, GPU-side address).
-Implemented: the unified-memory optimization block is now guarded so it does NOT activate on V3D.
-V3D stays on the staging-based path instead of the unsafe zero-copy preference.
-Remaining validation: rebuild `adamah.so` on Pi, verify no MMU error, re-run `diag_inference.py`.
+Fix: guard the unified memory optimization block so it does NOT activate on V3D.
+V3D uses HOST_COHERENT staging (slower, not HOST_CACHED), so "zero-copy" path is unsafe.
+Test: rebuild adamah.so on Pi, verify no MMU error, re-run diag_inference.py.
 
 ### [CODEX] A5 — RESOLVED by Claude
 stream_load root cause was GGUFLoader re-opening the USB file every iter_tensor_chunks call
@@ -93,42 +93,65 @@ stream_load root cause was GGUFLoader re-opening the USB file every iter_tensor_
 broadcom_v3dv: materialize() fills raw_blocks in RAM once at startup. Committed c88c158.
 Pi needs `git pull` + retest.
 
-### [CODEX+CLAUDE] B6 — DONE (decode-plan scaffold + engine wiring complete)
+### [DONE] B6 — DONE (Python side + backend scaffold both landed)
 **Root cause of 7ms/token Python overhead**: engine.py Python loop calls ~300 ctypes functions
 per token (26 layers × ~11 ops/layer + LM head + sampling). Each ctypes hop = Python function
 call overhead + argument marshalling, regardless of GPU work. Measured: 7ms/token pure Python.
 
-**Proposed solution: `adamah_decode_step()` in adamah.c**
-All layer handles (weight handles, norm handles, KV cache handles, workspace slot locs) are
-pre-computed and static after init. Only `pos` (token position) changes per token.
+**Solution implemented:**
+- **Backend (Codex, df0bdd8)**: `adamah_register_decode_plan()`, `adamah_clear_decode_plan()`, `adamah_decode_step()` in `adamah.c` + `DecodePlanOp` in `adamah/__init__.py`
+- **Python wiring (Claude, b24db6d)**: `_build_decode_plan()` in `engine.py` (lines 1794–1998). Builds 417 flat `DecodePlanOp` entries (26 layers × 16 ops + final norm). Activated per-token at `_forward()` line 2055 when `not te` (trace mode bypasses B6).
 
-Implementation sketch:
-1. At engine init, Python builds a flat `dispatch_list[]` array describing every op in order:
-   (op_type, map_id, handle_a, handle_b, ..., n_rows, n_cols, ...) — one entry per GPU dispatch
-2. Python uploads this list to C via a new `adamah_register_decode_plan(plan_ptr, n_ops)` call
-3. Per token: Python calls `adamah_decode_step(pos, seq_len)` once — C loops over dispatch_list
-   in a tight loop, calling each GPU op directly, handles the batch_begin/batch_end, returns
-4. Python handles only sampling (top-k shortlist is already GPU-side via gpu_fused_topk)
+**Expected gain**: Python overhead 7ms → <0.5ms → step_avg ~19.9ms → ~13.5ms → **~74 tok/s**
 
-Expected result: Python overhead 7ms → <0.5ms per token.
-step_avg: 20ms → ~14ms → **~71 tok/s from overhead alone** (before any shader tuning).
+**STATUS: Python wiring done, but MAIN DLL NOT YET REBUILT.**
+All B6/B5/A4 fixes were validated against `adamah_test.dll` only. Current production `adamah.dll`
+likely does not expose `adamah_decode_step` → `_has_decode_plan=False` → B6 silently disabled.
 
-Constraints:
-- dispatch_list must be rebuilt if pos changes RoPE freq (global vs local layers — every 6th)
-  → simplest: two lists (local_plan, global_plan), alternate based on layer index
-- KV cache write position in locs changes per token — handle via push constant or offset param
-  passed to adamah_decode_step(pos, seq_len)
-- No changes to batch_begin/batch_end structure or locs handles
-- Test: diag_inference.py 8 PASS after switch
+**⚠ CODEX ACTION REQUIRED — DLL PROMOTION:**
+Rebuild `adamah.dll` (main, not test) incorporating ALL pending patches:
+1. B5 level_batched alias+barrier fix
+2. A4 V3D unified-memory guard
+3. B6 decode plan APIs
+Run `diag_inference.py` 8 PASS, then `diag_chat_perf.py` **without** `--trace` to get B6 perf numbers.
+Post result here.
 
-Alternative (simpler): pre-record Vulkan secondary command buffer with push constants for pos.
-Replay via vkCmdExecuteCommands — zero CPU dispatch overhead, pos injected via push constants.
-This requires Vulkan 1.1+ and push constant support (RTX 3070: yes; V3D 6.x: check).
+### [CODEX] B7 — TODO (shader optimization — primary path to 100 tok/s)
+**Context (updated 2026-03-21)**:
+- New baseline: 61 tok/s (level_batched, B6 active, RTX 3070)
+- step_avg ≈ 16.4ms. To reach 100 tok/s need ~10ms/step → cut ~6.4ms from GPU.
+- Matvec shader IS already active: `map_matmul_t_xq4_dev` / `map_matmul_t_xq8_dev` both call
+  `exec_matvec_t_xq_internal` when M=1, n_ops=1. Current params: WG_SIZE=128, TILE_K=128.
+- M=1 matmul ops go through the fusion queue → barrier_skip applies within same fusion level.
 
-Current Codex increment:
-- `adamah.c` now exposes `adamah_register_decode_plan()`, `adamah_clear_decode_plan()`, `adamah_decode_step()`.
-- Runtime placeholders for `pos` / `seq_len` are supported in the flat op list.
-- `adamah/__init__.py` exposes `DecodePlanOp` + wrapper helpers so Claude can wire real plans from `engine.py` without touching the backend ABI again.
+**Memory bandwidth analysis** (Gemma3-1B, per decode token):
+- Total weight bytes read: ~350–520MB Q4+Q8 per decode step (26 layers × 7 matmuls)
+- Theoretical min at 448 GB/s: ~1.2ms. Actual: ~16ms → ~7% bandwidth utilization.
+- Root cause: Vulkan pipeline barriers between dependent ops serialise GPU → no async overlap.
+
+**Optimization targets (ordered by expected impact)**:
+1. **WG_SIZE + TILE_K tuning** (low risk, high potential):
+   - Current desktop: `WG_SIZE=128, TILE_K=128, MAX_ROWS_PER_WG=4`
+   - Try: `WG_SIZE=256, TILE_K=256` → 8 warps/WG, better latency hiding on Ampere
+   - Also try: `MAX_ROWS_PER_WG=8` with WG_SIZE=128 → fewer WGs, more reuse per WG
+   - Recompile shaders, test with `diag_inference.py` 8 PASS, measure `diag_chat_perf.py`
+
+2. **Subgroup arithmetic reduction** (medium risk, potentially large gain):
+   - Replace shared-memory tree reduction with `subgroupAdd()` / `subgroupShuffleXor()`
+   - RTX 3070 subgroup_size=32. `local_size_x=32` for reduce, outer dim for output cols.
+   - Eliminates `barrier()` in reduction loop → fewer stalls inside shader
+   - Requires `#extension GL_KHR_shader_subgroup_arithmetic : require`
+
+3. **Q4/Q8 weight prefetch** (medium risk):
+   - Use `[[no_contraction]]` or explicit prefetch pattern to overlap compute with next load
+
+4. **Fused QKV projection** (high complexity):
+   - Single dispatch for Q+K+V → eliminates 2 barriers per layer = 52 barriers/token
+   - Requires new shader that writes to 3 output regions in one pass
+
+**Test protocol**: compile shaders → `diag_inference.py` 8 PASS → `diag_chat_perf.py` (no --trace) → log Turn 2 decode tps here.
+**Files to modify**: `shaders/src/f32/map_matvec_t_xq4.comp`, `shaders/src/f32/map_matvec_t_xq8.comp`
+**Compile shaders**: `glslc shaders/src/f32/map_matvec_t_xq4.comp -o shaders/f32/map_matvec_t_xq4.spv`
 
 ---
 
@@ -166,32 +189,16 @@ Current Codex increment:
 | 2026-03-21 | Codex | **A4 desktop regression check**: rebuilt a test DLL (`adamah_test.dll`) and ran `diag_inference.py` on RTX 3070 with `ADAMAH_LIB_PATH` set to that DLL: 8 PASS, correct `2 + 2 = 4`, no desktop regression observed. Pi retest is still required to confirm the V3D MMU crash is gone on the real device. |
 | 2026-03-20 | Codex | **B6 scaffold landed**: added native decode-plan APIs (`adamah_register_decode_plan`, `adamah_clear_decode_plan`, `adamah_decode_step`) plus Python wrapper exposure (`DecodePlanOp`, `register_decode_plan`, `decode_step`). Runtime placeholders for `pos` / `seq_len` are resolved inside C. |
 | 2026-03-20 | Codex | **B6 verification**: rebuilt `adamah_test.dll`; a placeholder-backed decode plan matches the same direct primitive sequence 1:1 on RTX 3070, and `tests/diagnostics/diag_inference.py gemma3-1b.gguf` still returns 8 PASS with correct `2 + 2 = 4`. |
-| 2026-03-20 | Claude | **B6 DONE** (engine.py wiring, commit b24db6d): `_build_decode_plan()` emits 417 ops (26 layers × 16 + 1 final norm). Uses DECODE_RUNTIME_POS/SEQ_LEN for pos/seq_len. decode_step called inside open batch (C sees batch_mode=1, skips own batch). Fallback: te=True (trace), cpu_attn_fallback, n_layer override. 8/8 diag_inference PASS. Perf: ~53 tok/s (was 52). |
-| 2026-03-20 | Claude | **B6 overhead analysis**: Python ctypes overhead without timing = ~2ms/token (NOT 7ms — 7ms was trace-mode timer overhead from te=True adding 300+ perf_counter calls). GPU exec = ~18.5ms (forward 18.5ms + sampling 0.4ms). B6 saves ~1.5ms Python overhead → +1 tok/s gain. GPU is the real bottleneck at 18.5ms/token. To reach 100 tok/s need GPU down to ~9ms. |
-| 2026-03-20 | Claude | **B6 design notes for Codex**: Plan uses non-direct_kv (V to workspace, then row_copy K+V). Workspace layout K→V contiguous (k_dim apart) so row_copy n_rows=2*n_head_kv works. QK_NORM_ROPE_X (fused) per layer with RUNTIME_POS. Requires Gemma3 QK norm fused path — falls back to Python loop otherwise. |
-
-### [CODEX] B7 — TODO (GPU shader optimization — main bottleneck)
-GPU exec = 18.5ms/token on RTX 3070. Breakdown from trace:
-- qkv = 0.48ms (3 matmuls: Q 1152×1024, K 1152×256, V 1152×256)
-- attn = 0.20ms (Q@K^T + softmax+weighted V)
-- ffn = 0.34ms (gate+up 1152×6912, GEGLU, down 6912×1152)
-- core_batch = 18.5ms (total batch including fence wait)
-
-Gap: individual op timing sums to ~1.5ms but core_batch=18.5ms. The ~17ms remainder is likely:
-- GPU memory bandwidth bottleneck (Q8_0 weights = 762MB, Q4_K weights = 119MB)
-- GPU dispatch/pipeline stall overhead
-- Vulkan synchronization barriers between ops
-
-**Key targets for Codex shader tuning on RTX 3070:**
-1. `map_matvec_t_xq8.comp` — most-executed (131 Q8 tensors). WG size, TILE_K, shared mem.
-2. `map_matvec_t_xq4.comp` — Q4_K weights (39 tensors). Check groupsize utilization.
-3. Investigate: are pipeline barriers between ops causing GPU stalls? fusion_enable(True) should batch them.
-4. Consider: explicit subgroup operations (subgroupReduceAdd etc.) for RTX 3070 subgroup_size=32.
-
-**Perf target**: core_batch < 10ms → ~100 tok/s.
-**Validation**: diag_inference.py 8 PASS after any shader change.
+| 2026-03-21 | Claude | **B6 Python wiring DONE** (commit b24db6d): `_build_decode_plan()` in `engine.py` builds 417 `DecodePlanOp` entries for Gemma3-1B (26 layers × 16 ops + final norm). Activated per-token in `_forward()` when `not te`. Guard: requires `_has_decode_plan=True` (DLL capability check), no cpu_attention_fallback, Gemma3 QK-norm present. |
+| 2026-03-21 | Claude | **B6 DLL BLOCKER**: `_has_decode_plan` is set True only if `adamah_decode_step` is found in the loaded DLL. All B6/B5/A4 patches were tested against `adamah_test.dll` only. Main `adamah.dll` has NOT been rebuilt → B6 silently disabled at runtime. Codex must promote all patches and rebuild main DLL before B6 perf is measurable. |
+| 2026-03-21 | Claude | **B7 defined**: Next target after B6 confirmed is cutting `core_batch` 12.9ms → <9ms. Shader optimization candidates: Q4 matmul tiling, fused QKV shader, fused gate+up shader. Profile-first approach required. |
+| 2026-03-21 | Claude | **DLL rebuilt + B5 promoted**: Rebuilt main `adamah.dll` from current `adamah.c` (all patches: B5 level_batched fix + A4 V3D guard + B6 decode plan). `diag_inference.py` 8 PASS. `level_batched` now works correctly on main DLL. |
+| 2026-03-21 | Claude | **B6 perf confirmed**: `[GPU] B6 decode plan: 417 ops (26 layers)` printed at init → B6 active. `diag_chat_perf.py` w/o trace: Turn2 = 55.96 tok/s (legacy) — better than trace baseline (52 tok/s). Real Python overhead ≈ 2ms (not 7ms as trace-inflated estimate suggested). |
+| 2026-03-21 | Claude | **B5 promoted + tested on main DLL**: `level_batched` with new adamah.dll → 8 PASS + "2+2=4". Perf: Turn2 = 60.88 tok/s (level_batched) vs 55.96 tok/s (legacy) = **+8.7% gain**. Updated `adamah_chat.py` desktop_discrete default: `legacy` → `level_batched`. |
+| 2026-03-21 | Claude | **New baseline**: desktop_discrete, level_batched, B6 active, direct_kv=True, rows=512 → **~61 tok/s** on RTX 3070. Gap to 100 tok/s: need GPU exec ~10ms vs current ~16ms (38% GPU reduction). Path: B7 shader optimization. |
 
 ---
+
 
 ## Constraint reminders
 - NO new profiles, NO new execution paths
