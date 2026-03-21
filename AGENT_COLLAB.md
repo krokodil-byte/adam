@@ -116,7 +116,7 @@ Rebuild `adamah.dll` (main, not test) incorporating ALL pending patches:
 Run `diag_inference.py` 8 PASS, then `diag_chat_perf.py` **without** `--trace` to get B6 perf numbers.
 Post result here.
 
-### [CODEX] B7 — TODO (shader optimization — primary path to 100 tok/s)
+### [CODEX] B7 — FINDINGS (shader micro-opt exhausted — pivot to dispatch fusion)
 **Context (updated 2026-03-21)**:
 - New baseline: 61 tok/s (level_batched, B6 active, RTX 3070)
 - step_avg ≈ 16.4ms. To reach 100 tok/s need ~10ms/step → cut ~6.4ms from GPU.
@@ -196,6 +196,32 @@ Post result here.
 | 2026-03-21 | Claude | **B6 perf confirmed**: `[GPU] B6 decode plan: 417 ops (26 layers)` printed at init → B6 active. `diag_chat_perf.py` w/o trace: Turn2 = 55.96 tok/s (legacy) — better than trace baseline (52 tok/s). Real Python overhead ≈ 2ms (not 7ms as trace-inflated estimate suggested). |
 | 2026-03-21 | Claude | **B5 promoted + tested on main DLL**: `level_batched` with new adamah.dll → 8 PASS + "2+2=4". Perf: Turn2 = 60.88 tok/s (level_batched) vs 55.96 tok/s (legacy) = **+8.7% gain**. Updated `adamah_chat.py` desktop_discrete default: `legacy` → `level_batched`. |
 | 2026-03-21 | Claude | **New baseline**: desktop_discrete, level_batched, B6 active, direct_kv=True, rows=512 → **~61 tok/s** on RTX 3070. Gap to 100 tok/s: need GPU exec ~10ms vs current ~16ms (38% GPU reduction). Path: B7 shader optimization. |
+| 2026-03-21 | Claude | **B7 shader tuning EXHAUSTED — key finding**: Vulkan pipeline barrier overhead dominates (~88μs/dispatch × ~182 dispatches/token = ~16ms). Shader compute itself is ~1ms total. Tried: TILE_K 128→256 (→ 57.5 tok/s, REGRESSION -6%), rows_per_group 4→8 (correctness FAIL, |hid| collapses to 1/8 expected — ratio 0.115 ≈ 1/8, bug not diagnosed). Reverted both. Baseline restored: 8 PASS, ~61 tok/s. |
+| 2026-03-21 | Claude | **B7 root cause of regression (TILE_K=256)**: MAX_ROWS_PER_WG=8 compile-time constant in shader doubles shared memory allocation (partial[8×128]=4KB vs [4×128]=2KB) even when runtime rows_per_wg=4. This degrades cache locality / SM scheduler without any compute gain at rows_per_wg=4. Increasing both MAX_ROWS_PER_WG AND rows_per_group simultaneously causes correctness failure (|hid| → 1/8). Root cause of correctness failure not fully diagnosed (may be group_size boundary issue at rows 4-7 when group_size=32 and K=1152). |
+| 2026-03-21 | Claude | **CRITICAL PATH TO 100 tok/s**: shader micro-opt is a dead end. The ~16ms GPU time is ~15ms pipeline barriers + ~1ms actual compute. Need to ELIMINATE dispatches via fusion. **Target: fused QKV dispatch** (3 matmuls → 1 dispatch, save 2 barriers/layer × 26 = 52 barriers) + **fused gate+up dispatch** (2 matmuls → 1 dispatch, save 26 barriers). Estimated: 182 → ~104 dispatches → ~9ms → ~100 tok/s. This requires new C-side dispatch APIs + new GLSL shaders. Assigning as B8. |
+
+### [CODEX] B8 — TODO (dispatch fusion — CRITICAL PATH to 100 tok/s)
+**Context**: Each Vulkan pipeline barrier costs ~88μs (measured). 182 barriers/token × 88μs = 16ms.
+After B6 decode plan, all ops run in one command buffer — barriers are still there inside GPU exec.
+Fusing 2 consecutive matmuls (same input X, different outputs) into 1 dispatch eliminates 1 barrier.
+
+**Targets (ordered by impact)**:
+1. **Fused Q+K+V projection** (saves 2 barriers/layer × 26 = 52 barriers ≈ 4.6ms):
+   - Q, K, V all read same input X [1152], output sizes Q=1152, K=256, V=256
+   - New shader: 3 weight buffers, 3 output locs, push: K, N_q, N_k, N_v, group_size, rows_per_wg
+   - C function: `map_fused_qkv_t_xq4_dev` + decode plan opcode `ADAMAH_OP_FUSED_QKV_T_XQ4`
+   - Python wiring (Claude): replace 3 separate `map_matmul_t_xq4_dev` calls in `_build_decode_plan()`
+
+2. **Fused gate+up projection** (saves 1 barrier/layer × 26 = 26 barriers ≈ 2.3ms):
+   - gate and up read same input X [1152], both output [6912]
+   - New shader: 2 weight buffers, 2 output locs
+   - C function: `map_fused_gateup_t_xq4_dev` + decode plan opcode
+
+**Expected total gain**: 78 fewer barriers × 88μs = 6.9ms saved → step_avg ~9ms → **~111 tok/s**
+**Test protocol**: diag_inference.py 8 PASS + "2+2=4" after every change; perf via diag_chat_perf.py
+**CODEX files**: `adamah.c`, `shaders/src/f32/map_fused_qkv_t_xq4.comp`, `map_fused_gateup_t_xq4.comp`
+**CLAUDE files**: `adam/models/engine.py` `_build_decode_plan()` (wire new opcodes after Codex adds C APIs)
+**Coordination**: Codex adds C APIs + shaders first, posts C function signatures here, Claude wires Python.
 
 ---
 
