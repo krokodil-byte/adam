@@ -91,6 +91,12 @@
 #define ADAMAH_DECODE_OP_QK_NORM_ROPE_X 23
 #define ADAMAH_DECODE_OP_ROW_COPY_OFFSET 24
 #define ADAMAH_DECODE_OP_ATTN_SOFTMAX_VALUE 25
+#define ADAMAH_DECODE_OP_FUSED_QKV_T_XQ4 26
+#define ADAMAH_DECODE_OP_FUSED_GATEUP_T_XQ4 27
+#define ADAMAH_DECODE_OP_FUSED_QKV_T_XQ8 28
+#define ADAMAH_DECODE_OP_FUSED_GATEUP_T_XQ8 29
+#define ADAMAH_DECODE_OP_FUSED_GATEUP_ACT_T_XQ8 30
+#define ADAMAH_DECODE_OP_FULL_DECODE_STEP 31
 
 // Operation types for fusion
 #define FUSE_OP_UNARY 1
@@ -112,6 +118,13 @@
 #define FUSE_OP_MATMUL_T_XQ8 17
 #define FUSE_OP_QK_NORM_ROPE_X 18
 #define FUSE_OP_ATTN_SOFTMAX_VALUE 19
+#define FUSE_OP_FUSED_QKV_T_XQ4 20
+#define FUSE_OP_FUSED_GATEUP_T_XQ4 21
+#define FUSE_OP_FUSED_QKV_T_XQ8 22
+#define FUSE_OP_FUSED_GATEUP_T_XQ8 23
+#define FUSE_OP_FUSED_GATEUP_ACT_T_XQ8 24
+
+#define ADAMAH_FULL_DECODE_MAX_LAYERS 26
 
 #define LOC_ALIAS_NONE 0
 #define LOC_ALIAS_CONTIG 1
@@ -160,6 +173,34 @@ typedef struct {
   float f0;
   float f1;
 } AdamahDecodePlanOp;
+
+typedef struct {
+  uint64_t wq[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t wk[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t wv[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t wo[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t wg[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t wu[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t wd[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t attn_norm[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t attn_q_norm[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t attn_k_norm[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t ffn_norm[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t post_attn_norm[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t post_ffn_norm[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t qp_wq[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t qp_wk[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t qp_wv[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t qp_wo[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t qp_wg[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t qp_wu[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t qp_wd[ADAMAH_FULL_DECODE_MAX_LAYERS];
+  uint64_t output_norm;
+  uint32_t N_embd, N_q, N_k, N_v, N_ff;
+  uint32_t n_head, n_head_kv, head_dim, head_dim_kv;
+  uint32_t group_size_attn, group_size_ffn;
+  float attn_softcap;
+} FullDecodeWeightAddrs;
 
 typedef struct {
   uint8_t valid;
@@ -234,6 +275,9 @@ typedef struct {
 static AdamahStats native_stats = {0};
 static LocAliasMeta loc_alias_meta[MAX_RES + 1] = {0};
 static AdamahDecodePlan decode_plans[ADAMAH_DECODE_MAX_PLANS] = {0};
+static uint32_t batch_barrier_count = 0;
+static uint32_t last_batch_barrier_count = 0;
+static uint8_t batch_barrier_counting_active = 0;
 
 static int device_is_broadcom_v3d(const VkPhysicalDeviceProperties *props) {
   if (!props) {
@@ -315,6 +359,9 @@ static void tracked_vkCmdPipelineBarrier(
     uint32_t imageMemoryBarrierCount,
     const VkImageMemoryBarrier *pImageMemoryBarriers) {
   native_stats.barrier_count += 1;
+  if (batch_barrier_counting_active) {
+    batch_barrier_count += 1;
+  }
   vkCmdPipelineBarrier(commandBuffer, srcStageMask, dstStageMask,
                        dependencyFlags, memoryBarrierCount, pMemoryBarriers,
                        bufferMemoryBarrierCount, pBufferMemoryBarriers,
@@ -393,6 +440,15 @@ typedef struct {
   uint8_t cache_valid;
   VkDescriptorBufferInfo cache_infos[10];
 } Pipeline;
+
+typedef struct {
+  uint8_t registered;
+  uint8_t reserved[3];
+  uint32_t map_ws_id;
+  uint32_t map_kvcache_id;
+  uint32_t n_layer;
+  FullDecodeWeightAddrs wa;
+} FullDecodeState;
 
 typedef struct {
   VkDeviceSize offset;
@@ -511,6 +567,12 @@ static struct {
   Pipeline matvec_t_xq4_pipe;
   Pipeline matmul_t_xq4_pipe;
   Pipeline matmul_xq4_pipe;
+  Pipeline fused_qkv_t_xq4_pipe;
+  Pipeline fused_gateup_t_xq4_pipe;
+  Pipeline fused_qkv_t_xq8_pipe;
+  Pipeline fused_gateup_t_xq8_pipe;
+  Pipeline fused_gateup_act_t_xq8_pipe;
+  Pipeline full_decode_step_pipe;
 
   // Cross-map F32×Q8 pipelines
   Pipeline matvec_topk_t_xq8_pipe;
@@ -537,6 +599,13 @@ static struct {
   uint32_t active_dtype; // Currently active dtype for new maps
 
   char shader_path[512];
+
+  int has_buffer_device_address;
+  PFN_vkGetBufferDeviceAddress pfn_get_buffer_device_address;
+
+  VkBuffer full_decode_wa_buf;
+  VkDeviceMemory full_decode_wa_mem;
+  FullDecodeState full_decode_state;
 } ctx = {0};
 
 static void loc_alias_meta_reset_all(void) {
@@ -751,11 +820,31 @@ static uint32_t find_host_staging(uint32_t bits,
   return UINT32_MAX;
 }
 
+static VkBufferUsageFlags with_buffer_device_address_usage(
+    VkBufferUsageFlags usage) {
+  if (ctx.has_buffer_device_address &&
+      (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+    usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  }
+  return usage;
+}
+
+static uint64_t buffer_device_address_u64(VkBuffer buf) {
+  if (!ctx.has_buffer_device_address || !ctx.pfn_get_buffer_device_address ||
+      buf == VK_NULL_HANDLE) {
+    return 0;
+  }
+  VkBufferDeviceAddressInfo info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = buf};
+  return (uint64_t)ctx.pfn_get_buffer_device_address(ctx.device, &info);
+}
+
 // Extended version that returns memory properties
 static int create_buffer_ex(VkBuffer *buf, VkDeviceMemory *mem,
                             VkDeviceSize size, VkBufferUsageFlags usage,
                             int device_local,
                             VkMemoryPropertyFlags *props_out) {
+  usage = with_buffer_device_address_usage(usage);
   VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                             .size = size,
                             .usage = usage};
@@ -783,9 +872,16 @@ static int create_buffer_ex(VkBuffer *buf, VkDeviceMemory *mem,
   if (props_out)
     *props_out = props;
 
+  VkMemoryAllocateFlagsInfo alloc_flags = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
   VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                               .allocationSize = reqs.size,
                               .memoryTypeIndex = mem_type};
+  if ((usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0 &&
+      ctx.has_buffer_device_address) {
+    alloc_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    mai.pNext = &alloc_flags;
+  }
   if (vkAllocateMemory(ctx.device, &mai, NULL, mem) != VK_SUCCESS) {
     vkDestroyBuffer(ctx.device, *buf, NULL);
     return -1;
@@ -1043,7 +1139,6 @@ static void cmd_barrier_between_levels(void) {
   vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL,
                        0, NULL);
-  native_stats.barrier_count += 1;
 }
 
 static void cmd_buffer_barrier(VkPipelineStageFlags src_stage,
@@ -1509,6 +1604,8 @@ void batch_begin(void) {
   }
   batch_mode = 1;
   batch_op_counter = 0; // Reset counter for new batch
+  batch_barrier_count = 0;
+  batch_barrier_counting_active = 1;
 }
 
 // End batch mode - submit all accumulated commands
@@ -1531,6 +1628,8 @@ void batch_end(void) {
     vkWaitForFences(ctx.device, 1, &ctx.fence, VK_TRUE, UINT64_MAX);
     cmd_recording = 0;
   }
+  last_batch_barrier_count = batch_barrier_count;
+  batch_barrier_counting_active = 0;
 
   // Batch completed, recycle descriptor sets for next batch
   reset_pipeline_desc_pool(&ctx.unary_pipe);
@@ -1567,6 +1666,12 @@ void batch_end(void) {
   reset_pipeline_desc_pool(&ctx.matvec_t_xq4_pipe);
   reset_pipeline_desc_pool(&ctx.matmul_t_xq4_pipe);
   reset_pipeline_desc_pool(&ctx.matmul_xq4_pipe);
+  reset_pipeline_desc_pool(&ctx.fused_qkv_t_xq4_pipe);
+  reset_pipeline_desc_pool(&ctx.fused_gateup_t_xq4_pipe);
+  reset_pipeline_desc_pool(&ctx.fused_qkv_t_xq8_pipe);
+  reset_pipeline_desc_pool(&ctx.fused_gateup_t_xq8_pipe);
+  reset_pipeline_desc_pool(&ctx.fused_gateup_act_t_xq8_pipe);
+  reset_pipeline_desc_pool(&ctx.full_decode_step_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_rerank_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_t_xq8_pipe);
@@ -1600,6 +1705,8 @@ void batch_submit(void) {
     batch_submitted = 1;
     // cmd_recording stays 1 until batch_wait resets it
   }
+  last_batch_barrier_count = batch_barrier_count;
+  batch_barrier_counting_active = 0;
 }
 
 // Wait for a previously submitted batch to complete.
@@ -1610,6 +1717,7 @@ void batch_wait(void) {
   vkWaitForFences(ctx.device, 1, &ctx.fence, VK_TRUE, UINT64_MAX);
   batch_submitted = 0;
   cmd_recording = 0;
+  batch_barrier_counting_active = 0;
 
   // Invalidate hot_pool CPU cache if host-visible (for CPU reads)
   if (ctx.hot_pool && ctx.hot_pool->ptr) {
@@ -1651,6 +1759,12 @@ void batch_wait(void) {
   reset_pipeline_desc_pool(&ctx.matvec_t_xq4_pipe);
   reset_pipeline_desc_pool(&ctx.matmul_t_xq4_pipe);
   reset_pipeline_desc_pool(&ctx.matmul_xq4_pipe);
+  reset_pipeline_desc_pool(&ctx.fused_qkv_t_xq4_pipe);
+  reset_pipeline_desc_pool(&ctx.fused_gateup_t_xq4_pipe);
+  reset_pipeline_desc_pool(&ctx.fused_qkv_t_xq8_pipe);
+  reset_pipeline_desc_pool(&ctx.fused_gateup_t_xq8_pipe);
+  reset_pipeline_desc_pool(&ctx.fused_gateup_act_t_xq8_pipe);
+  reset_pipeline_desc_pool(&ctx.full_decode_step_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_rerank_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_t_xq8_pipe);
@@ -1698,6 +1812,7 @@ void adamah_sync(void) {
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq4_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq8_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_rerank_t_xq8_pipe);
+    reset_pipeline_desc_pool(&ctx.full_decode_step_pipe);
     reset_pipeline_desc_pool(&ctx.row_gather_xq8_pipe);
     ctx.pending_desc_reset = 0;
   }
@@ -1817,11 +1932,28 @@ int adamah_init_ex(uint64_t hot_bytes, uint64_t cold_bytes) {
   loc_alias_meta_reset_all();
   decode_plan_reset_all();
   adamah_stats_reset();
+  batch_barrier_count = 0;
+  last_batch_barrier_count = 0;
+  batch_barrier_counting_active = 0;
 
   // Create instance
+  uint32_t requested_api = VK_API_VERSION_1_0;
+  PFN_vkEnumerateInstanceVersion enum_instance_version =
+      (PFN_vkEnumerateInstanceVersion)vkGetInstanceProcAddr(
+          VK_NULL_HANDLE, "vkEnumerateInstanceVersion");
+  if (enum_instance_version) {
+    uint32_t supported_api = VK_API_VERSION_1_0;
+    if (enum_instance_version(&supported_api) == VK_SUCCESS) {
+      uint32_t target = VK_API_VERSION_1_2;
+      requested_api = supported_api < target ? supported_api : target;
+      if (requested_api < VK_API_VERSION_1_0) {
+        requested_api = VK_API_VERSION_1_0;
+      }
+    }
+  }
   VkApplicationInfo ai = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
                           .pApplicationName = "ADAMAH",
-                          .apiVersion = VK_API_VERSION_1_0};
+                          .apiVersion = requested_api};
   VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
                               .pApplicationInfo = &ai};
   if (vkCreateInstance(&ici, NULL, &ctx.instance) != VK_SUCCESS)
@@ -2012,12 +2144,81 @@ int adamah_init_ex(uint64_t hot_bytes, uint64_t cold_bytes) {
                                  .queueFamilyIndex = ctx.queue_family,
                                  .queueCount = 1,
                                  .pQueuePriorities = &prio};
-  VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-                            .queueCreateInfoCount = 1,
-                            .pQueueCreateInfos = &qci};
+  ctx.has_buffer_device_address = 0;
+  ctx.pfn_get_buffer_device_address = NULL;
+
+  PFN_vkGetPhysicalDeviceFeatures2 get_features2 =
+      (PFN_vkGetPhysicalDeviceFeatures2)vkGetInstanceProcAddr(
+          ctx.instance, "vkGetPhysicalDeviceFeatures2");
+  VkPhysicalDeviceBufferDeviceAddressFeatures bda_features = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+  if (get_features2) {
+    VkPhysicalDeviceFeatures2 feats2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &bda_features};
+    get_features2(ctx.phys, &feats2);
+    if (bda_features.bufferDeviceAddress == VK_TRUE) {
+      ctx.has_buffer_device_address = 1;
+    }
+  }
+
+  const char *device_exts[1];
+  uint32_t device_ext_count = 0;
+  if (ctx.has_buffer_device_address &&
+      VK_API_VERSION_MAJOR(props.apiVersion) == 1 &&
+      VK_API_VERSION_MINOR(props.apiVersion) < 2) {
+    uint32_t ext_count = 0;
+    int has_bda_ext = 0;
+    if (vkEnumerateDeviceExtensionProperties(ctx.phys, NULL, &ext_count, NULL) ==
+        VK_SUCCESS) {
+      VkExtensionProperties *exts = NULL;
+      exts = (VkExtensionProperties *)malloc(sizeof(VkExtensionProperties) *
+                                             (size_t)ext_count);
+      if (exts &&
+          vkEnumerateDeviceExtensionProperties(ctx.phys, NULL, &ext_count,
+                                               exts) == VK_SUCCESS) {
+        for (uint32_t i = 0; i < ext_count; i++) {
+          if (strcmp(exts[i].extensionName,
+                     VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) == 0) {
+            has_bda_ext = 1;
+            break;
+          }
+        }
+      }
+      if (exts)
+        free(exts);
+    }
+    if (has_bda_ext) {
+      device_exts[device_ext_count++] =
+          VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
+    } else {
+      ctx.has_buffer_device_address = 0;
+    }
+  }
+
+  VkPhysicalDeviceBufferDeviceAddressFeatures bda_enable = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
+      .bufferDeviceAddress = ctx.has_buffer_device_address ? VK_TRUE : VK_FALSE};
+  VkDeviceCreateInfo dci = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .pNext = ctx.has_buffer_device_address ? &bda_enable : NULL,
+      .queueCreateInfoCount = 1,
+      .pQueueCreateInfos = &qci,
+      .enabledExtensionCount = device_ext_count,
+      .ppEnabledExtensionNames = device_ext_count ? device_exts : NULL};
   if (vkCreateDevice(ctx.phys, &dci, NULL, &ctx.device) != VK_SUCCESS)
     return ADAMAH_ERR_VULKAN;
   vkGetDeviceQueue(ctx.device, ctx.queue_family, 0, &ctx.queue);
+  if (ctx.has_buffer_device_address) {
+    ctx.pfn_get_buffer_device_address =
+        (PFN_vkGetBufferDeviceAddress)vkGetDeviceProcAddr(
+            ctx.device, "vkGetBufferDeviceAddress");
+    if (!ctx.pfn_get_buffer_device_address) {
+      ctx.has_buffer_device_address = 0;
+    }
+  }
+  fprintf(stderr, "[ADAMAH] bufferDeviceAddress=%s\n",
+          ctx.has_buffer_device_address ? "enabled" : "disabled");
 
   // Command pool & buffer
   VkCommandPoolCreateInfo cpi = {
@@ -2361,6 +2562,15 @@ void adamah_shutdown(void) {
     ctx.pool_buf = VK_NULL_HANDLE;
   }
 
+  if (ctx.full_decode_wa_buf) {
+    vkDestroyBuffer(ctx.device, ctx.full_decode_wa_buf, NULL);
+    ctx.full_decode_wa_buf = VK_NULL_HANDLE;
+  }
+  if (ctx.full_decode_wa_mem) {
+    vkFreeMemory(ctx.device, ctx.full_decode_wa_mem, NULL);
+    ctx.full_decode_wa_mem = VK_NULL_HANDLE;
+  }
+
   // Destroy maps
   for (int i = 0; i < MAX_MAPS; i++) {
     if (ctx.maps[i].active)
@@ -2397,6 +2607,9 @@ void adamah_shutdown(void) {
   loc_alias_meta_reset_all();
   decode_plan_reset_all();
   adamah_stats_reset();
+  batch_barrier_count = 0;
+  last_batch_barrier_count = 0;
+  batch_barrier_counting_active = 0;
 }
 
 // ============================================
@@ -3903,6 +4116,27 @@ static int init_pipelines(void) {
   if (create_pipeline(&ctx.matmul_xq4_pipe, "map_matmul_xq4.spv", 6, 20) != 0) {
     fprintf(stderr, "ADAMAH: Warning - matmul_xq4 shader not found\n");
   }
+  if (create_pipeline(&ctx.fused_qkv_t_xq4_pipe, "map_fused_qkv_t_xq4.spv", 10, 24) != 0) {
+    fprintf(stderr, "ADAMAH: Warning - fused_qkv_t_xq4 shader not found\n");
+  }
+  if (create_pipeline(&ctx.fused_gateup_t_xq4_pipe, "map_fused_gateup_t_xq4.spv", 8, 20) != 0) {
+    fprintf(stderr, "ADAMAH: Warning - fused_gateup_t_xq4 shader not found\n");
+  }
+  if (create_pipeline(&ctx.fused_qkv_t_xq8_pipe, "map_fused_qkv_t_xq8.spv", 10, 24) != 0) {
+    fprintf(stderr, "ADAMAH: Warning - fused_qkv_t_xq8 shader not found\n");
+  }
+  if (create_pipeline(&ctx.fused_gateup_t_xq8_pipe, "map_fused_gateup_t_xq8.spv", 8, 20) != 0) {
+    fprintf(stderr, "ADAMAH: Warning - fused_gateup_t_xq8 shader not found\n");
+  }
+  if (create_pipeline(&ctx.fused_gateup_act_t_xq8_pipe,
+                      "map_fused_gateup_act_t_xq8.spv", 7, 16) != 0) {
+    fprintf(stderr,
+            "ADAMAH: Warning - fused_gateup_act_t_xq8 shader not found\n");
+  }
+  if (create_pipeline(&ctx.full_decode_step_pipe, "map_full_decode_step.spv", 5,
+                      16) != 0) {
+    fprintf(stderr, "ADAMAH: Warning - full_decode_step shader not found\n");
+  }
   if (create_pipeline(&ctx.matvec_t_xq8_pipe, "map_matvec_t_xq8.spv", 6, 16) != 0) {
     fprintf(stderr, "ADAMAH: Warning - matvec_t_xq8 shader not found\n");
   }
@@ -4440,6 +4674,156 @@ static int fusion_queue_matmul_t_xq8(uint32_t map_act_id, uint32_t map_wt_id,
                                       N, n_ops);
 }
 
+static int fusion_queue_fused_qkv_t_xq4(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a, uint32_t locs_bq,
+    uint32_t locs_bk, uint32_t locs_bv, uint32_t locs_cq, uint32_t locs_ck,
+    uint32_t locs_cv, uint32_t K, uint32_t N_q, uint32_t N_k, uint32_t N_v) {
+  uint32_t read_handles[4] = {locs_a, locs_bq, locs_bk, locs_bv};
+  uint32_t write_handles[3] = {locs_cq, locs_ck, locs_cv};
+  int level = fusion_calc_level_handles(read_handles, 4, write_handles, 3);
+  fusion_auto_flush_if_needed(level);
+
+  FuseOp *fop = &fusion.ops[fusion.n_ops++];
+  memset(fop, 0, sizeof(*fop));
+  fop->op_type = FUSE_OP_FUSED_QKV_T_XQ4;
+  fop->map_id = map_act_id;
+  fop->map_id2 = map_wt_id;
+  fop->locs_extra[0] = locs_a;
+  fop->locs_extra[1] = locs_bq;
+  fop->locs_extra[2] = locs_bk;
+  fop->locs_extra[3] = locs_bv;
+  fop->locs_src = locs_cq;
+  fop->locs_src2 = locs_ck;
+  fop->locs_dst = locs_cv;
+  fop->M = K;
+  fop->K = N_q;
+  fop->N = N_k;
+  fop->n = N_v;
+  fop->level = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_cq);
+  fusion_mark_write(locs_cq, fop->level);
+  fusion_mark_write(locs_ck, fop->level);
+  fusion_mark_write(locs_cv, fop->level);
+  return ADAMAH_OK;
+}
+
+static int fusion_queue_fused_gateup_t_xq4(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a,
+    uint32_t locs_b_gate, uint32_t locs_b_up, uint32_t locs_c_gate,
+    uint32_t locs_c_up, uint32_t K, uint32_t N_gate, uint32_t N_up) {
+  uint32_t read_handles[3] = {locs_a, locs_b_gate, locs_b_up};
+  uint32_t write_handles[2] = {locs_c_gate, locs_c_up};
+  int level = fusion_calc_level_handles(read_handles, 3, write_handles, 2);
+  fusion_auto_flush_if_needed(level);
+
+  FuseOp *fop = &fusion.ops[fusion.n_ops++];
+  memset(fop, 0, sizeof(*fop));
+  fop->op_type = FUSE_OP_FUSED_GATEUP_T_XQ4;
+  fop->map_id = map_act_id;
+  fop->map_id2 = map_wt_id;
+  fop->locs_extra[0] = locs_a;
+  fop->locs_extra[1] = locs_b_gate;
+  fop->locs_extra[2] = locs_b_up;
+  fop->locs_src = locs_c_gate;
+  fop->locs_dst = locs_c_up;
+  fop->M = K;
+  fop->K = N_gate;
+  fop->N = N_up;
+  fop->level = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_c_gate);
+  fusion_mark_write(locs_c_gate, fop->level);
+  fusion_mark_write(locs_c_up, fop->level);
+  return ADAMAH_OK;
+}
+
+static int fusion_queue_fused_qkv_t_xq8(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a, uint32_t locs_bq,
+    uint32_t locs_bk, uint32_t locs_bv, uint32_t locs_cq, uint32_t locs_ck,
+    uint32_t locs_cv, uint32_t K, uint32_t N_q, uint32_t N_k, uint32_t N_v) {
+  uint32_t read_handles[4] = {locs_a, locs_bq, locs_bk, locs_bv};
+  uint32_t write_handles[3] = {locs_cq, locs_ck, locs_cv};
+  int level = fusion_calc_level_handles(read_handles, 4, write_handles, 3);
+  fusion_auto_flush_if_needed(level);
+
+  FuseOp *fop = &fusion.ops[fusion.n_ops++];
+  memset(fop, 0, sizeof(*fop));
+  fop->op_type = FUSE_OP_FUSED_QKV_T_XQ8;
+  fop->map_id = map_act_id;
+  fop->map_id2 = map_wt_id;
+  fop->locs_extra[0] = locs_a;
+  fop->locs_extra[1] = locs_bq;
+  fop->locs_extra[2] = locs_bk;
+  fop->locs_extra[3] = locs_bv;
+  fop->locs_src = locs_cq;
+  fop->locs_src2 = locs_ck;
+  fop->locs_dst = locs_cv;
+  fop->M = K;
+  fop->K = N_q;
+  fop->N = N_k;
+  fop->n = N_v;
+  fop->level = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_cq);
+  fusion_mark_write(locs_cq, fop->level);
+  fusion_mark_write(locs_ck, fop->level);
+  fusion_mark_write(locs_cv, fop->level);
+  return ADAMAH_OK;
+}
+
+static int fusion_queue_fused_gateup_t_xq8(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a,
+    uint32_t locs_b_gate, uint32_t locs_b_up, uint32_t locs_c_gate,
+    uint32_t locs_c_up, uint32_t K, uint32_t N_gate, uint32_t N_up) {
+  uint32_t read_handles[3] = {locs_a, locs_b_gate, locs_b_up};
+  uint32_t write_handles[2] = {locs_c_gate, locs_c_up};
+  int level = fusion_calc_level_handles(read_handles, 3, write_handles, 2);
+  fusion_auto_flush_if_needed(level);
+
+  FuseOp *fop = &fusion.ops[fusion.n_ops++];
+  memset(fop, 0, sizeof(*fop));
+  fop->op_type = FUSE_OP_FUSED_GATEUP_T_XQ8;
+  fop->map_id = map_act_id;
+  fop->map_id2 = map_wt_id;
+  fop->locs_extra[0] = locs_a;
+  fop->locs_extra[1] = locs_b_gate;
+  fop->locs_extra[2] = locs_b_up;
+  fop->locs_src = locs_c_gate;
+  fop->locs_dst = locs_c_up;
+  fop->M = K;
+  fop->K = N_gate;
+  fop->N = N_up;
+  fop->level = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_c_gate);
+  fusion_mark_write(locs_c_gate, fop->level);
+  fusion_mark_write(locs_c_up, fop->level);
+  return ADAMAH_OK;
+}
+
+static int fusion_queue_fused_gateup_act_t_xq8(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a,
+    uint32_t locs_b_gate, uint32_t locs_b_up, uint32_t locs_c_out, uint32_t K,
+    uint32_t N_ff) {
+  uint32_t read_handles[3] = {locs_a, locs_b_gate, locs_b_up};
+  uint32_t write_handles[1] = {locs_c_out};
+  int level = fusion_calc_level_handles(read_handles, 3, write_handles, 1);
+  fusion_auto_flush_if_needed(level);
+
+  FuseOp *fop = &fusion.ops[fusion.n_ops++];
+  memset(fop, 0, sizeof(*fop));
+  fop->op_type = FUSE_OP_FUSED_GATEUP_ACT_T_XQ8;
+  fop->map_id = map_act_id;
+  fop->map_id2 = map_wt_id;
+  fop->locs_extra[0] = locs_a;
+  fop->locs_extra[1] = locs_b_gate;
+  fop->locs_extra[2] = locs_b_up;
+  fop->locs_dst = locs_c_out;
+  fop->M = K;
+  fop->K = N_ff;
+  fop->level = level;
+  fop->write_alias = fusion_write_alias_for_handle(locs_c_out);
+  fusion_mark_write(locs_c_out, fop->level);
+  return ADAMAH_OK;
+}
+
 // Queue a reduce operation
 static int fusion_queue_reduce(uint32_t map_id, uint32_t op, uint32_t locs_src,
                                uint32_t locs_dst, uint32_t n) {
@@ -4781,6 +5165,28 @@ static int exec_matmul_t_xq8_internal(uint32_t map_act_id, uint32_t map_wt_id,
                                       uint32_t locs_a, uint32_t locs_b,
                                       uint32_t locs_c, uint32_t M, uint32_t K,
                                       uint32_t N, uint32_t n_ops);
+static int exec_fused_qkv_t_xq4_internal(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a,
+    uint32_t locs_bq, uint32_t locs_bk, uint32_t locs_bv, uint32_t locs_cq,
+    uint32_t locs_ck, uint32_t locs_cv, uint32_t K, uint32_t N_q,
+    uint32_t N_k, uint32_t N_v);
+static int exec_fused_gateup_t_xq4_internal(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a,
+    uint32_t locs_b_gate, uint32_t locs_b_up, uint32_t locs_c_gate,
+    uint32_t locs_c_up, uint32_t K, uint32_t N_gate, uint32_t N_up);
+static int exec_fused_qkv_t_xq8_internal(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a,
+    uint32_t locs_bq, uint32_t locs_bk, uint32_t locs_bv, uint32_t locs_cq,
+    uint32_t locs_ck, uint32_t locs_cv, uint32_t K, uint32_t N_q,
+    uint32_t N_k, uint32_t N_v);
+static int exec_fused_gateup_t_xq8_internal(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a,
+    uint32_t locs_b_gate, uint32_t locs_b_up, uint32_t locs_c_gate,
+    uint32_t locs_c_up, uint32_t K, uint32_t N_gate, uint32_t N_up);
+static int exec_fused_gateup_act_t_xq8_internal(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a,
+    uint32_t locs_b_gate, uint32_t locs_b_up, uint32_t locs_c_out, uint32_t K,
+    uint32_t N_ff);
 static int exec_reduce_internal(uint32_t map_id, uint32_t op, uint32_t locs_src,
                                 uint32_t locs_dst, uint32_t n);
 static int exec_softmax_internal(uint32_t map_id, uint32_t locs_src,
@@ -4871,6 +5277,30 @@ static int fusion_exec_queued_op(const FuseOp *fop) {
                                       fop->locs_extra[0], fop->locs_extra[1],
                                       fop->locs_extra[2], fop->M, fop->K,
                                       fop->N, fop->n);
+  case FUSE_OP_FUSED_QKV_T_XQ4:
+    return exec_fused_qkv_t_xq4_internal(
+        fop->map_id, fop->map_id2, fop->locs_extra[0], fop->locs_extra[1],
+        fop->locs_extra[2], fop->locs_extra[3], fop->locs_src, fop->locs_src2,
+        fop->locs_dst, fop->M, fop->K, fop->N, fop->n);
+  case FUSE_OP_FUSED_GATEUP_T_XQ4:
+    return exec_fused_gateup_t_xq4_internal(
+        fop->map_id, fop->map_id2, fop->locs_extra[0], fop->locs_extra[1],
+        fop->locs_extra[2], fop->locs_src, fop->locs_dst, fop->M, fop->K,
+        fop->N);
+  case FUSE_OP_FUSED_QKV_T_XQ8:
+    return exec_fused_qkv_t_xq8_internal(
+        fop->map_id, fop->map_id2, fop->locs_extra[0], fop->locs_extra[1],
+        fop->locs_extra[2], fop->locs_extra[3], fop->locs_src, fop->locs_src2,
+        fop->locs_dst, fop->M, fop->K, fop->N, fop->n);
+  case FUSE_OP_FUSED_GATEUP_T_XQ8:
+    return exec_fused_gateup_t_xq8_internal(
+        fop->map_id, fop->map_id2, fop->locs_extra[0], fop->locs_extra[1],
+        fop->locs_extra[2], fop->locs_src, fop->locs_dst, fop->M, fop->K,
+        fop->N);
+  case FUSE_OP_FUSED_GATEUP_ACT_T_XQ8:
+    return exec_fused_gateup_act_t_xq8_internal(
+        fop->map_id, fop->map_id2, fop->locs_extra[0], fop->locs_extra[1],
+        fop->locs_extra[2], fop->locs_dst, fop->M, fop->K);
   case FUSE_OP_REDUCE:
     return exec_reduce_internal(fop->map_id, fop->op_code, fop->locs_src,
                                 fop->locs_dst, fop->n);
@@ -8081,6 +8511,665 @@ static int exec_matmul_t_xq4_internal(uint32_t map_act_id, uint32_t map_wt_id,
 // Cross-map MatMul F32×Q4: C = A @ B (non-transposed)
 // A from map_act (F32), B from map_wt (Q4), C to map_act (F32)
 // ============================================
+int map_fused_qkv_t_xq4_dev(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a_handle,
+    uint32_t locs_bq_handle, uint32_t locs_bk_handle, uint32_t locs_bv_handle,
+    uint32_t locs_cq_handle, uint32_t locs_ck_handle, uint32_t locs_cv_handle,
+    uint32_t K, uint32_t N_q, uint32_t N_k, uint32_t N_v) {
+  if (fusion.enabled) {
+    return fusion_queue_fused_qkv_t_xq4(
+        map_act_id, map_wt_id, locs_a_handle, locs_bq_handle, locs_bk_handle,
+        locs_bv_handle, locs_cq_handle, locs_ck_handle, locs_cv_handle, K, N_q,
+        N_k, N_v);
+  }
+  return exec_fused_qkv_t_xq4_internal(
+      map_act_id, map_wt_id, locs_a_handle, locs_bq_handle, locs_bk_handle,
+      locs_bv_handle, locs_cq_handle, locs_ck_handle, locs_cv_handle, K, N_q,
+      N_k, N_v);
+}
+
+static int exec_fused_qkv_t_xq4_internal(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a_handle,
+    uint32_t locs_bq_handle, uint32_t locs_bk_handle, uint32_t locs_bv_handle,
+    uint32_t locs_cq_handle, uint32_t locs_ck_handle, uint32_t locs_cv_handle,
+    uint32_t K, uint32_t N_q, uint32_t N_k, uint32_t N_v) {
+  if (map_act_id >= MAX_MAPS || !ctx.maps[map_act_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (map_wt_id >= MAX_MAPS || !ctx.maps[map_wt_id].active)
+    return ADAMAH_ERR_INVALID;
+  if ((N_q | N_k | N_v) == 0)
+    return ADAMAH_OK;
+  if (!ctx.fused_qkv_t_xq4_pipe.pipeline && init_pipelines() != 0)
+    return ADAMAH_ERR_VULKAN;
+  if (!ctx.fused_qkv_t_xq4_pipe.pipeline)
+    return ADAMAH_ERR_INVALID;
+
+  Map *m_act = &ctx.maps[map_act_id];
+  Map *m_wt = &ctx.maps[map_wt_id];
+  if (m_wt->qparam_buf == VK_NULL_HANDLE || m_wt->group_size == 0)
+    return ADAMAH_ERR_INVALID;
+
+  ResEntry *a_res = res_get(locs_a_handle);
+  ResEntry *bq_res = res_get(locs_bq_handle);
+  ResEntry *bk_res = res_get(locs_bk_handle);
+  ResEntry *bv_res = res_get(locs_bv_handle);
+  ResEntry *cq_res = res_get(locs_cq_handle);
+  ResEntry *ck_res = res_get(locs_ck_handle);
+  ResEntry *cv_res = res_get(locs_cv_handle);
+  if (!a_res || !bq_res || !bk_res || !bv_res || !cq_res || !ck_res || !cv_res)
+    return ADAMAH_ERR_INVALID;
+
+  res_pin(locs_a_handle);
+  res_pin(locs_bq_handle);
+  res_pin(locs_bk_handle);
+  res_pin(locs_bv_handle);
+  res_pin(locs_cq_handle);
+  res_pin(locs_ck_handle);
+  res_pin(locs_cv_handle);
+
+  VkDeviceSize a_off = 0, bq_off = 0, bk_off = 0, bv_off = 0;
+  VkDeviceSize cq_off = 0, ck_off = 0, cv_off = 0;
+  int ret = ADAMAH_OK;
+  if (res_require_hot(locs_a_handle, &a_off) != 0 ||
+      res_require_hot(locs_bq_handle, &bq_off) != 0 ||
+      res_require_hot(locs_bk_handle, &bk_off) != 0 ||
+      res_require_hot(locs_bv_handle, &bv_off) != 0 ||
+      res_require_hot(locs_cq_handle, &cq_off) != 0 ||
+      res_require_hot(locs_ck_handle, &ck_off) != 0 ||
+      res_require_hot(locs_cv_handle, &cv_off) != 0) {
+    ret = ADAMAH_ERR_INVALID;
+    goto cleanup_qkv;
+  }
+
+  VkDescriptorSet ds = alloc_desc_set(&ctx.fused_qkv_t_xq4_pipe);
+  if (ds == VK_NULL_HANDLE) {
+    ret = ADAMAH_ERR_VULKAN;
+    goto cleanup_qkv;
+  }
+
+  VkDescriptorBufferInfo buf_infos[10] = {
+      {.buffer = m_act->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = m_wt->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = ctx.hot_pool->buf, .offset = a_off, .range = a_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = bq_off, .range = bq_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = bk_off, .range = bk_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = bv_off, .range = bv_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = cq_off, .range = cq_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = ck_off, .range = ck_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = cv_off, .range = cv_res->size_bytes},
+      {.buffer = m_wt->qparam_buf, .range = VK_WHOLE_SIZE},
+  };
+  VkWriteDescriptorSet writes[10];
+  for (int i = 0; i < 10; i++) {
+    writes[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = ds,
+        .dstBinding = (uint32_t)i,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &buf_infos[i]};
+  }
+  vkUpdateDescriptorSets(ctx.device, 10, writes, 0, NULL);
+
+  uint32_t max_n = N_q > N_k ? N_q : N_k;
+  if (N_v > max_n)
+    max_n = N_v;
+  uint32_t rows_per_group = 4u;
+  if (rows_per_group > max_n)
+    rows_per_group = max_n;
+  if (rows_per_group == 0)
+    rows_per_group = 1;
+
+  uint32_t groups_q = (N_q + rows_per_group - 1) / rows_per_group;
+  uint32_t groups_k = (N_k + rows_per_group - 1) / rows_per_group;
+  uint32_t groups_v = (N_v + rows_per_group - 1) / rows_per_group;
+  uint32_t grid_x = groups_q > groups_k ? groups_q : groups_k;
+  if (groups_v > grid_x)
+    grid_x = groups_v;
+  if (grid_x == 0) {
+    ret = ADAMAH_OK;
+    goto cleanup_qkv;
+  }
+
+  uint32_t push[6] = {K, N_q, N_k, N_v, m_wt->group_size, rows_per_group};
+  cmd_begin();
+  vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    ctx.fused_qkv_t_xq4_pipe.pipeline);
+  vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ctx.fused_qkv_t_xq4_pipe.pipe_layout, 0, 1, &ds, 0,
+                          NULL);
+  vkCmdPushConstants(ctx.cmd, ctx.fused_qkv_t_xq4_pipe.pipe_layout,
+                     VK_SHADER_STAGE_COMPUTE_BIT, 0, 24, push);
+  vkCmdDispatch(ctx.cmd, grid_x, 3, 1);
+  cmd_barrier_after_dispatch();
+  cmd_submit();
+
+cleanup_qkv:
+  res_unpin(locs_a_handle);
+  res_unpin(locs_bq_handle);
+  res_unpin(locs_bk_handle);
+  res_unpin(locs_bv_handle);
+  res_unpin(locs_cq_handle);
+  res_unpin(locs_ck_handle);
+  res_unpin(locs_cv_handle);
+  return ret;
+}
+
+int map_fused_gateup_t_xq4_dev(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a_handle,
+    uint32_t locs_b_gate_handle, uint32_t locs_b_up_handle,
+    uint32_t locs_c_gate_handle, uint32_t locs_c_up_handle, uint32_t K,
+    uint32_t N_gate, uint32_t N_up) {
+  if (fusion.enabled) {
+    return fusion_queue_fused_gateup_t_xq4(
+        map_act_id, map_wt_id, locs_a_handle, locs_b_gate_handle,
+        locs_b_up_handle, locs_c_gate_handle, locs_c_up_handle, K, N_gate,
+        N_up);
+  }
+  return exec_fused_gateup_t_xq4_internal(
+      map_act_id, map_wt_id, locs_a_handle, locs_b_gate_handle,
+      locs_b_up_handle, locs_c_gate_handle, locs_c_up_handle, K, N_gate,
+      N_up);
+}
+
+static int exec_fused_gateup_t_xq4_internal(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a_handle,
+    uint32_t locs_b_gate_handle, uint32_t locs_b_up_handle,
+    uint32_t locs_c_gate_handle, uint32_t locs_c_up_handle, uint32_t K,
+    uint32_t N_gate, uint32_t N_up) {
+  if (map_act_id >= MAX_MAPS || !ctx.maps[map_act_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (map_wt_id >= MAX_MAPS || !ctx.maps[map_wt_id].active)
+    return ADAMAH_ERR_INVALID;
+  if ((N_gate | N_up) == 0)
+    return ADAMAH_OK;
+  if (!ctx.fused_gateup_t_xq4_pipe.pipeline && init_pipelines() != 0)
+    return ADAMAH_ERR_VULKAN;
+  if (!ctx.fused_gateup_t_xq4_pipe.pipeline)
+    return ADAMAH_ERR_INVALID;
+
+  Map *m_act = &ctx.maps[map_act_id];
+  Map *m_wt = &ctx.maps[map_wt_id];
+  if (m_wt->qparam_buf == VK_NULL_HANDLE || m_wt->group_size == 0)
+    return ADAMAH_ERR_INVALID;
+
+  ResEntry *a_res = res_get(locs_a_handle);
+  ResEntry *bg_res = res_get(locs_b_gate_handle);
+  ResEntry *bu_res = res_get(locs_b_up_handle);
+  ResEntry *cg_res = res_get(locs_c_gate_handle);
+  ResEntry *cu_res = res_get(locs_c_up_handle);
+  if (!a_res || !bg_res || !bu_res || !cg_res || !cu_res)
+    return ADAMAH_ERR_INVALID;
+
+  res_pin(locs_a_handle);
+  res_pin(locs_b_gate_handle);
+  res_pin(locs_b_up_handle);
+  res_pin(locs_c_gate_handle);
+  res_pin(locs_c_up_handle);
+
+  VkDeviceSize a_off = 0, bg_off = 0, bu_off = 0, cg_off = 0, cu_off = 0;
+  int ret = ADAMAH_OK;
+  if (res_require_hot(locs_a_handle, &a_off) != 0 ||
+      res_require_hot(locs_b_gate_handle, &bg_off) != 0 ||
+      res_require_hot(locs_b_up_handle, &bu_off) != 0 ||
+      res_require_hot(locs_c_gate_handle, &cg_off) != 0 ||
+      res_require_hot(locs_c_up_handle, &cu_off) != 0) {
+    ret = ADAMAH_ERR_INVALID;
+    goto cleanup_gateup;
+  }
+
+  VkDescriptorSet ds = alloc_desc_set(&ctx.fused_gateup_t_xq4_pipe);
+  if (ds == VK_NULL_HANDLE) {
+    ret = ADAMAH_ERR_VULKAN;
+    goto cleanup_gateup;
+  }
+
+  VkDescriptorBufferInfo buf_infos[8] = {
+      {.buffer = m_act->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = m_wt->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = ctx.hot_pool->buf, .offset = a_off, .range = a_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = bg_off, .range = bg_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = bu_off, .range = bu_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = cg_off, .range = cg_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = cu_off, .range = cu_res->size_bytes},
+      {.buffer = m_wt->qparam_buf, .range = VK_WHOLE_SIZE},
+  };
+  VkWriteDescriptorSet writes[8];
+  for (int i = 0; i < 8; i++) {
+    writes[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = ds,
+        .dstBinding = (uint32_t)i,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &buf_infos[i]};
+  }
+  vkUpdateDescriptorSets(ctx.device, 8, writes, 0, NULL);
+
+  uint32_t max_n = N_gate > N_up ? N_gate : N_up;
+  uint32_t rows_per_group = 4u;
+  if (rows_per_group > max_n)
+    rows_per_group = max_n;
+  if (rows_per_group == 0)
+    rows_per_group = 1;
+
+  uint32_t groups_gate = (N_gate + rows_per_group - 1) / rows_per_group;
+  uint32_t groups_up = (N_up + rows_per_group - 1) / rows_per_group;
+  uint32_t grid_x = groups_gate > groups_up ? groups_gate : groups_up;
+  if (grid_x == 0) {
+    ret = ADAMAH_OK;
+    goto cleanup_gateup;
+  }
+
+  uint32_t push[5] = {K, N_gate, N_up, m_wt->group_size, rows_per_group};
+  cmd_begin();
+  vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    ctx.fused_gateup_t_xq4_pipe.pipeline);
+  vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ctx.fused_gateup_t_xq4_pipe.pipe_layout, 0, 1, &ds,
+                          0, NULL);
+  vkCmdPushConstants(ctx.cmd, ctx.fused_gateup_t_xq4_pipe.pipe_layout,
+                     VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, push);
+  vkCmdDispatch(ctx.cmd, grid_x, 2, 1);
+  cmd_barrier_after_dispatch();
+  cmd_submit();
+
+cleanup_gateup:
+  res_unpin(locs_a_handle);
+  res_unpin(locs_b_gate_handle);
+  res_unpin(locs_b_up_handle);
+  res_unpin(locs_c_gate_handle);
+  res_unpin(locs_c_up_handle);
+  return ret;
+}
+
+int map_fused_qkv_t_xq8_dev(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a_handle,
+    uint32_t locs_bq_handle, uint32_t locs_bk_handle, uint32_t locs_bv_handle,
+    uint32_t locs_cq_handle, uint32_t locs_ck_handle, uint32_t locs_cv_handle,
+    uint32_t K, uint32_t N_q, uint32_t N_k, uint32_t N_v) {
+  if (fusion.enabled) {
+    return fusion_queue_fused_qkv_t_xq8(
+        map_act_id, map_wt_id, locs_a_handle, locs_bq_handle, locs_bk_handle,
+        locs_bv_handle, locs_cq_handle, locs_ck_handle, locs_cv_handle, K, N_q,
+        N_k, N_v);
+  }
+  return exec_fused_qkv_t_xq8_internal(
+      map_act_id, map_wt_id, locs_a_handle, locs_bq_handle, locs_bk_handle,
+      locs_bv_handle, locs_cq_handle, locs_ck_handle, locs_cv_handle, K, N_q,
+      N_k, N_v);
+}
+
+static int exec_fused_qkv_t_xq8_internal(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a_handle,
+    uint32_t locs_bq_handle, uint32_t locs_bk_handle, uint32_t locs_bv_handle,
+    uint32_t locs_cq_handle, uint32_t locs_ck_handle, uint32_t locs_cv_handle,
+    uint32_t K, uint32_t N_q, uint32_t N_k, uint32_t N_v) {
+  if (map_act_id >= MAX_MAPS || !ctx.maps[map_act_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (map_wt_id >= MAX_MAPS || !ctx.maps[map_wt_id].active)
+    return ADAMAH_ERR_INVALID;
+  if ((N_q | N_k | N_v) == 0)
+    return ADAMAH_OK;
+  if (!ctx.fused_qkv_t_xq8_pipe.pipeline && init_pipelines() != 0)
+    return ADAMAH_ERR_VULKAN;
+  if (!ctx.fused_qkv_t_xq8_pipe.pipeline)
+    return ADAMAH_ERR_INVALID;
+
+  Map *m_act = &ctx.maps[map_act_id];
+  Map *m_wt = &ctx.maps[map_wt_id];
+  if (m_wt->qparam_buf == VK_NULL_HANDLE || m_wt->group_size == 0)
+    return ADAMAH_ERR_INVALID;
+
+  ResEntry *a_res = res_get(locs_a_handle);
+  ResEntry *bq_res = res_get(locs_bq_handle);
+  ResEntry *bk_res = res_get(locs_bk_handle);
+  ResEntry *bv_res = res_get(locs_bv_handle);
+  ResEntry *cq_res = res_get(locs_cq_handle);
+  ResEntry *ck_res = res_get(locs_ck_handle);
+  ResEntry *cv_res = res_get(locs_cv_handle);
+  if (!a_res || !bq_res || !bk_res || !bv_res || !cq_res || !ck_res || !cv_res)
+    return ADAMAH_ERR_INVALID;
+
+  res_pin(locs_a_handle);
+  res_pin(locs_bq_handle);
+  res_pin(locs_bk_handle);
+  res_pin(locs_bv_handle);
+  res_pin(locs_cq_handle);
+  res_pin(locs_ck_handle);
+  res_pin(locs_cv_handle);
+
+  VkDeviceSize a_off = 0, bq_off = 0, bk_off = 0, bv_off = 0;
+  VkDeviceSize cq_off = 0, ck_off = 0, cv_off = 0;
+  int ret = ADAMAH_OK;
+  if (res_require_hot(locs_a_handle, &a_off) != 0 ||
+      res_require_hot(locs_bq_handle, &bq_off) != 0 ||
+      res_require_hot(locs_bk_handle, &bk_off) != 0 ||
+      res_require_hot(locs_bv_handle, &bv_off) != 0 ||
+      res_require_hot(locs_cq_handle, &cq_off) != 0 ||
+      res_require_hot(locs_ck_handle, &ck_off) != 0 ||
+      res_require_hot(locs_cv_handle, &cv_off) != 0) {
+    ret = ADAMAH_ERR_INVALID;
+    goto cleanup_qkv8;
+  }
+
+  VkDescriptorSet ds = alloc_desc_set(&ctx.fused_qkv_t_xq8_pipe);
+  if (ds == VK_NULL_HANDLE) {
+    ret = ADAMAH_ERR_VULKAN;
+    goto cleanup_qkv8;
+  }
+
+  VkDescriptorBufferInfo buf_infos[10] = {
+      {.buffer = m_act->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = m_wt->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = ctx.hot_pool->buf, .offset = a_off, .range = a_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = bq_off, .range = bq_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = bk_off, .range = bk_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = bv_off, .range = bv_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = cq_off, .range = cq_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = ck_off, .range = ck_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = cv_off, .range = cv_res->size_bytes},
+      {.buffer = m_wt->qparam_buf, .range = VK_WHOLE_SIZE},
+  };
+  VkWriteDescriptorSet writes[10];
+  for (int i = 0; i < 10; i++) {
+    writes[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = ds,
+        .dstBinding = (uint32_t)i,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &buf_infos[i]};
+  }
+  vkUpdateDescriptorSets(ctx.device, 10, writes, 0, NULL);
+
+  uint32_t max_n = N_q;
+  if (N_k > max_n) max_n = N_k;
+  if (N_v > max_n) max_n = N_v;
+  uint32_t rows_per_group = 4u;
+  if (rows_per_group > max_n)
+    rows_per_group = max_n;
+  if (rows_per_group == 0)
+    rows_per_group = 1;
+
+  uint32_t groups_q = (N_q + rows_per_group - 1) / rows_per_group;
+  uint32_t groups_k = (N_k + rows_per_group - 1) / rows_per_group;
+  uint32_t groups_v = (N_v + rows_per_group - 1) / rows_per_group;
+  uint32_t grid_x = groups_q;
+  if (groups_k > grid_x) grid_x = groups_k;
+  if (groups_v > grid_x) grid_x = groups_v;
+  if (grid_x == 0) {
+    ret = ADAMAH_OK;
+    goto cleanup_qkv8;
+  }
+
+  uint32_t push[6] = {K, N_q, N_k, N_v, m_wt->group_size, rows_per_group};
+  cmd_begin();
+  vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    ctx.fused_qkv_t_xq8_pipe.pipeline);
+  vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ctx.fused_qkv_t_xq8_pipe.pipe_layout, 0, 1, &ds,
+                          0, NULL);
+  vkCmdPushConstants(ctx.cmd, ctx.fused_qkv_t_xq8_pipe.pipe_layout,
+                     VK_SHADER_STAGE_COMPUTE_BIT, 0, 24, push);
+  vkCmdDispatch(ctx.cmd, grid_x, 3, 1);
+  cmd_barrier_after_dispatch();
+  cmd_submit();
+
+cleanup_qkv8:
+  res_unpin(locs_a_handle);
+  res_unpin(locs_bq_handle);
+  res_unpin(locs_bk_handle);
+  res_unpin(locs_bv_handle);
+  res_unpin(locs_cq_handle);
+  res_unpin(locs_ck_handle);
+  res_unpin(locs_cv_handle);
+  return ret;
+}
+
+int map_fused_gateup_t_xq8_dev(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a_handle,
+    uint32_t locs_b_gate_handle, uint32_t locs_b_up_handle,
+    uint32_t locs_c_gate_handle, uint32_t locs_c_up_handle, uint32_t K,
+    uint32_t N_gate, uint32_t N_up) {
+  if (fusion.enabled) {
+    return fusion_queue_fused_gateup_t_xq8(
+        map_act_id, map_wt_id, locs_a_handle, locs_b_gate_handle,
+        locs_b_up_handle, locs_c_gate_handle, locs_c_up_handle, K, N_gate,
+        N_up);
+  }
+  return exec_fused_gateup_t_xq8_internal(
+      map_act_id, map_wt_id, locs_a_handle, locs_b_gate_handle,
+      locs_b_up_handle, locs_c_gate_handle, locs_c_up_handle, K, N_gate,
+      N_up);
+}
+
+static int exec_fused_gateup_t_xq8_internal(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a_handle,
+    uint32_t locs_b_gate_handle, uint32_t locs_b_up_handle,
+    uint32_t locs_c_gate_handle, uint32_t locs_c_up_handle, uint32_t K,
+    uint32_t N_gate, uint32_t N_up) {
+  if (map_act_id >= MAX_MAPS || !ctx.maps[map_act_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (map_wt_id >= MAX_MAPS || !ctx.maps[map_wt_id].active)
+    return ADAMAH_ERR_INVALID;
+  if ((N_gate | N_up) == 0)
+    return ADAMAH_OK;
+  if (!ctx.fused_gateup_t_xq8_pipe.pipeline && init_pipelines() != 0)
+    return ADAMAH_ERR_VULKAN;
+  if (!ctx.fused_gateup_t_xq8_pipe.pipeline)
+    return ADAMAH_ERR_INVALID;
+
+  Map *m_act = &ctx.maps[map_act_id];
+  Map *m_wt = &ctx.maps[map_wt_id];
+  if (m_wt->qparam_buf == VK_NULL_HANDLE || m_wt->group_size == 0)
+    return ADAMAH_ERR_INVALID;
+
+  ResEntry *a_res = res_get(locs_a_handle);
+  ResEntry *bg_res = res_get(locs_b_gate_handle);
+  ResEntry *bu_res = res_get(locs_b_up_handle);
+  ResEntry *cg_res = res_get(locs_c_gate_handle);
+  ResEntry *cu_res = res_get(locs_c_up_handle);
+  if (!a_res || !bg_res || !bu_res || !cg_res || !cu_res)
+    return ADAMAH_ERR_INVALID;
+
+  res_pin(locs_a_handle);
+  res_pin(locs_b_gate_handle);
+  res_pin(locs_b_up_handle);
+  res_pin(locs_c_gate_handle);
+  res_pin(locs_c_up_handle);
+
+  VkDeviceSize a_off = 0, bg_off = 0, bu_off = 0, cg_off = 0, cu_off = 0;
+  int ret = ADAMAH_OK;
+  if (res_require_hot(locs_a_handle, &a_off) != 0 ||
+      res_require_hot(locs_b_gate_handle, &bg_off) != 0 ||
+      res_require_hot(locs_b_up_handle, &bu_off) != 0 ||
+      res_require_hot(locs_c_gate_handle, &cg_off) != 0 ||
+      res_require_hot(locs_c_up_handle, &cu_off) != 0) {
+    ret = ADAMAH_ERR_INVALID;
+    goto cleanup_gateup8;
+  }
+
+  VkDescriptorSet ds = alloc_desc_set(&ctx.fused_gateup_t_xq8_pipe);
+  if (ds == VK_NULL_HANDLE) {
+    ret = ADAMAH_ERR_VULKAN;
+    goto cleanup_gateup8;
+  }
+
+  VkDescriptorBufferInfo buf_infos[8] = {
+      {.buffer = m_act->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = m_wt->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = ctx.hot_pool->buf, .offset = a_off, .range = a_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = bg_off, .range = bg_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = bu_off, .range = bu_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = cg_off, .range = cg_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = cu_off, .range = cu_res->size_bytes},
+      {.buffer = m_wt->qparam_buf, .range = VK_WHOLE_SIZE},
+  };
+  VkWriteDescriptorSet writes[8];
+  for (int i = 0; i < 8; i++) {
+    writes[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = ds,
+        .dstBinding = (uint32_t)i,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &buf_infos[i]};
+  }
+  vkUpdateDescriptorSets(ctx.device, 8, writes, 0, NULL);
+
+  uint32_t max_n = N_gate > N_up ? N_gate : N_up;
+  uint32_t rows_per_group = 4u;
+  if (rows_per_group > max_n)
+    rows_per_group = max_n;
+  if (rows_per_group == 0)
+    rows_per_group = 1;
+
+  uint32_t groups_gate = (N_gate + rows_per_group - 1) / rows_per_group;
+  uint32_t groups_up = (N_up + rows_per_group - 1) / rows_per_group;
+  uint32_t grid_x = groups_gate > groups_up ? groups_gate : groups_up;
+  if (grid_x == 0) {
+    ret = ADAMAH_OK;
+    goto cleanup_gateup8;
+  }
+
+  uint32_t push[5] = {K, N_gate, N_up, m_wt->group_size, rows_per_group};
+  cmd_begin();
+  vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    ctx.fused_gateup_t_xq8_pipe.pipeline);
+  vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ctx.fused_gateup_t_xq8_pipe.pipe_layout, 0, 1, &ds,
+                          0, NULL);
+  vkCmdPushConstants(ctx.cmd, ctx.fused_gateup_t_xq8_pipe.pipe_layout,
+                     VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, push);
+  vkCmdDispatch(ctx.cmd, grid_x, 2, 1);
+  cmd_barrier_after_dispatch();
+  cmd_submit();
+
+cleanup_gateup8:
+  res_unpin(locs_a_handle);
+  res_unpin(locs_b_gate_handle);
+  res_unpin(locs_b_up_handle);
+  res_unpin(locs_c_gate_handle);
+  res_unpin(locs_c_up_handle);
+  return ret;
+}
+
+int map_fused_gateup_act_t_xq8_dev(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a_handle,
+    uint32_t locs_b_gate_handle, uint32_t locs_b_up_handle,
+    uint32_t locs_c_out_handle, uint32_t K, uint32_t N_ff) {
+  if (fusion.enabled) {
+    return fusion_queue_fused_gateup_act_t_xq8(
+        map_act_id, map_wt_id, locs_a_handle, locs_b_gate_handle,
+        locs_b_up_handle, locs_c_out_handle, K, N_ff);
+  }
+  return exec_fused_gateup_act_t_xq8_internal(
+      map_act_id, map_wt_id, locs_a_handle, locs_b_gate_handle,
+      locs_b_up_handle, locs_c_out_handle, K, N_ff);
+}
+
+static int exec_fused_gateup_act_t_xq8_internal(
+    uint32_t map_act_id, uint32_t map_wt_id, uint32_t locs_a_handle,
+    uint32_t locs_b_gate_handle, uint32_t locs_b_up_handle,
+    uint32_t locs_c_out_handle, uint32_t K, uint32_t N_ff) {
+  if (map_act_id >= MAX_MAPS || !ctx.maps[map_act_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (map_wt_id >= MAX_MAPS || !ctx.maps[map_wt_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (N_ff == 0)
+    return ADAMAH_OK;
+  if (!ctx.fused_gateup_act_t_xq8_pipe.pipeline && init_pipelines() != 0)
+    return ADAMAH_ERR_VULKAN;
+  if (!ctx.fused_gateup_act_t_xq8_pipe.pipeline)
+    return ADAMAH_ERR_INVALID;
+
+  Map *m_act = &ctx.maps[map_act_id];
+  Map *m_wt = &ctx.maps[map_wt_id];
+  if (m_wt->qparam_buf == VK_NULL_HANDLE || m_wt->group_size == 0)
+    return ADAMAH_ERR_INVALID;
+
+  ResEntry *a_res = res_get(locs_a_handle);
+  ResEntry *bg_res = res_get(locs_b_gate_handle);
+  ResEntry *bu_res = res_get(locs_b_up_handle);
+  ResEntry *co_res = res_get(locs_c_out_handle);
+  if (!a_res || !bg_res || !bu_res || !co_res)
+    return ADAMAH_ERR_INVALID;
+
+  res_pin(locs_a_handle);
+  res_pin(locs_b_gate_handle);
+  res_pin(locs_b_up_handle);
+  res_pin(locs_c_out_handle);
+
+  VkDeviceSize a_off = 0, bg_off = 0, bu_off = 0, co_off = 0;
+  int ret = ADAMAH_OK;
+  if (res_require_hot(locs_a_handle, &a_off) != 0 ||
+      res_require_hot(locs_b_gate_handle, &bg_off) != 0 ||
+      res_require_hot(locs_b_up_handle, &bu_off) != 0 ||
+      res_require_hot(locs_c_out_handle, &co_off) != 0) {
+    ret = ADAMAH_ERR_INVALID;
+    goto cleanup_gateup_act8;
+  }
+
+  VkDescriptorSet ds = alloc_desc_set(&ctx.fused_gateup_act_t_xq8_pipe);
+  if (ds == VK_NULL_HANDLE) {
+    ret = ADAMAH_ERR_VULKAN;
+    goto cleanup_gateup_act8;
+  }
+
+  VkDescriptorBufferInfo buf_infos[7] = {
+      {.buffer = m_act->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = m_wt->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = ctx.hot_pool->buf, .offset = a_off, .range = a_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = bg_off, .range = bg_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = bu_off, .range = bu_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = co_off, .range = co_res->size_bytes},
+      {.buffer = m_wt->qparam_buf, .range = VK_WHOLE_SIZE},
+  };
+  VkWriteDescriptorSet writes[7];
+  for (int i = 0; i < 7; i++) {
+    writes[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = ds,
+        .dstBinding = (uint32_t)i,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &buf_infos[i]};
+  }
+  vkUpdateDescriptorSets(ctx.device, 7, writes, 0, NULL);
+
+  uint32_t rows_per_group = 4u;
+  if (rows_per_group > N_ff)
+    rows_per_group = N_ff;
+  if (rows_per_group == 0)
+    rows_per_group = 1;
+  uint32_t grid_x = (N_ff + rows_per_group - 1) / rows_per_group;
+  if (grid_x == 0) {
+    ret = ADAMAH_OK;
+    goto cleanup_gateup_act8;
+  }
+
+  uint32_t push[4] = {K, N_ff, m_wt->group_size, rows_per_group};
+  cmd_begin();
+  vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    ctx.fused_gateup_act_t_xq8_pipe.pipeline);
+  vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ctx.fused_gateup_act_t_xq8_pipe.pipe_layout, 0, 1,
+                          &ds, 0, NULL);
+  vkCmdPushConstants(ctx.cmd, ctx.fused_gateup_act_t_xq8_pipe.pipe_layout,
+                     VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, push);
+  vkCmdDispatch(ctx.cmd, grid_x, 1, 1);
+  cmd_barrier_after_dispatch();
+  cmd_submit();
+
+cleanup_gateup_act8:
+  res_unpin(locs_a_handle);
+  res_unpin(locs_b_gate_handle);
+  res_unpin(locs_b_up_handle);
+  res_unpin(locs_c_out_handle);
+  return ret;
+}
+
 int map_matmul_xq4_dev(uint32_t map_act_id, uint32_t map_wt_id,
                        uint32_t locs_a_handle, uint32_t locs_b_handle,
                        uint32_t locs_c_handle, uint32_t M, uint32_t K,
@@ -8766,6 +9855,23 @@ static int decode_exec_op(const AdamahDecodePlanOp *op, uint32_t pos,
   case ADAMAH_DECODE_OP_ATTN_SOFTMAX_VALUE:
     return map_attn_softmax_value_dev(op->map_id, op->h0, op->h1, op->h2, u0,
                                       u1, u2, op->f0, op->f1);
+  case ADAMAH_DECODE_OP_FUSED_QKV_T_XQ4:
+    return map_fused_qkv_t_xq4_dev(
+        op->map_id, op->map_id2, op->h0, op->h1, op->h2, op->h3, op->h4,
+        op->h5, u0, u1, u2, u3, u4);
+  case ADAMAH_DECODE_OP_FUSED_GATEUP_T_XQ4:
+    return map_fused_gateup_t_xq4_dev(op->map_id, op->map_id2, op->h0, op->h1,
+                                      op->h2, op->h3, op->h4, u0, u1, u2);
+  case ADAMAH_DECODE_OP_FUSED_QKV_T_XQ8:
+    return map_fused_qkv_t_xq8_dev(
+        op->map_id, op->map_id2, op->h0, op->h1, op->h2, op->h3, op->h4,
+        op->h5, u0, u1, u2, u3, u4);
+  case ADAMAH_DECODE_OP_FUSED_GATEUP_T_XQ8:
+    return map_fused_gateup_t_xq8_dev(op->map_id, op->map_id2, op->h0, op->h1,
+                                      op->h2, op->h3, op->h4, u0, u1, u2);
+  case ADAMAH_DECODE_OP_FUSED_GATEUP_ACT_T_XQ8:
+    return map_fused_gateup_act_t_xq8_dev(op->map_id, op->map_id2, op->h0,
+                                          op->h1, op->h2, op->h3, u0, u1);
   default:
     (void)u5;
     return ADAMAH_ERR_INVALID;
@@ -8831,6 +9937,188 @@ int adamah_decode_step(uint32_t plan_id, uint32_t pos, uint32_t seq_len) {
   return ret;
 }
 
+static int ensure_full_decode_weight_buffer(void) {
+  if (ctx.full_decode_wa_buf != VK_NULL_HANDLE &&
+      ctx.full_decode_wa_mem != VK_NULL_HANDLE) {
+    return ADAMAH_OK;
+  }
+  VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  if (create_buffer(&ctx.full_decode_wa_buf, &ctx.full_decode_wa_mem,
+                    sizeof(FullDecodeWeightAddrs), usage, 1) != 0) {
+    ctx.full_decode_wa_buf = VK_NULL_HANDLE;
+    ctx.full_decode_wa_mem = VK_NULL_HANDLE;
+    return ADAMAH_ERR_MEMORY;
+  }
+  return ADAMAH_OK;
+}
+
+int adamah_has_full_decode_step(void) {
+  if (!ctx.initialized)
+    return 0;
+  if (!ctx.has_buffer_device_address || !ctx.pfn_get_buffer_device_address)
+    return 0;
+  if (ctx.full_decode_step_pipe.pipeline)
+    return 1;
+  if (init_pipelines() != 0)
+    return 0;
+  return ctx.full_decode_step_pipe.pipeline ? 1 : 0;
+}
+
+int adamah_full_decode_register(uint32_t map_ws_id, uint32_t map_kvcache_id,
+                                const FullDecodeWeightAddrs *wa,
+                                uint32_t n_layer) {
+  if (!ctx.initialized || !wa)
+    return ADAMAH_ERR_INVALID;
+  if (!ctx.has_buffer_device_address || !ctx.pfn_get_buffer_device_address)
+    return ADAMAH_ERR_NOT_FOUND;
+  if (map_ws_id >= MAX_MAPS || !ctx.maps[map_ws_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (map_kvcache_id >= MAX_MAPS || !ctx.maps[map_kvcache_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (n_layer == 0 || n_layer > ADAMAH_FULL_DECODE_MAX_LAYERS)
+    return ADAMAH_ERR_INVALID;
+  if (!ctx.full_decode_step_pipe.pipeline && init_pipelines() != 0)
+    return ADAMAH_ERR_VULKAN;
+  if (!ctx.full_decode_step_pipe.pipeline)
+    return ADAMAH_ERR_NOT_FOUND;
+  if (ctx.pool_size < (VkDeviceSize)sizeof(FullDecodeWeightAddrs))
+    return ADAMAH_ERR_MEMORY;
+
+  int ret = ensure_full_decode_weight_buffer();
+  if (ret != ADAMAH_OK)
+    return ret;
+
+  memcpy(&ctx.full_decode_state.wa, wa, sizeof(FullDecodeWeightAddrs));
+  ctx.full_decode_state.map_ws_id = map_ws_id;
+  ctx.full_decode_state.map_kvcache_id = map_kvcache_id;
+  ctx.full_decode_state.n_layer = n_layer;
+  ctx.full_decode_state.registered = 1;
+
+  memcpy(ctx.pool_ptr, wa, sizeof(FullDecodeWeightAddrs));
+  flush_mapped_pool(sizeof(FullDecodeWeightAddrs));
+
+  cmd_begin();
+  VkBufferCopy copy = {.srcOffset = 0,
+                       .dstOffset = 0,
+                       .size = sizeof(FullDecodeWeightAddrs)};
+  vkCmdCopyBuffer(ctx.cmd, ctx.pool_buf, ctx.full_decode_wa_buf, 1, &copy);
+  VkBuffer bufs[1] = {ctx.full_decode_wa_buf};
+  cmd_buffer_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                     bufs, 1);
+  cmd_submit();
+  return ADAMAH_OK;
+}
+
+int adamah_full_decode_step(uint32_t locs_emb_in_handle,
+                            uint32_t locs_hidden_out_handle, uint32_t pos,
+                            uint32_t seq_len) {
+  int fret = fusion_flush_pending_for_immediate();
+  if (fret != ADAMAH_OK)
+    return fret;
+  if (!ctx.initialized || !ctx.full_decode_state.registered)
+    return ADAMAH_ERR_NOT_FOUND;
+  if (!ctx.full_decode_step_pipe.pipeline && init_pipelines() != 0)
+    return ADAMAH_ERR_VULKAN;
+  if (!ctx.full_decode_step_pipe.pipeline)
+    return ADAMAH_ERR_NOT_FOUND;
+
+  uint32_t map_ws_id = ctx.full_decode_state.map_ws_id;
+  uint32_t map_kvcache_id = ctx.full_decode_state.map_kvcache_id;
+  if (map_ws_id >= MAX_MAPS || !ctx.maps[map_ws_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (map_kvcache_id >= MAX_MAPS || !ctx.maps[map_kvcache_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (ctx.full_decode_wa_buf == VK_NULL_HANDLE)
+    return ADAMAH_ERR_NOT_FOUND;
+
+  ResEntry *emb_res = res_get(locs_emb_in_handle);
+  ResEntry *out_res = res_get(locs_hidden_out_handle);
+  if (!emb_res || !out_res)
+    return ADAMAH_ERR_INVALID;
+
+  res_pin(locs_emb_in_handle);
+  res_pin(locs_hidden_out_handle);
+  VkDeviceSize emb_off = 0, out_off = 0;
+  int ret = ADAMAH_OK;
+  if (res_require_hot(locs_emb_in_handle, &emb_off) != 0 ||
+      res_require_hot(locs_hidden_out_handle, &out_off) != 0) {
+    ret = ADAMAH_ERR_INVALID;
+    goto cleanup_full_decode;
+  }
+
+  VkDescriptorSet ds = alloc_desc_set(&ctx.full_decode_step_pipe);
+  if (ds == VK_NULL_HANDLE) {
+    ret = ADAMAH_ERR_VULKAN;
+    goto cleanup_full_decode;
+  }
+
+  Map *m_ws = &ctx.maps[map_ws_id];
+  Map *m_kvcache = &ctx.maps[map_kvcache_id];
+  if (m_ws->dtype != DTYPE_F32 || m_kvcache->dtype != DTYPE_F32) {
+    ret = ADAMAH_ERR_INVALID;
+    goto cleanup_full_decode;
+  }
+
+  const FullDecodeWeightAddrs *wa = &ctx.full_decode_state.wa;
+  uint64_t denom = 2ull * (uint64_t)ctx.full_decode_state.n_layer *
+                   (uint64_t)wa->n_head_kv * (uint64_t)wa->head_dim_kv;
+  if (denom == 0) {
+    ret = ADAMAH_ERR_INVALID;
+    goto cleanup_full_decode;
+  }
+  uint64_t kv_elems_u64 = m_kvcache->total_bytes / sizeof(float);
+  uint32_t kv_cap = (uint32_t)(kv_elems_u64 / denom);
+  if (kv_cap == 0 || pos >= kv_cap || seq_len == 0 || seq_len > kv_cap) {
+    ret = ADAMAH_ERR_INVALID;
+    goto cleanup_full_decode;
+  }
+
+  VkDescriptorBufferInfo buf_infos[5] = {
+      {.buffer = m_ws->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = m_kvcache->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = ctx.full_decode_wa_buf, .range = sizeof(FullDecodeWeightAddrs)},
+      {.buffer = ctx.hot_pool->buf, .offset = emb_off, .range = emb_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = out_off, .range = out_res->size_bytes},
+  };
+  VkWriteDescriptorSet writes[5];
+  for (int i = 0; i < 5; i++) {
+    writes[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = ds,
+        .dstBinding = (uint32_t)i,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &buf_infos[i]};
+  }
+  vkUpdateDescriptorSets(ctx.device, 5, writes, 0, NULL);
+
+  uint32_t push[4] = {pos, seq_len, ctx.full_decode_state.n_layer, kv_cap};
+  cmd_begin();
+  vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    ctx.full_decode_step_pipe.pipeline);
+  vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ctx.full_decode_step_pipe.pipe_layout, 0, 1, &ds, 0,
+                          NULL);
+  vkCmdPushConstants(ctx.cmd, ctx.full_decode_step_pipe.pipe_layout,
+                     VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, push);
+  vkCmdDispatch(ctx.cmd, 1, 1, 1);
+  cmd_barrier_after_dispatch();
+  cmd_submit();
+
+cleanup_full_decode:
+  res_unpin(locs_emb_in_handle);
+  res_unpin(locs_hidden_out_handle);
+  return ret;
+}
+
+uint32_t adamah_get_last_barrier_count(void) {
+  return last_batch_barrier_count;
+}
+
 // Query whether the GPU is integrated (unified memory, e.g. Raspberry Pi)
 int adamah_is_integrated_gpu(void) {
   return is_integrated_gpu;
@@ -8853,6 +10141,18 @@ void adamah_get_gpu_caps(uint32_t *max_workgroup_size, uint32_t *subgroup_size,
     *subgroup_size = gpu_caps.subgroup_size;
   if (vram_bytes)
     *vram_bytes = gpu_caps.vram_bytes;
+}
+
+uint64_t adamah_get_map_buffer_device_address(uint32_t map_id) {
+  if (!ctx.initialized || map_id >= MAX_MAPS || !ctx.maps[map_id].active)
+    return 0;
+  return buffer_device_address_u64(ctx.maps[map_id].buf);
+}
+
+uint64_t adamah_get_map_qparam_device_address(uint32_t map_id) {
+  if (!ctx.initialized || map_id >= MAX_MAPS || !ctx.maps[map_id].active)
+    return 0;
+  return buffer_device_address_u64(ctx.maps[map_id].qparam_buf);
 }
 
 // Get CPU-accessible pointer to workspace (map) data at given byte offset.

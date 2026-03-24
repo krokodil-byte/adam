@@ -1,0 +1,175 @@
+#version 450
+
+#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
+#define WG_SIZE 16
+#define TILE_K 32
+#define MAX_ROWS_PER_WG 8
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+#define WG_SIZE 64
+#define TILE_K 64
+#define MAX_ROWS_PER_WG 8
+#else
+#define WG_SIZE 128
+#define TILE_K 128
+#define MAX_ROWS_PER_WG 4
+#endif
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(push_constant) uniform PushConstants {
+    uint K;
+    uint N_ff;
+    uint group_size;
+    uint rows_per_wg;
+} pc;
+
+layout(set = 0, binding = 0) buffer ActBuffer  { float map_act[]; };
+layout(set = 0, binding = 1) buffer WtBuffer   { uint  map_wt[];  };
+layout(set = 0, binding = 2) buffer LocsA      { uint  locs_a[];  };
+layout(set = 0, binding = 3) buffer LocsBGate  { uint  locs_bg[]; };
+layout(set = 0, binding = 4) buffer LocsBUp    { uint  locs_bu[]; };
+layout(set = 0, binding = 5) buffer LocsCOut   { uint  locs_co[]; };
+layout(set = 0, binding = 6) buffer QParams    { float qparams[]; };
+
+shared float a_tile[TILE_K];
+shared float partial[2 * MAX_ROWS_PER_WG * WG_SIZE];
+
+float silu(float x) {
+    return x / (1.0 + exp(-x));
+}
+
+void load_q8_4(uint word_addr, float scale, float zp, inout float acc0,
+               inout float acc1, inout float acc2, inout float acc3,
+               uint tile_off) {
+    uint packed = map_wt[word_addr];
+    acc0 += a_tile[tile_off + 0u] * (float(bitfieldExtract(packed,  0, 8)) * scale + zp);
+    acc1 += a_tile[tile_off + 1u] * (float(bitfieldExtract(packed,  8, 8)) * scale + zp);
+    acc2 += a_tile[tile_off + 2u] * (float(bitfieldExtract(packed, 16, 8)) * scale + zp);
+    acc3 += a_tile[tile_off + 3u] * (float(bitfieldExtract(packed, 24, 8)) * scale + zp);
+}
+
+float load_q8(uint idx) {
+    uint word_idx = idx / 4u;
+    uint sub_idx  = idx % 4u;
+    uint raw_uint = bitfieldExtract(map_wt[word_idx], int(sub_idx * 8u), 8);
+    uint group = idx / pc.group_size;
+    return float(raw_uint) * qparams[group * 2u] + qparams[group * 2u + 1u];
+}
+
+void main() {
+    uint n_rows = pc.N_ff;
+    if (n_rows == 0u) {
+        return;
+    }
+
+    uint rows_per_group = pc.rows_per_wg;
+    if (rows_per_group == 0u) {
+        rows_per_group = 1u;
+    }
+    uint base_row = gl_WorkGroupID.x * rows_per_group;
+    if (base_row >= n_rows) {
+        return;
+    }
+
+    uint lid = gl_LocalInvocationID.x;
+    uint a_base = locs_a[0];
+    uint bg_base = locs_bg[0];
+    uint bu_base = locs_bu[0];
+    float sums_gate[MAX_ROWS_PER_WG];
+    float sums_up[MAX_ROWS_PER_WG];
+    for (uint r = 0u; r < MAX_ROWS_PER_WG; ++r) {
+        sums_gate[r] = 0.0;
+        sums_up[r] = 0.0;
+    }
+
+    for (uint tile = 0u; tile < pc.K; tile += TILE_K) {
+        for (uint i = lid; i < TILE_K; i += uint(WG_SIZE)) {
+            uint k = tile + i;
+            a_tile[i] = (k < pc.K) ? map_act[a_base + k] : 0.0;
+        }
+        barrier();
+
+        uint tile_len = min(uint(TILE_K), pc.K - tile);
+        for (uint r = 0u; r < rows_per_group && r < MAX_ROWS_PER_WG; ++r) {
+            uint row = base_row + r;
+            if (row >= n_rows) {
+                break;
+            }
+            uint row_gate_base = bg_base + row * pc.K;
+            uint row_up_base   = bu_base + row * pc.K;
+
+#if defined(ADAMAH_PROFILE_BROADCOM_V3DV_NARROW) || defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+            uint aligned_len = tile_len & ~3u;
+            for (uint i = lid * 4u; i < aligned_len; i += uint(WG_SIZE) * 4u) {
+                uint abs_gate_idx = row_gate_base + tile + i;
+                uint abs_up_idx = row_up_base + tile + i;
+
+                uint gate_group = abs_gate_idx / pc.group_size;
+                float gate_scale = qparams[gate_group * 2u];
+                float gate_zp = qparams[gate_group * 2u + 1u];
+                float g0 = 0.0, g1 = 0.0, g2 = 0.0, g3 = 0.0;
+                load_q8_4(abs_gate_idx / 4u, gate_scale, gate_zp, g0, g1, g2, g3, i);
+                sums_gate[r] += g0 + g1 + g2 + g3;
+
+                uint up_group = abs_up_idx / pc.group_size;
+                float up_scale = qparams[up_group * 2u];
+                float up_zp = qparams[up_group * 2u + 1u];
+                float u0 = 0.0, u1 = 0.0, u2 = 0.0, u3 = 0.0;
+                load_q8_4(abs_up_idx / 4u, up_scale, up_zp, u0, u1, u2, u3, i);
+                sums_up[r] += u0 + u1 + u2 + u3;
+            }
+            for (uint i = aligned_len + lid; i < tile_len; i += uint(WG_SIZE)) {
+                sums_gate[r] += a_tile[i] * load_q8(row_gate_base + tile + i);
+                sums_up[r] += a_tile[i] * load_q8(row_up_base + tile + i);
+            }
+#else
+            for (uint i = lid; i < tile_len; i += uint(WG_SIZE)) {
+                sums_gate[r] += a_tile[i] * load_q8(row_gate_base + tile + i);
+                sums_up[r] += a_tile[i] * load_q8(row_up_base + tile + i);
+            }
+#endif
+        }
+        barrier();
+    }
+
+    for (uint r = 0u; r < rows_per_group && r < MAX_ROWS_PER_WG; ++r) {
+        uint row = base_row + r;
+        if (row >= n_rows) {
+            break;
+        }
+        uint gate_off = r * uint(WG_SIZE);
+        uint up_off = (MAX_ROWS_PER_WG + r) * uint(WG_SIZE);
+        partial[gate_off + lid] = sums_gate[r];
+        partial[up_off + lid] = sums_up[r];
+    }
+    barrier();
+
+    for (uint stride = uint(WG_SIZE >> 1); stride > 0u; stride >>= 1u) {
+        for (uint r = 0u; r < rows_per_group && r < MAX_ROWS_PER_WG; ++r) {
+            uint row = base_row + r;
+            if (row >= n_rows) {
+                break;
+            }
+            uint gate_off = r * uint(WG_SIZE);
+            uint up_off = (MAX_ROWS_PER_WG + r) * uint(WG_SIZE);
+            if (lid < stride) {
+                partial[gate_off + lid] += partial[gate_off + lid + stride];
+                partial[up_off + lid] += partial[up_off + lid + stride];
+            }
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        uint c_base = locs_co[0];
+        for (uint r = 0u; r < rows_per_group && r < MAX_ROWS_PER_WG; ++r) {
+            uint row = base_row + r;
+            if (row >= n_rows) {
+                break;
+            }
+            float gate_val = partial[r * uint(WG_SIZE)];
+            float up_val = partial[(MAX_ROWS_PER_WG + r) * uint(WG_SIZE)];
+            map_act[c_base + row] = silu(gate_val) * up_val;
+        }
+    }
+}

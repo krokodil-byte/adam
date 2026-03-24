@@ -1,0 +1,512 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#define WG_SIZE 128
+#define ADAMAH_FULL_DECODE_MAX_LAYERS 26
+
+// Tuned for Gemma3-1B decode path. Guarded at runtime against larger shapes.
+#define MAX_EMBD 2048u
+#define MAX_TMP 9216u
+#define MAX_HEAD_DIM 512u
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(buffer_reference, std430) readonly buffer Q8Buf { uint8_t b[]; };
+layout(buffer_reference, std430) readonly buffer QPBuf { float f[]; };
+layout(buffer_reference, std430) readonly buffer F32Buf { float f[]; };
+
+struct FullDecodeWeightAddrs {
+    uint64_t wq[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t wk[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t wv[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t wo[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t wg[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t wu[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t wd[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t attn_norm[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t attn_q_norm[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t attn_k_norm[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t ffn_norm[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t post_attn_norm[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t post_ffn_norm[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t qp_wq[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t qp_wk[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t qp_wv[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t qp_wo[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t qp_wg[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t qp_wu[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t qp_wd[ADAMAH_FULL_DECODE_MAX_LAYERS];
+    uint64_t output_norm;
+    uint N_embd;
+    uint N_q;
+    uint N_k;
+    uint N_v;
+    uint N_ff;
+    uint n_head;
+    uint n_head_kv;
+    uint head_dim;
+    uint head_dim_kv;
+    uint group_size_attn;
+    uint group_size_ffn;
+    float attn_softcap;
+};
+
+layout(set = 0, binding = 0) buffer ActBuf { float act[]; };
+layout(set = 0, binding = 1) buffer KVCacheBuf { float kv[]; };
+layout(set = 0, binding = 2) readonly buffer WeightAddrsBuf { FullDecodeWeightAddrs wa; };
+layout(set = 0, binding = 3) readonly buffer LocsEmbIn { uint locs_emb_in[]; };
+layout(set = 0, binding = 4) readonly buffer LocsHiddenOut { uint locs_hidden_out[]; };
+
+layout(push_constant) uniform PC {
+    uint pos;
+    uint seq_len;
+    uint n_layer;
+    uint kv_cap;
+} pc;
+
+shared float sh_hidden[MAX_EMBD];
+shared float sh_tmp[MAX_TMP];
+shared float sh_reduce[WG_SIZE];
+shared float sh_score_max;
+shared float sh_score_sum;
+
+float gelu(float x) {
+    return 0.5 * x * (1.0 + tanh(0.797884583 * (x + 0.0447149985 * x * x * x)));
+}
+
+float dequant_q8(uint64_t w_addr, uint64_t qp_addr, uint idx, uint group_size) {
+    Q8Buf w = Q8Buf(w_addr);
+    QPBuf qp = QPBuf(qp_addr);
+    uint gs = max(group_size, 1u);
+    uint g = idx / gs;
+    return float(w.b[idx]) * qp.f[g * 2u] + qp.f[g * 2u + 1u];
+}
+
+float reduce_sum(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    sh_reduce[tid] = v;
+    barrier();
+    for (uint s = WG_SIZE >> 1; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            sh_reduce[tid] += sh_reduce[tid + s];
+        }
+        barrier();
+    }
+    return sh_reduce[0];
+}
+
+float reduce_max(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    sh_reduce[tid] = v;
+    barrier();
+    for (uint s = WG_SIZE >> 1; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            sh_reduce[tid] = max(sh_reduce[tid], sh_reduce[tid + s]);
+        }
+        barrier();
+    }
+    return sh_reduce[0];
+}
+
+void rmsnorm_hidden_to_tmp(uint dst_off, uint dim, uint64_t wt_addr) {
+    uint tid = gl_LocalInvocationID.x;
+    F32Buf w = F32Buf(wt_addr);
+
+    float ss = 0.0;
+    for (uint i = tid; i < dim; i += WG_SIZE) {
+        float x = sh_hidden[i];
+        ss += x * x;
+    }
+    float ss_all = reduce_sum(ss);
+    float inv_rms = inversesqrt(ss_all / float(dim) + 1e-6);
+
+    for (uint i = tid; i < dim; i += WG_SIZE) {
+        sh_tmp[dst_off + i] = sh_hidden[i] * inv_rms * w.f[i];
+    }
+    barrier();
+}
+
+void rmsnorm_tmp_add_hidden(uint src_off, uint dim, uint64_t wt_addr) {
+    uint tid = gl_LocalInvocationID.x;
+    F32Buf w = F32Buf(wt_addr);
+
+    float ss = 0.0;
+    for (uint i = tid; i < dim; i += WG_SIZE) {
+        float x = sh_tmp[src_off + i];
+        ss += x * x;
+    }
+    float ss_all = reduce_sum(ss);
+    float inv_rms = inversesqrt(ss_all / float(dim) + 1e-6);
+
+    for (uint i = tid; i < dim; i += WG_SIZE) {
+        float y = sh_tmp[src_off + i] * inv_rms * w.f[i];
+        sh_hidden[i] += y;
+    }
+    barrier();
+}
+
+void rmsnorm_hidden_store_output(uint dim, uint64_t wt_addr) {
+    uint tid = gl_LocalInvocationID.x;
+    F32Buf w = F32Buf(wt_addr);
+
+    float ss = 0.0;
+    for (uint i = tid; i < dim; i += WG_SIZE) {
+        float x = sh_hidden[i];
+        ss += x * x;
+    }
+    float ss_all = reduce_sum(ss);
+    float inv_rms = inversesqrt(ss_all / float(dim) + 1e-6);
+
+    for (uint i = tid; i < dim; i += WG_SIZE) {
+        act[locs_hidden_out[i]] = sh_hidden[i] * inv_rms * w.f[i];
+    }
+    barrier();
+}
+
+void matvec_from_hidden_to_tmp(uint dst_off, uint K, uint N,
+                               uint64_t w_addr, uint64_t qp_addr,
+                               uint group_size) {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint row = 0u; row < N; ++row) {
+        float acc = 0.0;
+        uint base = row * K;
+        for (uint i = tid; i < K; i += WG_SIZE) {
+            float w = dequant_q8(w_addr, qp_addr, base + i, group_size);
+            acc += sh_hidden[i] * w;
+        }
+        float sum = reduce_sum(acc);
+        if (tid == 0u) {
+            sh_tmp[dst_off + row] = sum;
+        }
+        barrier();
+    }
+}
+
+void matvec_from_tmp_to_tmp(uint src_off, uint dst_off, uint K, uint N,
+                            uint64_t w_addr, uint64_t qp_addr,
+                            uint group_size) {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint row = 0u; row < N; ++row) {
+        float acc = 0.0;
+        uint base = row * K;
+        for (uint i = tid; i < K; i += WG_SIZE) {
+            float w = dequant_q8(w_addr, qp_addr, base + i, group_size);
+            acc += sh_tmp[src_off + i] * w;
+        }
+        float sum = reduce_sum(acc);
+        if (tid == 0u) {
+            sh_tmp[dst_off + row] = sum;
+        }
+        barrier();
+    }
+}
+
+void apply_rope_qk(uint q_off, uint k_off, uint head_dim, uint head_dim_kv,
+                   uint n_head, uint n_head_kv, uint pos,
+                   uint64_t q_norm_addr, uint64_t k_norm_addr) {
+    uint tid = gl_LocalInvocationID.x;
+    const float rope_base = 1000000.0;
+    bool has_q_norm = (q_norm_addr != uint64_t(0));
+    bool has_k_norm = (k_norm_addr != uint64_t(0));
+    F32Buf q_norm_w = F32Buf(q_norm_addr);
+    F32Buf k_norm_w = F32Buf(k_norm_addr);
+
+    uint q_half = head_dim / 2u;
+    for (uint h = 0u; h < n_head; ++h) {
+        uint hb = q_off + h * head_dim;
+
+        float ss = 0.0;
+        for (uint i = tid; i < head_dim; i += WG_SIZE) {
+            float x = sh_tmp[hb + i];
+            ss += x * x;
+        }
+        float ss_all = reduce_sum(ss);
+        float inv_rms = inversesqrt(ss_all / float(head_dim) + 1e-6);
+
+        for (uint i = tid; i < q_half; i += WG_SIZE) {
+            uint i0 = hb + i;
+            uint i1 = hb + i + q_half;
+            float y0 = sh_tmp[i0];
+            float y1 = sh_tmp[i1];
+            if (has_q_norm) {
+                y0 = y0 * inv_rms * q_norm_w.f[i];
+                y1 = y1 * inv_rms * q_norm_w.f[i + q_half];
+            }
+            float freq = 1.0 / pow(rope_base, float(2u * i) / float(head_dim));
+            float ang = float(pos) * freq;
+            float cs = cos(ang);
+            float sn = sin(ang);
+            sh_tmp[i0] = y0 * cs - y1 * sn;
+            sh_tmp[i1] = y0 * sn + y1 * cs;
+        }
+        barrier();
+    }
+
+    uint k_half = head_dim_kv / 2u;
+    for (uint h = 0u; h < n_head_kv; ++h) {
+        uint hb = k_off + h * head_dim_kv;
+
+        float ss = 0.0;
+        for (uint i = tid; i < head_dim_kv; i += WG_SIZE) {
+            float x = sh_tmp[hb + i];
+            ss += x * x;
+        }
+        float ss_all = reduce_sum(ss);
+        float inv_rms = inversesqrt(ss_all / float(head_dim_kv) + 1e-6);
+
+        for (uint i = tid; i < k_half; i += WG_SIZE) {
+            uint i0 = hb + i;
+            uint i1 = hb + i + k_half;
+            float y0 = sh_tmp[i0];
+            float y1 = sh_tmp[i1];
+            if (has_k_norm) {
+                y0 = y0 * inv_rms * k_norm_w.f[i];
+                y1 = y1 * inv_rms * k_norm_w.f[i + k_half];
+            }
+            float freq = 1.0 / pow(rope_base, float(2u * i) / float(head_dim_kv));
+            float ang = float(pos) * freq;
+            float cs = cos(ang);
+            float sn = sin(ang);
+            sh_tmp[i0] = y0 * cs - y1 * sn;
+            sh_tmp[i1] = y0 * sn + y1 * cs;
+        }
+        barrier();
+    }
+}
+
+void kv_write_layer(uint layer_idx, uint k_off, uint v_off,
+                    uint n_head_kv, uint head_dim_kv, uint kv_cap, uint pos) {
+    uint tid = gl_LocalInvocationID.x;
+    uint layer_stride = 2u * n_head_kv * kv_cap * head_dim_kv;
+    uint k_layer = layer_idx * layer_stride;
+    uint v_layer = k_layer + n_head_kv * kv_cap * head_dim_kv;
+
+    for (uint h = 0u; h < n_head_kv; ++h) {
+        uint khb = k_off + h * head_dim_kv;
+        uint vhb = v_off + h * head_dim_kv;
+        uint k_dst = k_layer + h * kv_cap * head_dim_kv + pos * head_dim_kv;
+        uint v_dst = v_layer + h * kv_cap * head_dim_kv + pos * head_dim_kv;
+        for (uint d = tid; d < head_dim_kv; d += WG_SIZE) {
+            kv[k_dst + d] = sh_tmp[khb + d];
+            kv[v_dst + d] = sh_tmp[vhb + d];
+        }
+        barrier();
+    }
+}
+
+void attention_layer(uint layer_idx, uint q_off, uint out_off,
+                     uint n_head, uint n_head_kv, uint head_dim,
+                     uint head_dim_kv, uint kv_cap, uint seq_len,
+                     float softcap) {
+    uint tid = gl_LocalInvocationID.x;
+    uint layer_stride = 2u * n_head_kv * kv_cap * head_dim_kv;
+    uint k_layer = layer_idx * layer_stride;
+    uint v_layer = k_layer + n_head_kv * kv_cap * head_dim_kv;
+    uint heads_per_kv = max(1u, n_head / max(1u, n_head_kv));
+    float scale = inversesqrt(float(head_dim));
+
+    for (uint h = 0u; h < n_head; ++h) {
+        uint q_base = q_off + h * head_dim;
+        uint g = min(n_head_kv - 1u, h / heads_per_kv);
+        uint k_head = k_layer + g * kv_cap * head_dim_kv;
+        uint v_head = v_layer + g * kv_cap * head_dim_kv;
+
+        float row_max_local = -3.402823e38;
+        for (uint t = 0u; t < seq_len; ++t) {
+            float dot_part = 0.0;
+            uint k_tok = k_head + t * head_dim_kv;
+            for (uint d = tid; d < head_dim; d += WG_SIZE) {
+                dot_part += sh_tmp[q_base + d] * kv[k_tok + d];
+            }
+            float score = reduce_sum(dot_part) * scale;
+            if (softcap > 0.0) {
+                score = tanh(score / softcap) * softcap;
+            }
+            row_max_local = max(row_max_local, score);
+            barrier();
+        }
+        float row_max = reduce_max(row_max_local);
+        if (tid == 0u) {
+            sh_score_max = row_max;
+        }
+        barrier();
+
+        float local_sum = 0.0;
+        for (uint d = tid; d < head_dim_kv; d += WG_SIZE) {
+            sh_tmp[out_off + h * head_dim_kv + d] = 0.0;
+        }
+        barrier();
+
+        for (uint t = 0u; t < seq_len; ++t) {
+            float dot_part = 0.0;
+            uint k_tok = k_head + t * head_dim_kv;
+            uint v_tok = v_head + t * head_dim_kv;
+            for (uint d = tid; d < head_dim; d += WG_SIZE) {
+                dot_part += sh_tmp[q_base + d] * kv[k_tok + d];
+            }
+            float score = reduce_sum(dot_part) * scale;
+            if (softcap > 0.0) {
+                score = tanh(score / softcap) * softcap;
+            }
+            float w = exp(score - sh_score_max);
+            local_sum += w;
+            barrier();
+
+            for (uint d = tid; d < head_dim_kv; d += WG_SIZE) {
+                sh_tmp[out_off + h * head_dim_kv + d] += w * kv[v_tok + d];
+            }
+            barrier();
+        }
+
+        float sum_all = reduce_sum(local_sum);
+        if (tid == 0u) {
+            sh_score_sum = max(sum_all, 1e-20);
+        }
+        barrier();
+
+        for (uint d = tid; d < head_dim_kv; d += WG_SIZE) {
+            sh_tmp[out_off + h * head_dim_kv + d] /= sh_score_sum;
+        }
+        barrier();
+    }
+}
+
+void gateup_geglu_from_hidden(uint dst_off, uint K, uint N_ff,
+                              uint64_t wg_addr, uint64_t wu_addr,
+                              uint64_t qp_g_addr, uint64_t qp_u_addr,
+                              uint group_size) {
+    uint tid = gl_LocalInvocationID.x;
+
+    for (uint row = 0u; row < N_ff; ++row) {
+        float gate_part = 0.0;
+        float up_part = 0.0;
+        uint base = row * K;
+        for (uint i = tid; i < K; i += WG_SIZE) {
+            float wg = dequant_q8(wg_addr, qp_g_addr, base + i, group_size);
+            float wu = dequant_q8(wu_addr, qp_u_addr, base + i, group_size);
+            float x = sh_hidden[i];
+            gate_part += x * wg;
+            up_part += x * wu;
+        }
+        float gate = reduce_sum(gate_part);
+        float up = reduce_sum(up_part);
+        if (tid == 0u) {
+            sh_tmp[dst_off + row] = gelu(gate) * up;
+        }
+        barrier();
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint n_embd = wa.N_embd;
+    uint n_q = wa.N_q;
+    uint n_k = wa.N_k;
+    uint n_v = wa.N_v;
+    uint n_ff = wa.N_ff;
+    uint n_head = wa.n_head;
+    uint n_head_kv = wa.n_head_kv;
+    uint head_dim = wa.head_dim;
+    uint head_dim_kv = wa.head_dim_kv;
+
+    uint n_layer = min(pc.n_layer, ADAMAH_FULL_DECODE_MAX_LAYERS);
+
+    uint q_off = 0u;
+    uint k_off = q_off + n_q;
+    uint v_off = k_off + n_k;
+    uint attn_out_off = v_off + n_v;
+    uint down_out_off = n_ff;
+    uint attn_save_off = attn_out_off + n_q;
+    uint ffn_save_off = n_ff + n_embd;
+
+    if (n_embd == 0u || n_layer == 0u ||
+        n_embd > MAX_EMBD ||
+        (n_ff + n_embd) > MAX_TMP ||
+        (attn_out_off + n_q) > MAX_TMP ||
+        (attn_save_off + n_embd) > MAX_TMP ||
+        (ffn_save_off + n_embd) > MAX_TMP ||
+        head_dim > MAX_HEAD_DIM || head_dim_kv > MAX_HEAD_DIM ||
+        pc.kv_cap == 0u || pc.seq_len == 0u || pc.seq_len > pc.kv_cap) {
+        for (uint i = tid; i < n_embd; i += WG_SIZE) {
+            act[locs_hidden_out[i]] = act[locs_emb_in[i]];
+        }
+        return;
+    }
+
+    for (uint i = tid; i < n_embd; i += WG_SIZE) {
+        sh_hidden[i] = act[locs_emb_in[i]];
+    }
+    barrier();
+
+    for (uint L = 0u; L < n_layer; ++L) {
+        // pre-attn norm: hidden -> tmp[0:n_embd]
+        rmsnorm_hidden_to_tmp(0u, n_embd, wa.attn_norm[L]);
+
+        // Save residual hidden, then feed normalized hidden into QKV projections.
+        for (uint i = tid; i < n_embd; i += WG_SIZE) {
+            sh_tmp[attn_save_off + i] = sh_hidden[i];
+            sh_hidden[i] = sh_tmp[i];
+        }
+        barrier();
+        matvec_from_hidden_to_tmp(q_off, n_embd, n_q, wa.wq[L], wa.qp_wq[L], wa.group_size_attn);
+        matvec_from_hidden_to_tmp(k_off, n_embd, n_k, wa.wk[L], wa.qp_wk[L], wa.group_size_attn);
+        matvec_from_hidden_to_tmp(v_off, n_embd, n_v, wa.wv[L], wa.qp_wv[L], wa.group_size_attn);
+
+        // Q/K rope in-place.
+        apply_rope_qk(q_off, k_off, head_dim, head_dim_kv, n_head, n_head_kv, pc.pos,
+                      wa.attn_q_norm[L], wa.attn_k_norm[L]);
+
+        // Write K/V for current position.
+        kv_write_layer(L, k_off, v_off, n_head_kv, head_dim_kv, pc.kv_cap, pc.pos);
+
+        // Attention over cache -> tmp[attn_out_off : attn_out_off + n_q]
+        attention_layer(L, q_off, attn_out_off, n_head, n_head_kv,
+                        head_dim, head_dim_kv, pc.kv_cap, pc.seq_len,
+                        wa.attn_softcap);
+
+        // Output projection attn_out -> tmp[0:n_embd]
+        matvec_from_tmp_to_tmp(attn_out_off, 0u, n_q, n_embd,
+                               wa.wo[L], wa.qp_wo[L], wa.group_size_attn);
+
+        // Restore residual hidden for post-attn RMSNorm+add.
+        for (uint i = tid; i < n_embd; i += WG_SIZE) {
+            sh_hidden[i] = sh_tmp[attn_save_off + i];
+        }
+        barrier();
+
+        // post-attn norm + residual: hidden += RMSNorm(tmp[0:n_embd], post_attn_norm)
+        rmsnorm_tmp_add_hidden(0u, n_embd, wa.post_attn_norm[L]);
+
+        // ffn pre-norm: hidden -> tmp[0:n_embd], save residual, then copy normed input.
+        rmsnorm_hidden_to_tmp(0u, n_embd, wa.ffn_norm[L]);
+        for (uint i = tid; i < n_embd; i += WG_SIZE) {
+            sh_tmp[ffn_save_off + i] = sh_hidden[i];
+            sh_hidden[i] = sh_tmp[i];
+        }
+        barrier();
+
+        // gate/up + GEGLU activation -> tmp[0:n_ff]
+        gateup_geglu_from_hidden(0u, n_embd, n_ff,
+                                 wa.wg[L], wa.wu[L],
+                                 wa.qp_wg[L], wa.qp_wu[L],
+                                 wa.group_size_ffn);
+
+        // down projection: tmp[0:n_ff] -> tmp[n_ff : n_ff+n_embd]
+        matvec_from_tmp_to_tmp(0u, down_out_off, n_ff, n_embd,
+                               wa.wd[L], wa.qp_wd[L], wa.group_size_ffn);
+
+        // Restore residual hidden for post-FFN RMSNorm+add.
+        for (uint i = tid; i < n_embd; i += WG_SIZE) {
+            sh_hidden[i] = sh_tmp[ffn_save_off + i];
+        }
+        barrier();
+
+        // post-ffn norm + residual: hidden += RMSNorm(tmp[down_out_off], post_ffn_norm)
+        rmsnorm_tmp_add_hidden(down_out_off, n_embd, wa.post_ffn_norm[L]);
+    }
+
+    // final output norm -> output handle
+    rmsnorm_hidden_store_output(n_embd, wa.output_norm);
+}

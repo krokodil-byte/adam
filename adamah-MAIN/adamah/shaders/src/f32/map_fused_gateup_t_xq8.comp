@@ -1,0 +1,172 @@
+#version 450
+
+#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
+#define WG_SIZE 16
+#define TILE_K 32
+#define MAX_ROWS_PER_WG 8
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+#define WG_SIZE 64
+#define TILE_K 64
+#define MAX_ROWS_PER_WG 8
+#else
+#define WG_SIZE 128
+#define TILE_K 128
+#define MAX_ROWS_PER_WG 4
+#endif
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(push_constant) uniform PushConstants {
+    uint K;
+    uint N_gate;
+    uint N_up;
+    uint group_size;
+    uint rows_per_wg;
+} pc;
+
+layout(set = 0, binding = 0) buffer ActBuffer   { float map_act[]; };
+layout(set = 0, binding = 1) buffer WtBuffer    { uint  map_wt[];  };
+layout(set = 0, binding = 2) buffer LocsA       { uint  locs_a[];  };
+layout(set = 0, binding = 3) buffer LocsBGate   { uint  locs_bg[]; };
+layout(set = 0, binding = 4) buffer LocsBUp     { uint  locs_bu[]; };
+layout(set = 0, binding = 5) buffer LocsCGate   { uint  locs_cg[]; };
+layout(set = 0, binding = 6) buffer LocsCUp     { uint  locs_cu[]; };
+layout(set = 0, binding = 7) buffer QParams     { float qparams[]; };
+
+shared float a_tile[TILE_K];
+shared float partial[MAX_ROWS_PER_WG * WG_SIZE];
+
+// Packed Q8 load: decode 4 bytes from one uint in registers
+void load_q8_4(uint word_addr, float scale, float zp, inout float acc0,
+               inout float acc1, inout float acc2, inout float acc3,
+               uint tile_off) {
+    uint packed = map_wt[word_addr];
+    acc0 += a_tile[tile_off + 0u] * (float(bitfieldExtract(packed,  0, 8)) * scale + zp);
+    acc1 += a_tile[tile_off + 1u] * (float(bitfieldExtract(packed,  8, 8)) * scale + zp);
+    acc2 += a_tile[tile_off + 2u] * (float(bitfieldExtract(packed, 16, 8)) * scale + zp);
+    acc3 += a_tile[tile_off + 3u] * (float(bitfieldExtract(packed, 24, 8)) * scale + zp);
+}
+
+float load_q8(uint idx) {
+    uint word_idx = idx / 4u;
+    uint sub_idx  = idx % 4u;
+    uint raw_uint = bitfieldExtract(map_wt[word_idx], int(sub_idx * 8u), 8);
+    uint group = idx / pc.group_size;
+    return float(raw_uint) * qparams[group * 2u] + qparams[group * 2u + 1u];
+}
+
+void select_projection(uint proj, out uint n_rows, out uint b_base, out uint c_base) {
+    if (proj == 0u) {
+        n_rows = pc.N_gate;
+        b_base = locs_bg[0];
+        c_base = locs_cg[0];
+        return;
+    }
+    n_rows = pc.N_up;
+    b_base = locs_bu[0];
+    c_base = locs_cu[0];
+}
+
+void main() {
+    uint proj = gl_WorkGroupID.y;
+    if (proj >= 2u) {
+        return;
+    }
+
+    uint n_rows;
+    uint b_base;
+    uint c_base;
+    select_projection(proj, n_rows, b_base, c_base);
+    if (n_rows == 0u) {
+        return;
+    }
+
+    uint rows_per_group = pc.rows_per_wg;
+    if (rows_per_group == 0u) {
+        rows_per_group = 1u;
+    }
+    uint base_row = gl_WorkGroupID.x * rows_per_group;
+    if (base_row >= n_rows) {
+        return;
+    }
+
+    uint lid = gl_LocalInvocationID.x;
+    uint a_base = locs_a[0];
+    float sums[MAX_ROWS_PER_WG];
+    for (uint r = 0u; r < MAX_ROWS_PER_WG; ++r) {
+        sums[r] = 0.0;
+    }
+
+    for (uint tile = 0u; tile < pc.K; tile += TILE_K) {
+        for (uint i = lid; i < TILE_K; i += uint(WG_SIZE)) {
+            uint k = tile + i;
+            a_tile[i] = (k < pc.K) ? map_act[a_base + k] : 0.0;
+        }
+        barrier();
+
+        uint tile_len = min(uint(TILE_K), pc.K - tile);
+        for (uint r = 0u; r < rows_per_group && r < MAX_ROWS_PER_WG; ++r) {
+            uint row = base_row + r;
+            if (row >= n_rows) {
+                break;
+            }
+            uint row_base = b_base + row * pc.K;
+#if defined(ADAMAH_PROFILE_BROADCOM_V3DV_NARROW) || defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+            // Packed Q8 path: process 4 elements per word
+            uint aligned_len = tile_len & ~3u;
+            for (uint i = lid * 4u; i < aligned_len; i += uint(WG_SIZE) * 4u) {
+                uint abs_idx = row_base + tile + i;
+                uint word_addr = abs_idx / 4u;
+                uint group = abs_idx / pc.group_size;
+                float scale = qparams[group * 2u];
+                float zp = qparams[group * 2u + 1u];
+                float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                load_q8_4(word_addr, scale, zp, a0, a1, a2, a3, i);
+                sums[r] += a0 + a1 + a2 + a3;
+            }
+            // Remainder
+            for (uint i = aligned_len + lid; i < tile_len; i += uint(WG_SIZE)) {
+                sums[r] += a_tile[i] * load_q8(row_base + tile + i);
+            }
+#else
+            for (uint i = lid; i < tile_len; i += uint(WG_SIZE)) {
+                sums[r] += a_tile[i] * load_q8(row_base + tile + i);
+            }
+#endif
+        }
+        barrier();
+    }
+
+    for (uint r = 0u; r < rows_per_group && r < MAX_ROWS_PER_WG; ++r) {
+        uint row = base_row + r;
+        if (row >= n_rows) {
+            break;
+        }
+        partial[r * uint(WG_SIZE) + lid] = sums[r];
+    }
+    barrier();
+
+    for (uint stride = uint(WG_SIZE >> 1); stride > 0u; stride >>= 1u) {
+        for (uint r = 0u; r < rows_per_group && r < MAX_ROWS_PER_WG; ++r) {
+            uint row = base_row + r;
+            if (row >= n_rows) {
+                break;
+            }
+            uint off = r * uint(WG_SIZE);
+            if (lid < stride) {
+                partial[off + lid] += partial[off + lid + stride];
+            }
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        for (uint r = 0u; r < rows_per_group && r < MAX_ROWS_PER_WG; ++r) {
+            uint row = base_row + r;
+            if (row >= n_rows) {
+                break;
+            }
+            map_act[c_base + row] = partial[r * uint(WG_SIZE)];
+        }
+    }
+}

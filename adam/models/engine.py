@@ -285,6 +285,10 @@ class ADAMEngine:
         self._alloc_kv_cache()
         self._upload_locs()
         self._cache_lm_weight()
+        # B12 Q8 re-quant (in _register_full_decode) needs self.tensors — run before release.
+        self._full_decode_active = False
+        self._full_decode_registered = False
+        self._register_full_decode()
         if self._production_mode:
             self.release_host_state()
         self.timing = {}; self._reset_timing()
@@ -1875,7 +1879,7 @@ class ADAMEngine:
         hid_h    = self._ws_slots['hidden'][0]
         normed_h = self._ws_slots['normed'][0]
         q_h      = self._ws_slots['q'][0]
-        k_h      = self._ws_slots['k'][0]   # noqa: F841
+        k_h      = self._ws_slots['k'][0]
         v_h      = self._ws_slots['v'][0]
         ao_h     = self._ws_slots['attn_out'][0]
         op_h     = self._ws_slots['o_proj'][0]
@@ -1891,6 +1895,108 @@ class ADAMEngine:
         attn_scale = float(1.0 / np.sqrt(c.head_dim))
         softcap    = float(c.attn_softcap)
 
+        _has_fused_qkv_q4 = (hasattr(A, 'DECODE_OP_FUSED_QKV_T_XQ4') and
+                              getattr(self.gpu, '_has_map_fused_qkv_t_xq4_dev', False))
+        _has_fused_gateup_q4 = (hasattr(A, 'DECODE_OP_FUSED_GATEUP_T_XQ4') and
+                                 getattr(self.gpu, '_has_map_fused_gateup_t_xq4_dev', False))
+        _has_fused_qkv_q8 = (hasattr(A, 'DECODE_OP_FUSED_QKV_T_XQ8') and
+                              getattr(self.gpu, '_has_map_fused_qkv_t_xq8_dev', False))
+        _has_fused_gateup_q8 = (hasattr(A, 'DECODE_OP_FUSED_GATEUP_T_XQ8') and
+                                 getattr(self.gpu, '_has_map_fused_gateup_t_xq8_dev', False))
+        _has_fused_qkv = _has_fused_qkv_q4 or _has_fused_qkv_q8
+        _has_fused_gateup = _has_fused_gateup_q4 or _has_fused_gateup_q8
+        _has_fused_gateup_act_q8 = (hasattr(A, 'DECODE_OP_FUSED_GATEUP_ACT_T_XQ8') and
+                                     getattr(self.gpu, '_has_map_fused_gateup_act_t_xq8_dev', False))
+
+        def fused_qkv_op_or_fallback(in_h, qname, kname, vname, out_qh, out_kh, out_vh):
+            q_mid = self.tensor_map_id[qname]
+            if (not self._trans[qname] and not self._trans[kname]
+                    and not self._trans[vname]
+                    and self.tensor_map_id[kname] == q_mid
+                    and self.tensor_map_id[vname] == q_mid):
+                kind_q = self._weight_kind(qname)
+                kind_k = self._weight_kind(kname)
+                kind_v = self._weight_kind(vname)
+                if (_has_fused_qkv_q4
+                        and kind_q == 'q4' and kind_k == 'q4' and kind_v == 'q4'):
+                    return [_mk(
+                        kind=A.DECODE_OP_FUSED_QKV_T_XQ4,
+                        map_id=ws_id, map_id2=q_mid,
+                        h0=in_h,
+                        h1=self._wh[qname], h2=self._wh[kname], h3=self._wh[vname],
+                        h4=out_qh, h5=out_kh,
+                        u0=out_vh, u1=c.n_embd, u2=q_dim, u3=k_dim, u4=k_dim,
+                    )]
+                if (_has_fused_qkv_q8
+                        and kind_q == 'q8' and kind_k == 'q8' and kind_v == 'q8'):
+                    return [_mk(
+                        kind=A.DECODE_OP_FUSED_QKV_T_XQ8,
+                        map_id=ws_id, map_id2=q_mid,
+                        h0=in_h,
+                        h1=self._wh[qname], h2=self._wh[kname], h3=self._wh[vname],
+                        h4=out_qh, h5=out_kh,
+                        u0=out_vh, u1=c.n_embd, u2=q_dim, u3=k_dim, u4=k_dim,
+                    )]
+            return [
+                proj_op(in_h, qname, out_qh, 1, c.n_embd, q_dim),
+                proj_op(in_h, kname, out_kh, 1, c.n_embd, k_dim),
+                proj_op(in_h, vname, out_vh, 1, c.n_embd, k_dim),
+            ]
+
+        def fused_gateup_op_or_fallback(in_h, gate_name, up_name, out_gate_h, out_up_h):
+            gate_mid = self.tensor_map_id[gate_name]
+            if (not self._trans[gate_name] and not self._trans[up_name]
+                    and self.tensor_map_id[up_name] == gate_mid):
+                kind_g = self._weight_kind(gate_name)
+                kind_u = self._weight_kind(up_name)
+                if _has_fused_gateup_q4 and kind_g == 'q4' and kind_u == 'q4':
+                    return [_mk(
+                        kind=A.DECODE_OP_FUSED_GATEUP_T_XQ4,
+                        map_id=ws_id, map_id2=gate_mid,
+                        h0=in_h,
+                        h1=self._wh[gate_name], h2=self._wh[up_name],
+                        h3=out_gate_h, h4=out_up_h,
+                        u0=c.n_embd, u1=c.n_ff, u2=c.n_ff,
+                    )]
+                if _has_fused_gateup_q8 and kind_g == 'q8' and kind_u == 'q8':
+                    return [_mk(
+                        kind=A.DECODE_OP_FUSED_GATEUP_T_XQ8,
+                        map_id=ws_id, map_id2=gate_mid,
+                        h0=in_h,
+                        h1=self._wh[gate_name], h2=self._wh[up_name],
+                        h3=out_gate_h, h4=out_up_h,
+                        u0=c.n_embd, u1=c.n_ff, u2=c.n_ff,
+                    )]
+            return [
+                proj_op(in_h, gate_name, out_gate_h, 1, c.n_embd, c.n_ff),
+                proj_op(in_h, up_name, out_up_h, 1, c.n_embd, c.n_ff),
+            ]
+
+        def fused_gateup_act_op_or_fallback(in_h, gate_name, up_name, out_act_h):
+            """Fused gate+up projection + swiGLU activation → single output (act_h).
+            Only activates for Q8 swiGLU (silu); falls back to 3 separate ops otherwise."""
+            gate_mid = self.tensor_map_id[gate_name]
+            if (_has_fused_gateup_act_q8
+                    and fused_gate_op == A.OP_SWIGLU
+                    and not self._trans[gate_name] and not self._trans[up_name]
+                    and self.tensor_map_id[up_name] == gate_mid):
+                kind_g = self._weight_kind(gate_name)
+                kind_u = self._weight_kind(up_name)
+                if kind_g == 'q8' and kind_u == 'q8':
+                    return [_mk(
+                        kind=A.DECODE_OP_FUSED_GATEUP_ACT_T_XQ8,
+                        map_id=ws_id, map_id2=gate_mid,
+                        h0=in_h,
+                        h1=self._wh[gate_name], h2=self._wh[up_name],
+                        h3=out_act_h,
+                        u0=c.n_embd, u1=c.n_ff,
+                    )]
+            return [
+                *fused_gateup_op_or_fallback(in_h, gate_name, up_name, gate_h, up_h),
+                _mk(kind=A.DECODE_OP_OP2, map_id=ws_id,
+                    op_code=fused_gate_op, h0=gate_h, h1=up_h, h2=out_act_h, u0=c.n_ff),
+            ]
+
         all_ops = []
         for L in range(c.n_layer):
             p  = self._blk_names[L]
@@ -1905,10 +2011,11 @@ class ADAMEngine:
             # 1. Pre-attention RMSNorm: hidden → normed
             all_ops.append(rmsnorm_op(hid_h, f'{p}.attn_norm.weight', normed_h, 1, c.n_embd))
 
-            # 2-4. QKV projections
-            all_ops.append(proj_op(normed_h, f'{p}.attn_q.weight', q_h,  1, c.n_embd, q_dim))
-            all_ops.append(proj_op(normed_h, f'{p}.attn_k.weight', k_h,  1, c.n_embd, k_dim))
-            all_ops.append(proj_op(normed_h, f'{p}.attn_v.weight', v_h,  1, c.n_embd, k_dim))
+            # 2-4. QKV projections (fused single dispatch if all Q4 same-map, else 3 ops)
+            all_ops.extend(fused_qkv_op_or_fallback(
+                normed_h,
+                f'{p}.attn_q.weight', f'{p}.attn_k.weight', f'{p}.attn_v.weight',
+                q_h, k_h, v_h))
 
             # 5. Fused QK-norm + RoPE (cross-map, writes Q+K back into workspace)
             all_ops.append(_mk(
@@ -1969,13 +2076,9 @@ class ADAMEngine:
             # 11. FFN pre-norm: hidden → normed2
             all_ops.append(rmsnorm_op(hid_h, f'{p}.ffn_norm.weight', n2_h, 1, c.n_embd))
 
-            # 12-13. Gate + Up projections
-            all_ops.append(proj_op(n2_h, f'{p}.ffn_gate.weight', gate_h, 1, c.n_embd, c.n_ff))
-            all_ops.append(proj_op(n2_h, f'{p}.ffn_up.weight',   up_h,   1, c.n_embd, c.n_ff))
-
-            # 14. GEGLU/SwiGLU activation
-            all_ops.append(_mk(kind=A.DECODE_OP_OP2, map_id=ws_id,
-                               op_code=fused_gate_op, h0=gate_h, h1=up_h, h2=act_h, u0=c.n_ff))
+            # 12-14. Gate+up proj + activation → act_h (fused single dispatch if Q8 swiGLU, else 3 ops)
+            all_ops.extend(fused_gateup_act_op_or_fallback(
+                n2_h, f'{p}.ffn_gate.weight', f'{p}.ffn_up.weight', act_h))
 
             # 15. FFN down projection
             all_ops.append(proj_op(act_h, f'{p}.ffn_down.weight', ffn_h, 1, c.n_ff, c.n_embd))
@@ -1995,7 +2098,214 @@ class ADAMEngine:
         self.gpu.register_decode_plan(self._decode_plan_id, all_ops)
         self._decode_plan_active = True
         if self.verbose:
-            print(f"[GPU] B6 decode plan: {len(all_ops)} ops ({c.n_layer} layers)")
+            print(f"[GPU] B9 decode plan: {len(all_ops)} ops ({c.n_layer} layers)"
+                  f" fused_qkv_q8={_has_fused_qkv_q8}"
+                  f" fused_gateup_q8={_has_fused_gateup_q8}"
+                  f" fused_gateup_act_q8={_has_fused_gateup_act_q8}")
+
+    # ============================================================
+    # B12: Monolithic decode shader registration
+    # ============================================================
+
+    _B12_PROJ_SUFFIXES = [
+        'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'attn_output.weight',
+        'ffn_gate.weight', 'ffn_up.weight', 'ffn_down.weight',
+    ]
+    _B12_Q8_MAP_ID = 3   # new GPU map for B12-only re-quantized Q4/Q6 tensors
+    _B12_KV_MAP_ID = 4   # dedicated KV cache for B12 (exact size so C code derives kv_cap correctly)
+
+    def _ensure_b12_kv_map(self):
+        """One-time: create a dedicated F32 KV-cache map (map 4) for B12 with EXACT size.
+
+        The C code computes kv_cap = map_kvcache_total_bytes / (4 * 2 * n_layer * n_head_kv
+        * head_dim_kv). If we pass ws_map_id for kvcache (which includes activations + norms
+        + KV cache), kv_cap is inflated and the shader addresses wrong KV locations.
+        This map has exactly 2 * n_layer * n_head_kv * kv_cap * head_dim_kv F32 elements,
+        so the C code derives the correct kv_cap."""
+        if getattr(self, '_b12_kv_map_created', False):
+            return
+        c = self.cfg
+        n_kv_elems = 2 * c.n_layer * c.n_head_kv * self._kv_cap * c.head_dim_kv
+        self.gpu.map_create(self._B12_KV_MAP_ID, 1, n_kv_elems)
+        self._b12_kv_map_created = True
+        if self.verbose:
+            print(f"[GPU] B12 KV map {self._B12_KV_MAP_ID}: {n_kv_elems:,} F32 elems "
+                  f"({n_kv_elems * 4 / 1e6:.0f} MB, kv_cap={self._kv_cap})")
+
+    def _ensure_b12_q8_map(self):
+        """One-time: create Q8 re-quant map (map 3) for projection tensors not already in Q8 map.
+
+        Uses ALL model layers (len(_blk_names)) so the map is valid for any n_layer sub-test.
+        Idempotent — safe to call from reset() multiple times."""
+        if getattr(self, '_b12_q8_map_created', False):
+            return
+
+        self._b12_q8_off = {}   # tensor-name → element offset inside B12 Q8 map
+
+        # Collect all unique non-Q8 projection tensors across all model layers
+        non_q8 = []
+        seen = set()
+        for L in range(len(self._blk_names)):
+            for suffix in self._B12_PROJ_SUFFIXES:
+                name = f'{self._blk_names[L]}.{suffix}'
+                if (name in self._off and name not in seen and
+                        self.tensor_map_id.get(name) not in (self.ws_map_id, self.q8_map_id)):
+                    non_q8.append(name)
+                    seen.add(name)
+
+        if not non_q8:
+            self._b12_q8_map_created = True
+            return
+
+        # Total element count for the new map
+        total_elems = sum(self._size_of(n) for n in non_q8)
+        n_groups = (total_elems + self.Q8_GROUP_SIZE - 1) // self.Q8_GROUP_SIZE
+
+        g = self.gpu
+        g.map_create_typed(self._B12_Q8_MAP_ID, self.A.DTYPE_Q8, 1, total_elems, self.Q8_GROUP_SIZE)
+
+        b12_scales = np.ones (n_groups, dtype=np.float32)
+        b12_zeros  = np.zeros(n_groups, dtype=np.float32)
+
+        pos = 0
+        for name in non_q8:
+            self._b12_q8_off[name] = pos
+            for elem_off, take, _, data_f32 in self._iter_tensor_chunks(name, include_f32=True):
+                uint8_vals = np.empty(take, dtype=np.uint8)
+                for bi in range(0, take, self.Q8_GROUP_SIZE):
+                    chunk = data_f32[bi:bi + self.Q8_GROUP_SIZE]
+                    vmax  = float(np.abs(chunk).max())
+                    sc    = vmax / 127.0 if vmax > 0 else 1.0
+                    gi    = (pos + elem_off + bi) // self.Q8_GROUP_SIZE
+                    b12_scales[gi] = sc
+                    b12_zeros [gi] = -128.0 * sc
+                    q8 = np.round(chunk / sc).astype(np.int16).clip(-127, 127)
+                    uint8_vals[bi:bi + len(chunk)] = (q8 + 128).astype(np.uint8)
+                locs = np.arange(pos + elem_off, pos + elem_off + take, dtype=np.uint32)
+                g.scatter(self._B12_Q8_MAP_ID, locs, uint8_vals)
+            pos += self._size_of(name)
+
+        g.set_qparams(self._B12_Q8_MAP_ID, b12_scales, b12_zeros)
+        self._b12_q8_map_created = True
+        if self.verbose:
+            print(f"[GPU] B12 Q8 remap: {len(non_q8)} tensors, "
+                  f"{total_elems/1e6:.0f}MB → map {self._B12_Q8_MAP_ID}")
+
+    def _register_full_decode(self):
+        """Build FullDecodeWeightAddrs and register the monolithic decode shader (B12)."""
+        A = self.A
+        if not (getattr(self.gpu, '_has_full_decode_step', False) and
+                getattr(self.gpu, '_has_map_device_address', False)):
+            return
+
+        c = self.cfg
+        q_dim = c.n_head * c.head_dim
+        k_dim = c.n_head_kv * c.head_dim_kv
+
+        # Ensure B12 Q8 re-quant map exists for any Q4/Q6 projection tensors
+        self._ensure_b12_q8_map()
+
+        ws_base    = self.gpu.get_map_buffer_device_address(self.ws_map_id)
+        q8_base    = self.gpu.get_map_buffer_device_address(self.q8_map_id)
+        q8_qp_base = self.gpu.get_map_qparam_device_address(self.q8_map_id)
+        b12_base    = self.gpu.get_map_buffer_device_address(self._B12_Q8_MAP_ID) \
+                      if getattr(self, '_b12_q8_off', None) else 0
+        b12_qp_base = self.gpu.get_map_qparam_device_address(self._B12_Q8_MAP_ID) \
+                      if getattr(self, '_b12_q8_off', None) else 0
+
+        wa = A.FullDecodeWeightAddrs()
+
+        def _w_addr(name):
+            """Byte-level VkDeviceAddress for a weight tensor."""
+            mid = self.tensor_map_id.get(name)
+            off = self._off.get(name, 0)
+            if mid == self.ws_map_id:
+                return ws_base + off * 4   # F32 norm: 4 bytes/elem
+            elif mid == self.q8_map_id:
+                return q8_base + off       # native Q8: 1 byte/elem
+            else:
+                # Q4/Q6 tensor remapped to B12 Q8 map
+                b12_off = self._b12_q8_off.get(name, None)
+                return (b12_base + b12_off) if b12_off is not None else 0
+
+        def _qp_addr(name):
+            """Byte-level VkDeviceAddress for a tensor's Q8 qparam block."""
+            mid = self.tensor_map_id.get(name)
+            if mid == self.q8_map_id:
+                off = self._off.get(name, 0)
+                return q8_qp_base + (off // self.Q8_GROUP_SIZE) * 8
+            else:
+                # Q4/Q6 tensor: use B12 Q8 map qparams
+                b12_off = self._b12_q8_off.get(name, None)
+                return (b12_qp_base + (b12_off // self.Q8_GROUP_SIZE) * 8) if b12_off is not None else 0
+
+        # Per-layer weight BDAs (data + qparams)
+        weight_fields = [
+            ('wq',  'qp_wq',  'attn_q.weight'),
+            ('wk',  'qp_wk',  'attn_k.weight'),
+            ('wv',  'qp_wv',  'attn_v.weight'),
+            ('wo',  'qp_wo',  'attn_output.weight'),
+            ('wg',  'qp_wg',  'ffn_gate.weight'),
+            ('wu',  'qp_wu',  'ffn_up.weight'),
+            ('wd',  'qp_wd',  'ffn_down.weight'),
+        ]
+        for w_field, qp_field, suffix in weight_fields:
+            w_arr  = getattr(wa, w_field)
+            qp_arr = getattr(wa, qp_field)
+            for L in range(min(c.n_layer, 26)):
+                name = f'{self._blk_names[L]}.{suffix}'
+                if name in self._off:
+                    w_arr[L]  = _w_addr(name)
+                    qp_arr[L] = _qp_addr(name)
+
+        # Per-layer norm BDAs (F32 in ws map — no qparams needed)
+        norm_fields = [
+            ('attn_norm',      'attn_norm.weight'),
+            ('attn_q_norm',    'attn_q_norm.weight'),
+            ('attn_k_norm',    'attn_k_norm.weight'),
+            ('ffn_norm',       'ffn_norm.weight'),
+            ('post_attn_norm', 'post_attention_norm.weight'),
+            ('post_ffn_norm',  'post_ffw_norm.weight'),
+        ]
+        for field, suffix in norm_fields:
+            arr = getattr(wa, field)
+            for L in range(min(c.n_layer, 26)):
+                name = f'{self._blk_names[L]}.{suffix}'
+                if name in self._off:
+                    arr[L] = _w_addr(name)
+
+        wa.output_norm    = _w_addr('output_norm.weight')
+        wa.attn_softcap   = float(c.attn_softcap)
+
+        # Model dimensions
+        wa.N_embd      = c.n_embd
+        wa.N_q         = q_dim
+        wa.N_k         = k_dim
+        wa.N_v         = k_dim
+        wa.N_ff        = c.n_ff
+        wa.n_head      = c.n_head
+        wa.n_head_kv   = c.n_head_kv
+        wa.head_dim    = c.head_dim
+        wa.head_dim_kv = c.head_dim_kv
+        wa.group_size_attn = self.Q8_GROUP_SIZE
+        wa.group_size_ffn  = self.Q8_GROUP_SIZE
+
+        # Ensure dedicated B12 KV map exists so C code derives correct kv_cap
+        self._ensure_b12_kv_map()
+
+        try:
+            self.gpu.full_decode_register(self.ws_map_id, self._B12_KV_MAP_ID, wa, c.n_layer)
+            self._full_decode_registered = True
+            self._full_decode_active = True
+            self._full_decode_n_layer = c.n_layer
+            if self.verbose:
+                print(f"[GPU] B12 full_decode_register: ws={ws_base:#x} q8={q8_base:#x}"
+                      f" q8_qp={q8_qp_base:#x} softcap={c.attn_softcap}"
+                      f" → _full_decode_active=True")
+        except Exception as e:
+            self._full_decode_registered = False
+            if self.verbose:
+                print(f"[GPU] B12 full_decode_register failed: {e}")
 
     # ============================================================
     # Forward pass
@@ -2052,13 +2362,19 @@ class ADAMEngine:
         if use_gpu_embed:
             self._enqueue_gpu_embed_token(hid_h)
 
-        _b6 = (self._decode_plan_active and not te
+        # B12: single dispatch for all 26 layers (monolithic shader)
+        _b12 = (self._full_decode_active and not te
+                and c.n_layer == getattr(self, '_full_decode_n_layer', -1))
+        if _b12:
+            self.gpu.full_decode_step(hid_h, normed_h, pos, seq_len)
+
+        _b6 = (not _b12 and self._decode_plan_active and not te
                and c.n_layer == self._decode_plan_n_layer)
         if _b6:
             # B6: single C call replaces all Python layer ops + final norm
             self.gpu.decode_step(self._decode_plan_id, pos, seq_len)
 
-        if not _b6:
+        if not _b6 and not _b12:
          for L in range(c.n_layer):
             p = self._blk_names[L]; gl = c.is_global(L)
             alias_fast = self._fusion_alias_fast_enabled()
@@ -2298,9 +2614,9 @@ class ADAMEngine:
                 g.map_op2_dev(ws_id, self.A.OP_ADD, hid_h, ffn_h, hid_h, c.n_embd)
             if te: self.timing['ffn'] += time.perf_counter() - t0
 
-        # ---- Final norm (still in batch; B6 path includes this in decode plan) ----
+        # ---- Final norm (still in batch; B6/B12 path includes this in decode plan/shader) ----
         normed_final_h, _ = self._wsh('normed')
-        if not _b6:
+        if not _b6 and not _b12:
             if te: t0 = time.perf_counter()
             self._gpu_rmsnorm(hid_h, 'output_norm.weight', normed_final_h, 1, c.n_embd, c.norm_eps)
             if te: self.timing['norm'] += time.perf_counter() - t0

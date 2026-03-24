@@ -30,6 +30,8 @@ def parse_args(argv=None):
     parser.add_argument("--trace", action="store_true", help="Print per-stage timing breakdown")
     parser.add_argument("--rows-per-group", type=int, default=None,
                         help="Override gpu_fused_rows_per_group (default: use profile value)")
+    parser.add_argument("--barrier-count", action="store_true",
+                        help="Print Vulkan pipeline barrier count after Turn 2 (B10 diagnostic)")
     return parser.parse_args(argv)
 
 
@@ -103,6 +105,19 @@ def main(argv=None):
     print(f"decode         : {turn2_stats.get('decode_s', 0.0) * 1000.0:.2f} ms")
     print(f"decode tps     : {turn2_stats.get('decode_tps', 0.0):.2f}")
     print(f"reply preview  : {turn2_text[:100]!r}")
+
+    if args.barrier_count:
+        gpu = getattr(engine, 'gpu', None)
+        bc = gpu.get_last_barrier_count() if (gpu and getattr(gpu, '_has_get_last_barrier_count', False)) else None
+        print("")
+        print("=== Barrier count (B10 diagnostic) ===")
+        if bc is not None:
+            print(f"  barriers/batch : {bc}")
+            t2_tps = turn2_stats.get('decode_tps', 0.0)
+            if t2_tps > 0:
+                print(f"  implied us/bar : {(1000.0 / t2_tps - 0.5) / bc * 1000.0:.1f} μs  (rough: (step_ms - 0.5ms) / barriers)")
+        else:
+            print("  get_last_barrier_count not available in this DLL")
 
     if args.trace:
         ts = turn2_stats.get("trace_summary") or {}

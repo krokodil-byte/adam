@@ -63,6 +63,12 @@ DECODE_OP_MATMUL_XQ8 = 22
 DECODE_OP_QK_NORM_ROPE_X = 23
 DECODE_OP_ROW_COPY_OFFSET = 24
 DECODE_OP_ATTN_SOFTMAX_VALUE = 25
+DECODE_OP_FUSED_QKV_T_XQ4 = 26
+DECODE_OP_FUSED_GATEUP_T_XQ4 = 27
+DECODE_OP_FUSED_QKV_T_XQ8 = 28
+DECODE_OP_FUSED_GATEUP_T_XQ8 = 29
+DECODE_OP_FUSED_GATEUP_ACT_T_XQ8 = 30
+DECODE_OP_FULL_DECODE_STEP = 31
 
 # Import UUCIS wrapper for benchmark compatibility
 try:
@@ -390,6 +396,46 @@ class DecodePlanOp(ctypes.Structure):
         ("f1", ctypes.c_float),
     ]
 
+
+class FullDecodeWeightAddrs(ctypes.Structure):
+    """Weight/address table for monolithic decode-step backend."""
+
+    _fields_ = [
+        ("wq", ctypes.c_uint64 * 26),
+        ("wk", ctypes.c_uint64 * 26),
+        ("wv", ctypes.c_uint64 * 26),
+        ("wo", ctypes.c_uint64 * 26),
+        ("wg", ctypes.c_uint64 * 26),
+        ("wu", ctypes.c_uint64 * 26),
+        ("wd", ctypes.c_uint64 * 26),
+        ("attn_norm", ctypes.c_uint64 * 26),
+        ("attn_q_norm", ctypes.c_uint64 * 26),
+        ("attn_k_norm", ctypes.c_uint64 * 26),
+        ("ffn_norm", ctypes.c_uint64 * 26),
+        ("post_attn_norm", ctypes.c_uint64 * 26),
+        ("post_ffn_norm", ctypes.c_uint64 * 26),
+        ("qp_wq", ctypes.c_uint64 * 26),
+        ("qp_wk", ctypes.c_uint64 * 26),
+        ("qp_wv", ctypes.c_uint64 * 26),
+        ("qp_wo", ctypes.c_uint64 * 26),
+        ("qp_wg", ctypes.c_uint64 * 26),
+        ("qp_wu", ctypes.c_uint64 * 26),
+        ("qp_wd", ctypes.c_uint64 * 26),
+        ("output_norm", ctypes.c_uint64),
+        ("N_embd", ctypes.c_uint32),
+        ("N_q", ctypes.c_uint32),
+        ("N_k", ctypes.c_uint32),
+        ("N_v", ctypes.c_uint32),
+        ("N_ff", ctypes.c_uint32),
+        ("n_head", ctypes.c_uint32),
+        ("n_head_kv", ctypes.c_uint32),
+        ("head_dim", ctypes.c_uint32),
+        ("head_dim_kv", ctypes.c_uint32),
+        ("group_size_attn", ctypes.c_uint32),
+        ("group_size_ffn", ctypes.c_uint32),
+        ("attn_softcap", ctypes.c_float),
+    ]
+
 # ============================================
 # ArrayHandle - Wrapper for GPU arrays
 # ============================================
@@ -459,6 +505,12 @@ class Adamah:
             ret = self._lib.adamah_init()
         if ret != 0:
             raise RuntimeError(f"adamah_init failed with code {ret}")
+
+        if getattr(self, "_has_full_decode_step_api", False):
+            try:
+                self._has_full_decode_step = bool(self._lib.adamah_has_full_decode_step())
+            except Exception:
+                self._has_full_decode_step = False
 
         # Metrics
         self._metrics = {
@@ -779,6 +831,61 @@ class Adamah:
                     'map_matmul_t_xq8_dev', 'map_matmul_xq8_dev'):
             getattr(self._lib, _fn).argtypes = _xmap_args
             getattr(self._lib, _fn).restype = ctypes.c_int
+        try:
+            self._lib.map_fused_qkv_t_xq4_dev.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ]
+            self._lib.map_fused_qkv_t_xq4_dev.restype = ctypes.c_int
+            self._has_map_fused_qkv_t_xq4_dev = True
+        except AttributeError:
+            self._has_map_fused_qkv_t_xq4_dev = False
+        try:
+            self._lib.map_fused_gateup_t_xq4_dev.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ]
+            self._lib.map_fused_gateup_t_xq4_dev.restype = ctypes.c_int
+            self._has_map_fused_gateup_t_xq4_dev = True
+        except AttributeError:
+            self._has_map_fused_gateup_t_xq4_dev = False
+        try:
+            self._lib.map_fused_qkv_t_xq8_dev.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ]
+            self._lib.map_fused_qkv_t_xq8_dev.restype = ctypes.c_int
+            self._has_map_fused_qkv_t_xq8_dev = True
+        except AttributeError:
+            self._has_map_fused_qkv_t_xq8_dev = False
+        try:
+            self._lib.map_fused_gateup_t_xq8_dev.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ]
+            self._lib.map_fused_gateup_t_xq8_dev.restype = ctypes.c_int
+            self._has_map_fused_gateup_t_xq8_dev = True
+        except AttributeError:
+            self._has_map_fused_gateup_t_xq8_dev = False
+        try:
+            self._lib.map_fused_gateup_act_t_xq8_dev.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32,
+            ]
+            self._lib.map_fused_gateup_act_t_xq8_dev.restype = ctypes.c_int
+            self._has_map_fused_gateup_act_t_xq8_dev = True
+        except AttributeError:
+            self._has_map_fused_gateup_act_t_xq8_dev = False
         self._lib.map_row_gather_xq8_dev.argtypes = [
             ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32,
@@ -833,6 +940,12 @@ class Adamah:
             self._has_native_stats = True
         except AttributeError:
             self._has_native_stats = False
+        try:
+            self._lib.adamah_get_last_barrier_count.argtypes = []
+            self._lib.adamah_get_last_barrier_count.restype = ctypes.c_uint32
+            self._has_get_last_barrier_count = True
+        except AttributeError:
+            self._has_get_last_barrier_count = False
 
         try:
             self._lib.adamah_fusion_set_scheduler_mode.argtypes = [ctypes.c_int]
@@ -870,6 +983,34 @@ class Adamah:
             self._has_decode_plan = True
         except AttributeError:
             self._has_decode_plan = False
+
+        try:
+            self._lib.adamah_full_decode_register.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.POINTER(FullDecodeWeightAddrs),
+                ctypes.c_uint32,
+            ]
+            self._lib.adamah_full_decode_register.restype = ctypes.c_int
+            self._lib.adamah_full_decode_step.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32
+            ]
+            self._lib.adamah_full_decode_step.restype = ctypes.c_int
+            self._lib.adamah_has_full_decode_step.argtypes = []
+            self._lib.adamah_has_full_decode_step.restype = ctypes.c_int
+            self._has_full_decode_step_api = True
+            self._has_full_decode_step = False
+        except AttributeError:
+            self._has_full_decode_step_api = False
+            self._has_full_decode_step = False
+
+        try:
+            self._lib.adamah_get_map_buffer_device_address.argtypes = [ctypes.c_uint32]
+            self._lib.adamah_get_map_buffer_device_address.restype = ctypes.c_uint64
+            self._lib.adamah_get_map_qparam_device_address.argtypes = [ctypes.c_uint32]
+            self._lib.adamah_get_map_qparam_device_address.restype = ctypes.c_uint64
+            self._has_map_device_address = True
+        except AttributeError:
+            self._has_map_device_address = False
 
         # GPU capability queries (integrated GPU detection, caps)
         try:
@@ -1583,6 +1724,102 @@ class Adamah:
         if ret != 0:
             raise RuntimeError(f"map_matmul_t_xq4_dev failed with code {ret}")
 
+    def map_fused_qkv_t_xq4_dev(self, map_act: int, map_wt: int,
+                                locs_a_handle: int,
+                                locs_bq_handle: int, locs_bk_handle: int, locs_bv_handle: int,
+                                locs_cq_handle: int, locs_ck_handle: int, locs_cv_handle: int,
+                                K: int, N_q: int, N_k: int, N_v: int):
+        """Single-dispatch fused Q/K/V projections for decode (M=1)."""
+        if not getattr(self, "_has_map_fused_qkv_t_xq4_dev", False):
+            raise RuntimeError("map_fused_qkv_t_xq4_dev not available in loaded backend")
+        self._metrics['op_calls'] += 1
+        ret = self._lib.map_fused_qkv_t_xq4_dev(
+            ctypes.c_uint32(map_act), ctypes.c_uint32(map_wt),
+            ctypes.c_uint32(locs_a_handle),
+            ctypes.c_uint32(locs_bq_handle), ctypes.c_uint32(locs_bk_handle), ctypes.c_uint32(locs_bv_handle),
+            ctypes.c_uint32(locs_cq_handle), ctypes.c_uint32(locs_ck_handle), ctypes.c_uint32(locs_cv_handle),
+            ctypes.c_uint32(K), ctypes.c_uint32(N_q), ctypes.c_uint32(N_k), ctypes.c_uint32(N_v),
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_fused_qkv_t_xq4_dev failed with code {ret}")
+
+    def map_fused_gateup_t_xq4_dev(self, map_act: int, map_wt: int,
+                                   locs_a_handle: int,
+                                   locs_b_gate_handle: int, locs_b_up_handle: int,
+                                   locs_c_gate_handle: int, locs_c_up_handle: int,
+                                   K: int, N_gate: int, N_up: int):
+        """Single-dispatch fused gate/up projections for decode (M=1)."""
+        if not getattr(self, "_has_map_fused_gateup_t_xq4_dev", False):
+            raise RuntimeError("map_fused_gateup_t_xq4_dev not available in loaded backend")
+        self._metrics['op_calls'] += 1
+        ret = self._lib.map_fused_gateup_t_xq4_dev(
+            ctypes.c_uint32(map_act), ctypes.c_uint32(map_wt),
+            ctypes.c_uint32(locs_a_handle),
+            ctypes.c_uint32(locs_b_gate_handle), ctypes.c_uint32(locs_b_up_handle),
+            ctypes.c_uint32(locs_c_gate_handle), ctypes.c_uint32(locs_c_up_handle),
+            ctypes.c_uint32(K), ctypes.c_uint32(N_gate), ctypes.c_uint32(N_up),
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_fused_gateup_t_xq4_dev failed with code {ret}")
+
+    def map_fused_qkv_t_xq8_dev(self, map_act: int, map_wt: int,
+                                locs_a_handle: int,
+                                locs_bq_handle: int, locs_bk_handle: int, locs_bv_handle: int,
+                                locs_cq_handle: int, locs_ck_handle: int, locs_cv_handle: int,
+                                K: int, N_q: int, N_k: int, N_v: int):
+        """Single-dispatch fused Q/K/V projections for decode (M=1, Q8 weights)."""
+        if not getattr(self, "_has_map_fused_qkv_t_xq8_dev", False):
+            raise RuntimeError("map_fused_qkv_t_xq8_dev not available in loaded backend")
+        self._metrics['op_calls'] += 1
+        ret = self._lib.map_fused_qkv_t_xq8_dev(
+            ctypes.c_uint32(map_act), ctypes.c_uint32(map_wt),
+            ctypes.c_uint32(locs_a_handle),
+            ctypes.c_uint32(locs_bq_handle), ctypes.c_uint32(locs_bk_handle), ctypes.c_uint32(locs_bv_handle),
+            ctypes.c_uint32(locs_cq_handle), ctypes.c_uint32(locs_ck_handle), ctypes.c_uint32(locs_cv_handle),
+            ctypes.c_uint32(K), ctypes.c_uint32(N_q), ctypes.c_uint32(N_k), ctypes.c_uint32(N_v),
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_fused_qkv_t_xq8_dev failed with code {ret}")
+
+    def map_fused_gateup_t_xq8_dev(self, map_act: int, map_wt: int,
+                                   locs_a_handle: int,
+                                   locs_b_gate_handle: int, locs_b_up_handle: int,
+                                   locs_c_gate_handle: int, locs_c_up_handle: int,
+                                   K: int, N_gate: int, N_up: int):
+        """Single-dispatch fused gate/up projections for decode (M=1, Q8 weights)."""
+        if not getattr(self, "_has_map_fused_gateup_t_xq8_dev", False):
+            raise RuntimeError("map_fused_gateup_t_xq8_dev not available in loaded backend")
+        self._metrics['op_calls'] += 1
+        ret = self._lib.map_fused_gateup_t_xq8_dev(
+            ctypes.c_uint32(map_act), ctypes.c_uint32(map_wt),
+            ctypes.c_uint32(locs_a_handle),
+            ctypes.c_uint32(locs_b_gate_handle), ctypes.c_uint32(locs_b_up_handle),
+            ctypes.c_uint32(locs_c_gate_handle), ctypes.c_uint32(locs_c_up_handle),
+            ctypes.c_uint32(K), ctypes.c_uint32(N_gate), ctypes.c_uint32(N_up),
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_fused_gateup_t_xq8_dev failed with code {ret}")
+
+    def map_fused_gateup_act_t_xq8_dev(self, map_act: int, map_wt: int,
+                                       locs_a_handle: int,
+                                       locs_b_gate_handle: int,
+                                       locs_b_up_handle: int,
+                                       locs_c_out_handle: int,
+                                       K: int, N_ff: int):
+        """Single-dispatch fused gate/up + SiLU(gate)*up for decode (M=1, Q8 weights)."""
+        if not getattr(self, "_has_map_fused_gateup_act_t_xq8_dev", False):
+            raise RuntimeError("map_fused_gateup_act_t_xq8_dev not available in loaded backend")
+        self._metrics['op_calls'] += 1
+        ret = self._lib.map_fused_gateup_act_t_xq8_dev(
+            ctypes.c_uint32(map_act), ctypes.c_uint32(map_wt),
+            ctypes.c_uint32(locs_a_handle),
+            ctypes.c_uint32(locs_b_gate_handle), ctypes.c_uint32(locs_b_up_handle),
+            ctypes.c_uint32(locs_c_out_handle),
+            ctypes.c_uint32(K), ctypes.c_uint32(N_ff),
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_fused_gateup_act_t_xq8_dev failed with code {ret}")
+
     def map_matmul_xq4_dev(self, map_act: int, map_wt: int,
                             locs_a_handle: int, locs_b_handle: int,
                             locs_c_handle: int, M: int, K: int, N: int, n_ops: int = 1):
@@ -2122,6 +2359,12 @@ class Adamah:
             "scheduler_mode_name": _FUSION_SCHEDULER_NAMES.get(scheduler_mode_value, "unknown"),
         }
 
+    def get_last_barrier_count(self):
+        """Return the barrier count from the most recently completed batch."""
+        if not getattr(self, '_has_get_last_barrier_count', False):
+            return None
+        return int(self._lib.adamah_get_last_barrier_count())
+
     def fusion_enable(self, enable: bool):
         """Enable or disable the fusion op-queue.
 
@@ -2237,6 +2480,46 @@ class Adamah:
         )
         if ret != 0:
             raise RuntimeError(f"adamah_decode_step failed with code {ret}")
+
+    def full_decode_register(self, map_ws_id: int, map_kvcache_id: int,
+                             wa: FullDecodeWeightAddrs, n_layer: int):
+        """Register monolithic decode weights/addresses once at model-load time."""
+        if not getattr(self, '_has_full_decode_step', False):
+            raise NotImplementedError("full_decode_step is not available in the loaded backend")
+        if not isinstance(wa, FullDecodeWeightAddrs):
+            raise TypeError("wa must be a FullDecodeWeightAddrs ctypes structure")
+        ret = self._lib.adamah_full_decode_register(
+            ctypes.c_uint32(map_ws_id),
+            ctypes.c_uint32(map_kvcache_id),
+            ctypes.byref(wa),
+            ctypes.c_uint32(n_layer),
+        )
+        if ret != 0:
+            raise RuntimeError(f"adamah_full_decode_register failed with code {ret}")
+
+    def full_decode_step(self, locs_emb_in: int, locs_hidden_out: int,
+                         pos: int, seq_len: int):
+        """Run one monolithic decode step (single dispatch path)."""
+        if not getattr(self, '_has_full_decode_step', False):
+            raise NotImplementedError("full_decode_step is not available in the loaded backend")
+        ret = self._lib.adamah_full_decode_step(
+            ctypes.c_uint32(locs_emb_in),
+            ctypes.c_uint32(locs_hidden_out),
+            ctypes.c_uint32(pos),
+            ctypes.c_uint32(seq_len),
+        )
+        if ret != 0:
+            raise RuntimeError(f"adamah_full_decode_step failed with code {ret}")
+
+    def get_map_buffer_device_address(self, map_id: int) -> int:
+        if not getattr(self, '_has_map_device_address', False):
+            raise NotImplementedError("map device-address API is not available in the loaded backend")
+        return int(self._lib.adamah_get_map_buffer_device_address(ctypes.c_uint32(map_id)))
+
+    def get_map_qparam_device_address(self, map_id: int) -> int:
+        if not getattr(self, '_has_map_device_address', False):
+            raise NotImplementedError("map device-address API is not available in the loaded backend")
+        return int(self._lib.adamah_get_map_qparam_device_address(ctypes.c_uint32(map_id)))
 
     @contextmanager
     def fusion_disabled(self):
@@ -2590,5 +2873,5 @@ __all__ = [
     'BROADCAST_MUL', 'BROADCAST_DIV', 'BROADCAST_ADD', 'BROADCAST_SUB',
     
     # Handles
-    'ArrayHandle',
+    'ArrayHandle', 'DecodePlanOp', 'FullDecodeWeightAddrs',
 ]

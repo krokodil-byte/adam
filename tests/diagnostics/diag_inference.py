@@ -766,12 +766,26 @@ def check_multilayer_cpu(engine, tokenizer, cfg):
         engine.cfg.n_layer = n
         engine.reset()
         gpu_logits = engine._forward(tokenizer.bos_id, 0)
-        gpu_hid = engine.gpu.gather(engine.ws_map_id, hid_locs).view(np.float32)
+        # B12 writes final-normed output to normed slot (not hidden slot).
+        # Compare normed_gpu vs cpu_normed, and require top1 match as tie-breaker.
+        b12_this_n = (getattr(engine, '_full_decode_active', False) and
+                      n == getattr(engine, '_full_decode_n_layer', -1))
+        if b12_this_n:
+            normed_locs = np.arange(engine._ws_slots['normed'][2],
+                                    engine._ws_slots['normed'][2] + c.n_embd, dtype=np.uint32)
+            gpu_hid = engine.gpu.gather(engine.ws_map_id, normed_locs).view(np.float32)
+            cpu_norm_ref = float(np.linalg.norm(cpu_normed))
+        else:
+            gpu_hid = engine.gpu.gather(engine.ws_map_id, hid_locs).view(np.float32)
+            cpu_norm_ref = cpu_norm
         gpu_norm = float(np.linalg.norm(gpu_hid))
         gpu_top1 = int(np.argmax(gpu_logits))
 
-        ratio = gpu_norm / (cpu_norm + 1e-8)
-        ok = 0.85 < ratio < 1.15   # within 15% is fine given Q4 error
+        ratio = gpu_norm / (cpu_norm_ref + 1e-8)
+        if b12_this_n:
+            ok = (0.85 < ratio < 1.15) and (gpu_top1 == cpu_top1)
+        else:
+            ok = 0.85 < ratio < 1.15   # within 15% is fine given Q4 error
         all_ok = all_ok and ok
         print(f"  {n:4d}  {gpu_norm:12.2f}  {cpu_norm:12.2f}  {ratio:7.3f}  "
               f"  {ts(gpu_top1):>12s}  {ts(cpu_top1):>12s}  "
