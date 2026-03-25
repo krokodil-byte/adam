@@ -2362,17 +2362,18 @@ class ADAMEngine:
         if use_gpu_embed:
             self._enqueue_gpu_embed_token(hid_h)
 
-        # B12: single dispatch for all 26 layers (monolithic shader)
-        _b12 = (self._full_decode_active and not te
+        # B6: decode plan (339 ops, 61 tok/s) — preferred path
+        _b6 = (self._decode_plan_active and not te
+               and c.n_layer == self._decode_plan_n_layer)
+        if _b6:
+            self.gpu.decode_step(self._decode_plan_id, pos, seq_len)
+
+        # B12: monolithic shader — only active when B6 unavailable AND explicitly enabled
+        # (B13 will make this competitive; until then B6 takes priority)
+        _b12 = (not _b6 and self._full_decode_active and not te
                 and c.n_layer == getattr(self, '_full_decode_n_layer', -1))
         if _b12:
             self.gpu.full_decode_step(hid_h, normed_h, pos, seq_len)
-
-        _b6 = (not _b12 and self._decode_plan_active and not te
-               and c.n_layer == self._decode_plan_n_layer)
-        if _b6:
-            # B6: single C call replaces all Python layer ops + final norm
-            self.gpu.decode_step(self._decode_plan_id, pos, seq_len)
 
         if not _b6 and not _b12:
          for L in range(c.n_layer):
