@@ -656,8 +656,137 @@ Target: Turn 2 decode_tps >> 61 tok/s (B6 baseline).
 
 ---
 
+## B13 addendum — barrier overhead diagnosis + A/B test (2026-03-25)
+
+### Observed result
+B13 validated at **28.6 tok/s** on RTX 3070 (vs 1.33 tok/s B12, 61 tok/s B6).
+Expected was ~300 tok/s. The gap points to barrier overhead dominating.
+
+### Root cause hypothesis
+The current `global_arrive_wait` uses a **globally contended coherent uint counter**:
+all N_WG workgroups spin on `s[bid]` via `memoryBarrierBuffer()` in a loop.
+On NVIDIA, coherent buffer reads between workgroups cross the L2 cache coherency
+domain — each spin iteration triggers a full L2 cache line invalidation.
+Measured cost: likely ~50–150 μs per barrier (not ~3 μs as assumed).
+With 260 barriers × 100 μs = 26 ms → ~38 tok/s ceiling, consistent with observation.
+
+**Correction**: `GL_EXT_shader_atomic_float2` is NOT the right tool here.
+The barrier mechanism needs uint atomics + memory semantics, not float atomics.
+
+### Requested A/B test
+
+**Step 1: measure barrier cost directly.**
+
+Add a GPU timestamp (via push constant round-trip or a counter in the sync buffer)
+to isolate barrier cost from compute cost. Specifically:
+- Record time before first `global_arrive_wait` and after last one (per token)
+- Report `barrier_ms` and `compute_ms` separately in a debug build
+
+If `barrier_ms >> compute_ms`, confirmed barrier-dominated.
+
+**Step 2: implement and compare two alternative sync schemes.**
+
+#### Scheme A — "mailbox/epoch" per-WG coordination
+
+Instead of all WGs spinning on a single global counter, WG 0 acts as coordinator:
+
+```glsl
+// SyncBuf layout for mailbox scheme:
+// s[0..N_WG-1]: per-WG arrival flags (each WG writes its own slot)
+// s[N_WG]:      coordinator broadcast slot (WG 0 writes, others read)
+
+void global_arrive_wait_mailbox(uint epoch) {
+    memoryBarrierBuffer(); barrier();
+    // Each WG writes to its own dedicated slot — no contention
+    if (tid == 0u) {
+        s[wg_id] = epoch + 1u;          // signal arrival (unique slot per WG)
+        memoryBarrierBuffer();
+        if (wg_id == 0u) {
+            // WG 0 polls per-WG slots (N_WG reads, but each is hot in L1)
+            for (uint w = 1u; w < pc.n_wg; w++) {
+                while (s[w] <= epoch) { memoryBarrierBuffer(); }
+            }
+            // broadcast "all arrived"
+            s[N_WG_MAX] = epoch + 1u;
+            memoryBarrierBuffer();
+        } else {
+            // non-WG0: spin on broadcast slot (1 cache line, written once by WG0)
+            while (s[N_WG_MAX] <= epoch) { memoryBarrierBuffer(); }
+        }
+    }
+    barrier(); memoryBarrierBuffer();
+}
+```
+
+Key difference: each WG writes to its **own slot** (no write contention).
+Non-WG0 WGs spin on a **single broadcast slot** written exactly once by WG 0.
+WG 0 polls N_WG slots, but each is written once and then hot in L2 cache.
+Expected: 1–2 cache line invalidations per barrier instead of N_WG × continuous polling.
+
+`epoch` increments by 1 each call (local uint variable in main(), no extra buffer slot needed).
+`N_WG_MAX` is a compile-time constant (e.g., 64). SyncBuf needs N_WG_MAX+1 uint slots.
+
+#### Scheme B — "chunked dispatch" fallback
+
+If in-shader sync remains expensive regardless of scheme, fall back to splitting
+the 26 layers into K groups dispatched separately (K << 339):
+
+```
+// Instead of 1 dispatch for 26 layers:
+// Dispatch 1: layers 0..8   (9 layers, no cross-dispatch sync needed)
+// Dispatch 2: layers 9..17
+// Dispatch 3: layers 18..25 + final norm
+// Total: 3 dispatches vs 339 for B6 → ~100× less dispatch overhead
+```
+
+Each dispatch: N_WG workgroups, no inter-WG sync needed (layers within a dispatch
+are processed sequentially by each WG independently, with only intra-WG barriers).
+Between dispatches: standard Vulkan pipeline barrier (cheap at 3 barriers vs 339).
+
+This eliminates global spin-barriers entirely at the cost of 3 dispatches instead of 1.
+Estimated: 3 × 48μs (barrier overhead) + compute ≈ 2.1ms → ~470 tok/s.
+
+### Requested implementation order
+
+1. Add timestamp/cost measurement to current B13 (1 day)
+2. Implement mailbox scheme A (in-shader, drop-in replacement for spin-wait)
+3. If scheme A ≥ 200 tok/s → ship. If not → implement scheme B (chunked dispatch).
+4. Report all three measurements in AGENT_COLLAB.md.
+
+### Zero-copy embedding (B13 add-on, independent of barrier work)
+
+While fixing barriers, also add zero-copy token embedding to eliminate the
+`map_row_gather_xq8_dev` pre-dispatch currently enqueued before `full_decode_step`:
+
+Add to `FullDecodeWeightAddrs`:
+```c
+uint64_t token_embd;      // BDA: row 0 of token_embd.weight in Q8 map
+uint64_t qp_token_embd;   // BDA: qparams for token_embd
+uint32_t group_size_embd;
+float    emb_scale;       // sqrt(n_embd) for Gemma3, 1.0 otherwise
+```
+
+Add `token_id` to push constants (6th uint32, total 24 bytes).
+
+Shader: at start of `main()`, replace `locs_emb_in` read with:
+```glsl
+uint emb_row = pc.token_id * wa.N_embd;
+for (uint i = tid; i < wa.N_embd; i += WG_SIZE)
+    act[wa.hidden_slot + i] =
+        dequant_q8(wa.token_embd, wa.qp_token_embd, emb_row + i, wa.group_size_embd)
+        * wa.emb_scale;
+barrier();
+```
+
+`binding 3` (LocsEmbIn) can be removed from the descriptor set.
+Claude will update `engine.py` to skip `_enqueue_gpu_embed_token` when `_b12` active
+and pass `tok` as the 6th push constant.
+
+---
+
 ## Post results in AGENT_COLLAB.md
 
-- decode_tps Turn 2 from diag_chat_perf.py
-- diag_inference.py result (8/8 or fail)
-- Measured barriers/batch from `--barrier-count` if available
+- decode_tps Turn 2 from diag_chat_perf.py (scheme A, B, baseline)
+- barrier_ms vs compute_ms breakdown
+- diag_inference.py result (8/8 or fail) after each change
+- N_WG value used (auto or manual)
