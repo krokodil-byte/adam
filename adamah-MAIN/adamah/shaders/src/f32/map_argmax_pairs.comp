@@ -1,0 +1,67 @@
+#version 450
+
+#ifdef ADAMAH_PROFILE_BROADCOM_V3DV_NARROW
+#define WG_SIZE 32
+#elif defined(ADAMAH_PROFILE_BROADCOM_V3DV_BALANCED)
+#define WG_SIZE 64
+#else
+#define WG_SIZE 128
+#endif
+
+layout(local_size_x = WG_SIZE) in;
+
+const float NEG_INF = -3.402823466e+38;
+const uint INVALID_IDX = 0xffffffffu;
+
+layout(push_constant) uniform PushConstants {
+    layout(offset = 0) uint n_groups;
+} pc;
+
+layout(set = 0, binding = 0) buffer ActBuffer    { float map_act[]; };
+layout(set = 0, binding = 1) buffer LocsIdxSrc   { uint  locs_idx_src[]; };
+layout(set = 0, binding = 2) buffer LocsValSrc   { uint  locs_val_src[]; };
+layout(set = 0, binding = 3) buffer LocsTokDst   { uint  locs_tok_dst[]; };
+
+shared float sh_vals[WG_SIZE];
+shared uint sh_idxs[WG_SIZE];
+
+bool better(float cand_val, uint cand_idx, float best_val, uint best_idx) {
+    if (best_idx == INVALID_IDX) return true;
+    if (cand_idx == INVALID_IDX) return false;
+    return (cand_val > best_val) || ((cand_val == best_val) && (cand_idx < best_idx));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    float best_val = NEG_INF;
+    uint best_idx = INVALID_IDX;
+
+    for (uint i = tid; i < pc.n_groups; i += WG_SIZE) {
+        float val = map_act[locs_val_src[i]];
+        uint idx = uint(map_act[locs_idx_src[i]] + 0.5);
+        if (better(val, idx, best_val, best_idx)) {
+            best_val = val;
+            best_idx = idx;
+        }
+    }
+
+    sh_vals[tid] = best_val;
+    sh_idxs[tid] = best_idx;
+    barrier();
+
+    for (uint stride = uint(WG_SIZE >> 1); stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            float rv = sh_vals[tid + stride];
+            uint ri = sh_idxs[tid + stride];
+            if (better(rv, ri, sh_vals[tid], sh_idxs[tid])) {
+                sh_vals[tid] = rv;
+                sh_idxs[tid] = ri;
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        map_act[locs_tok_dst[0]] = float((sh_idxs[0] == INVALID_IDX) ? 0u : sh_idxs[0]);
+    }
+}

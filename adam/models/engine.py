@@ -13,9 +13,13 @@ Key design choices:
 """
 import numpy as np
 import os
+import json
+import hashlib
 import time, sys
 from typing import Optional, List, Dict
 from dataclasses import dataclass
+from pathlib import Path
+from contextlib import nullcontext
 
 @dataclass
 class GenerationConfig:
@@ -253,6 +257,68 @@ class ADAMEngine:
                  adamah_mod=None, verbose=True, **kw):
         self.gpu = gpu; self.cfg = cfg; self.tensors = dict(tensors)
         self.A = adamah_mod; self.verbose = verbose
+        self._runtime_profile = str(
+            kw.get('runtime_profile',
+                   os.environ.get('ADAMAH_SHADER_PROFILE',
+                                  os.environ.get('ADAM_RUNTIME_PROFILE', '')))
+        ).strip().lower()
+        self._is_broadcom = self._runtime_profile.startswith('broadcom_v3dv')
+        legacy_cpu_top1 = (
+            str(
+                kw.get(
+                    'broadcom_cpu_lm_head',
+                    os.environ.get('ADAM_BROADCOM_CPU_LM_HEAD', '0'),
+                )
+            ).strip().lower() in ('1', 'true', 'yes', 'on')
+        )
+        lm_mode_raw = str(
+            kw.get(
+                'broadcom_lm_head_mode',
+                os.environ.get('ADAM_BROADCOM_LM_HEAD_MODE', 'auto'),
+            )
+        ).strip().lower()
+        if lm_mode_raw not in ('auto', 'cpu_top1', 'gpu'):
+            lm_mode_raw = 'auto'
+        lm_mode_explicit = (
+            ('broadcom_lm_head_mode' in kw) or
+            ('ADAM_BROADCOM_LM_HEAD_MODE' in os.environ)
+        )
+        if legacy_cpu_top1 and not lm_mode_explicit:
+            lm_mode_raw = 'cpu_top1'
+        if not self._is_broadcom:
+            lm_mode_raw = 'gpu'
+        self._broadcom_lm_head_mode = lm_mode_raw
+        self._legacy_cpu_lm_head = legacy_cpu_top1
+        self._cpu_top1_enabled = (
+            self._is_broadcom and self._broadcom_lm_head_mode in ('auto', 'cpu_top1')
+        )
+        self._cpu_top1_threads = max(
+            1, int(kw.get('cpu_top1_threads', os.environ.get('ADAM_CPU_TOP1_THREADS', '4'))))
+        self._cpu_top1_block_rows = max(
+            256, int(kw.get('cpu_top1_block_rows', os.environ.get('ADAM_CPU_TOP1_BLOCK_ROWS', '4096'))))
+        self._cpu_top1_impl = str(
+            kw.get('cpu_top1_impl', os.environ.get('ADAM_CPU_TOP1_IMPL', 'block'))
+        ).strip().lower()
+        if self._cpu_top1_impl not in ('full_gemv', 'block'):
+            self._cpu_top1_impl = 'block'
+        self._cpu_top1_lm_name = None
+        self._cpu_top1_weight = None
+        self._cpu_top1_logits_buf = None
+        self._configure_cpu_top1_threads()
+        self._require_b12_on_broadcom = (
+            self._is_broadcom and
+            str(os.environ.get('ADAM_BROADCOM_REQUIRE_B12', '1')).strip().lower()
+            not in ('0', 'false', 'no', 'off')
+        )
+        self._broadcom_split_proj = (
+            self._is_broadcom and
+            str(os.environ.get('ADAM_BROADCOM_SPLIT_PROJ', '0')).strip().lower()
+            in ('1', 'true', 'yes', 'on')
+        )
+        if self._broadcom_split_proj:
+            # Split-proj mode intentionally uses the classic per-op dispatch path
+            # for QKV/output projections, so strict B12 requirement is disabled.
+            self._require_b12_on_broadcom = False
         self.raw_blocks = dict(kw.get('raw_blocks', {}))
         self.tensor_types = kw.get('tensor_types', {})
         self.tensor_shapes = dict(kw.get(
@@ -272,6 +338,9 @@ class ADAMEngine:
                    int(kw.get('gpu_approx_partial_k', self.SAMPLE_TOPK_MAX))))
         self._gpu_fused_rows_per_group = max(
             1, int(kw.get('gpu_fused_rows_per_group', self.SAMPLE_FUSED_ROWS_PER_GROUP)))
+        if self._broadcom_split_proj and ('gpu_fused_rows_per_group' not in kw):
+            # Favor more workgroups on Broadcom split-proj path.
+            self._gpu_fused_rows_per_group = 64
         if self._production_mode and self._cpu_attention_fallback:
             raise ValueError("production_mode requires GPU attention; cpu_attention_fallback is disabled")
         self._host_state_pruned = False
@@ -292,23 +361,23 @@ class ADAMEngine:
         if self._production_mode:
             self.release_host_state()
         self.timing = {}; self._reset_timing()
-        # Detect runtime profile for hardware-specific optimizations
-        self._runtime_profile = str(
-            os.environ.get('ADAMAH_SHADER_PROFILE', os.environ.get('ADAM_RUNTIME_PROFILE', ''))
-        ).strip().lower()
-        self._is_broadcom = self._runtime_profile.startswith('broadcom_v3dv')
         self._is_integrated = getattr(self.gpu, '_is_integrated_gpu', False)
         # Auto-tune for Broadcom / integrated GPU (Raspberry Pi)
         if self._is_broadcom or self._is_integrated:
             # Default to level_batched fusion scheduler (enables barrier coalescing)
             default_scheduler = 'level_batched'
-            # Larger rows_per_group reduces dispatch count for LM head sampling
+            # V3D prefers smaller row groups; 1024 causes severe sampler slowdown.
             if self._gpu_fused_rows_per_group == self.SAMPLE_FUSED_ROWS_PER_GROUP:
-                self._gpu_fused_rows_per_group = 1024
+                self._gpu_fused_rows_per_group = 256 if self._is_broadcom else 512
             if self.verbose:
+                lm_mode = (
+                    f", lm_head_mode={self._broadcom_lm_head_mode}"
+                    if self._is_broadcom else ""
+                )
+                split_proj = ", split_proj=on" if self._broadcom_split_proj else ""
                 print(f"[GPU] Broadcom/integrated GPU detected — "
                       f"auto-tuning: scheduler={default_scheduler}, "
-                      f"rows_per_group={self._gpu_fused_rows_per_group}")
+                      f"rows_per_group={self._gpu_fused_rows_per_group}{lm_mode}{split_proj}")
         else:
             default_scheduler = 'legacy'
         self._fusion_scheduler_mode = str(
@@ -443,6 +512,8 @@ class ADAMEngine:
     Q8_GROUP_SIZE = 32
     # GGML types routed to the Q8 map (stored as int8, full precision)
     _GGML_Q8_MAP = frozenset({6, 8})   # Q5_0=6, Q8_0=8
+    _Q4_MAP_CACHE_VERSION = 1
+    _Q8_MAP_CACHE_VERSION = 1
 
     def _build_layout(self):
         c = self.cfg
@@ -537,8 +608,344 @@ class ADAMEngine:
                           f"{n8g*8/1e6:.0f} MB qparams")
             print(f"[GPU] F32 norms: {len(norm_names)} tensors")
 
+    def _q4_map_cache_enabled(self):
+        v = str(os.environ.get("ADAM_Q4_MAP_CACHE", "1")).strip().lower()
+        return v not in ("0", "false", "no", "off")
+
+    def _q4_map_cache_base(self):
+        if (self._force_f32 or not self._q4_map_cache_enabled() or
+                int(self._q4_total_elems) <= 0):
+            return None, None, None
+
+        names = sorted(self._q4_tensors)
+        model_path = ""
+        model_size = 0
+        model_mtime_ns = 0
+        tl = getattr(self, "_tensor_loader", None)
+        if tl is not None and hasattr(tl, "path"):
+            try:
+                p = Path(str(tl.path)).expanduser().resolve()
+                st = p.stat()
+                model_path = str(p)
+                model_size = int(st.st_size)
+                model_mtime_ns = int(st.st_mtime_ns)
+            except Exception:
+                model_path = str(getattr(tl, "path", ""))
+
+        h = hashlib.sha1()
+        h.update(str(self._Q4_MAP_CACHE_VERSION).encode("utf-8"))
+        h.update(str(self.Q4_GROUP_SIZE).encode("utf-8"))
+        h.update(str(model_path).encode("utf-8"))
+        h.update(str(model_size).encode("utf-8"))
+        h.update(str(model_mtime_ns).encode("utf-8"))
+        h.update(str(self._q4_total_elems).encode("utf-8"))
+        h.update(str(self._lm_q4_approx_name or "").encode("utf-8"))
+        h.update(str(int(self._lm_q4_approx_off or -1)).encode("utf-8"))
+        for name in names:
+            h.update(name.encode("utf-8"))
+            h.update(str(self.tensor_types.get(name)).encode("utf-8"))
+            h.update(str(self._size_of(name)).encode("utf-8"))
+            h.update(str(self._off.get(name, 0)).encode("utf-8"))
+        sig = h.hexdigest()[:20]
+
+        tag = Path(model_path).stem if model_path else "model"
+        tag = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in tag)[:64]
+        if not tag:
+            tag = "model"
+
+        cache_dir = os.environ.get(
+            "ADAM_Q4_MAP_CACHE_DIR",
+            os.path.join(os.path.expanduser("~"), ".cache", "adam", "q4_map"),
+        )
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except Exception:
+            return None, None, None
+
+        base = os.path.join(cache_dir, f"{tag}_{sig}")
+        meta = {
+            "version": int(self._Q4_MAP_CACHE_VERSION),
+            "group_size": int(self.Q4_GROUP_SIZE),
+            "model_path": model_path,
+            "model_size": int(model_size),
+            "model_mtime_ns": int(model_mtime_ns),
+            "total_elems": int(self._q4_total_elems),
+            "lm_q4_approx_name": str(self._lm_q4_approx_name or ""),
+            "lm_q4_approx_off": int(self._lm_q4_approx_off or -1),
+        }
+        return base, meta, names
+
+    def _q4_map_try_load_cache(self):
+        base, meta_expected, names = self._q4_map_cache_base()
+        if not base:
+            return False
+        if not getattr(self.gpu, "_has_map_scatter_q4_packed_contiguous", False):
+            return False
+
+        meta_path = base + ".meta.json"
+        u8_path = base + ".u8.npy"
+        sc_path = base + ".sc.npy"
+        zp_path = base + ".zp.npy"
+        if not (os.path.exists(meta_path) and os.path.exists(u8_path) and
+                os.path.exists(sc_path) and os.path.exists(zp_path)):
+            return False
+
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if int(meta.get("version", -1)) != int(meta_expected["version"]):
+                return False
+            if int(meta.get("group_size", -1)) != int(meta_expected["group_size"]):
+                return False
+            if int(meta.get("total_elems", -1)) != int(meta_expected["total_elems"]):
+                return False
+            if str(meta.get("lm_q4_approx_name", "")) != str(meta_expected["lm_q4_approx_name"]):
+                return False
+            if int(meta.get("lm_q4_approx_off", -1)) != int(meta_expected["lm_q4_approx_off"]):
+                return False
+
+            meta_names = list(meta.get("names", []))
+            meta_types = [int(x) for x in meta.get("types", [])]
+            meta_sizes = [int(x) for x in meta.get("sizes", [])]
+            meta_offs = [int(x) for x in meta.get("offs", [])]
+            if meta_names != names:
+                return False
+            if len(meta_types) != len(names) or len(meta_sizes) != len(names) or len(meta_offs) != len(names):
+                return False
+            if [int(self.tensor_types.get(n, -1)) for n in names] != meta_types:
+                return False
+            if [int(self._size_of(n)) for n in names] != meta_sizes:
+                return False
+            if [int(self._off.get(n, 0)) for n in names] != meta_offs:
+                return False
+
+            u8 = np.load(u8_path, mmap_mode="r")
+            sc = np.load(sc_path, mmap_mode="r")
+            zp = np.load(zp_path, mmap_mode="r")
+            n4g = (self._q4_total_elems + self.Q4_GROUP_SIZE - 1) // self.Q4_GROUP_SIZE
+            n4b = (self._q4_total_elems + 1) // 2
+            if u8.dtype != np.uint8 or int(u8.size) != int(n4b):
+                return False
+            if sc.dtype != np.float32 or int(sc.size) != int(n4g):
+                return False
+            if zp.dtype != np.float32 or int(zp.size) != int(n4g):
+                return False
+
+            g = self.gpu
+            g.map_create_typed(1, self.A.DTYPE_Q4, 1, self._q4_total_elems, self.Q4_GROUP_SIZE)
+            g.scatter_q4_packed_contiguous(1, 0, np.ascontiguousarray(u8, dtype=np.uint8),
+                                           n_locs=int(self._q4_total_elems))
+            g.set_qparams(1, np.ascontiguousarray(sc, dtype=np.float32),
+                          np.ascontiguousarray(zp, dtype=np.float32))
+            if self.verbose:
+                print(f"[GPU] Q4 cache hit: {len(names)} tensors, "
+                      f"{self._q4_total_elems * 0.5 / 1e6:.0f}MB -> map 1")
+            return True
+        except Exception as e:
+            if self.verbose:
+                print(f"[GPU] Q4 cache load failed ({e}), rebuilding...")
+            return False
+
+    def _q4_map_save_cache(self, q4_u8, q4_scales, q4_zeros):
+        base, meta, names = self._q4_map_cache_base()
+        if not base:
+            return
+        try:
+            np.save(base + ".u8.npy", np.ascontiguousarray(q4_u8, dtype=np.uint8))
+            np.save(base + ".sc.npy", np.ascontiguousarray(q4_scales, dtype=np.float32))
+            np.save(base + ".zp.npy", np.ascontiguousarray(q4_zeros, dtype=np.float32))
+            meta_out = dict(meta)
+            meta_out.update({
+                "names": list(names),
+                "types": [int(self.tensor_types.get(n, -1)) for n in names],
+                "sizes": [int(self._size_of(n)) for n in names],
+                "offs": [int(self._off.get(n, 0)) for n in names],
+            })
+            with open(base + ".meta.json", "w", encoding="utf-8") as f:
+                json.dump(meta_out, f)
+        except Exception as e:
+            if self.verbose:
+                print(f"[GPU] Q4 cache save failed: {e}")
+
+    def _q8_map_cache_enabled(self):
+        v = str(os.environ.get("ADAM_Q8_MAP_CACHE", "1")).strip().lower()
+        return v not in ("0", "false", "no", "off")
+
+    def _q8_scatter_contiguous(self, map_id, total_elems, data_u8):
+        g = self.gpu
+        chunk = int(os.environ.get("ADAM_Q8_MAP_SCATTER_CHUNK", str(4 * 1024 * 1024)))
+        if chunk <= 0:
+            chunk = 4 * 1024 * 1024
+        for start in range(0, total_elems, chunk):
+            end = min(total_elems, start + chunk)
+            vals = np.ascontiguousarray(data_u8[start:end], dtype=np.uint8)
+            if getattr(g, "_has_map_scatter_contiguous", False):
+                g.scatter_contiguous(map_id, start, vals)
+            else:
+                locs = np.arange(start, end, dtype=np.uint32)
+                g.scatter(map_id, locs, vals)
+
+    def _q8_map_cache_base(self, use_q5_raw_decode):
+        if not self._q8_map_cache_enabled() or not self._q8_tensors:
+            return None, None, None
+
+        names = sorted(self._q8_tensors)
+        model_path = ""
+        model_size = 0
+        model_mtime_ns = 0
+        tl = getattr(self, "_tensor_loader", None)
+        if tl is not None and hasattr(tl, "path"):
+            try:
+                p = Path(str(tl.path)).expanduser().resolve()
+                st = p.stat()
+                model_path = str(p)
+                model_size = int(st.st_size)
+                model_mtime_ns = int(st.st_mtime_ns)
+            except Exception:
+                model_path = str(getattr(tl, "path", ""))
+
+        h = hashlib.sha1()
+        h.update(str(self._Q8_MAP_CACHE_VERSION).encode("utf-8"))
+        h.update(str(self.Q8_GROUP_SIZE).encode("utf-8"))
+        h.update(str(int(bool(use_q5_raw_decode))).encode("utf-8"))
+        h.update(str(model_path).encode("utf-8"))
+        h.update(str(model_size).encode("utf-8"))
+        h.update(str(model_mtime_ns).encode("utf-8"))
+        h.update(str(self._q8_total_elems).encode("utf-8"))
+        for name in names:
+            h.update(name.encode("utf-8"))
+            h.update(str(self.tensor_types.get(name)).encode("utf-8"))
+            h.update(str(self._size_of(name)).encode("utf-8"))
+            h.update(str(self._off.get(name, 0)).encode("utf-8"))
+        sig = h.hexdigest()[:20]
+
+        tag = Path(model_path).stem if model_path else "model"
+        tag = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in tag)[:64]
+        if not tag:
+            tag = "model"
+
+        cache_dir = os.environ.get(
+            "ADAM_Q8_MAP_CACHE_DIR",
+            os.path.join(os.path.expanduser("~"), ".cache", "adam", "q8_map"),
+        )
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except Exception:
+            return None, None, None
+
+        base = os.path.join(cache_dir, f"{tag}_{sig}")
+        meta = {
+            "version": int(self._Q8_MAP_CACHE_VERSION),
+            "group_size": int(self.Q8_GROUP_SIZE),
+            "use_q5_raw_decode": int(bool(use_q5_raw_decode)),
+            "model_path": model_path,
+            "model_size": int(model_size),
+            "model_mtime_ns": int(model_mtime_ns),
+            "total_elems": int(self._q8_total_elems),
+        }
+        return base, meta, names
+
+    def _q8_map_try_load_cache(self, use_q5_raw_decode):
+        base, meta_expected, names = self._q8_map_cache_base(use_q5_raw_decode)
+        if not base:
+            return False
+
+        meta_path = base + ".meta.json"
+        u8_path = base + ".u8.npy"
+        sc_path = base + ".sc.npy"
+        if not (os.path.exists(meta_path) and os.path.exists(u8_path) and os.path.exists(sc_path)):
+            return False
+
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if int(meta.get("version", -1)) != int(meta_expected["version"]):
+                return False
+            if int(meta.get("group_size", -1)) != int(meta_expected["group_size"]):
+                return False
+            if int(meta.get("use_q5_raw_decode", -1)) != int(meta_expected["use_q5_raw_decode"]):
+                return False
+            if int(meta.get("total_elems", -1)) != int(meta_expected["total_elems"]):
+                return False
+
+            meta_names = list(meta.get("names", []))
+            meta_types = [int(x) for x in meta.get("types", [])]
+            meta_sizes = [int(x) for x in meta.get("sizes", [])]
+            meta_offs = [int(x) for x in meta.get("offs", [])]
+            if meta_names != names:
+                return False
+            if len(meta_types) != len(names) or len(meta_sizes) != len(names) or len(meta_offs) != len(names):
+                return False
+            if [int(self.tensor_types.get(n, -1)) for n in names] != meta_types:
+                return False
+            if [int(self._size_of(n)) for n in names] != meta_sizes:
+                return False
+            if [int(self._off.get(n, 0)) for n in names] != meta_offs:
+                return False
+
+            u8 = np.load(u8_path, mmap_mode="r")
+            sc = np.load(sc_path, mmap_mode="r")
+            n8g = (self._q8_total_elems + self.Q8_GROUP_SIZE - 1) // self.Q8_GROUP_SIZE
+            if u8.dtype != np.uint8 or int(u8.size) != int(self._q8_total_elems):
+                return False
+            if sc.dtype != np.float32 or int(sc.size) != int(n8g):
+                return False
+
+            g = self.gpu
+            g.map_create_typed(2, self.A.DTYPE_Q8, 1, self._q8_total_elems, self.Q8_GROUP_SIZE)
+            self._q8_scatter_contiguous(2, self._q8_total_elems, u8)
+            scales = np.ascontiguousarray(sc, dtype=np.float32)
+            zeros = (-128.0 * scales).astype(np.float32)
+            g.set_qparams(2, scales, zeros)
+            if self.verbose:
+                print(f"[GPU] Q8 cache hit: {len(names)} tensors, "
+                      f"{self._q8_total_elems/1e6:.0f}MB -> map 2")
+            return True
+        except Exception as e:
+            if self.verbose:
+                print(f"[GPU] Q8 cache load failed ({e}), rebuilding...")
+            return False
+
+    def _q8_map_save_cache(self, use_q5_raw_decode, q8_u8, q8_scales):
+        base, meta, names = self._q8_map_cache_base(use_q5_raw_decode)
+        if not base:
+            return
+        try:
+            np.save(base + ".u8.npy", np.ascontiguousarray(q8_u8, dtype=np.uint8))
+            np.save(base + ".sc.npy", np.ascontiguousarray(q8_scales, dtype=np.float32))
+            meta_out = dict(meta)
+            meta_out.update({
+                "names": list(names),
+                "types": [int(self.tensor_types.get(n, -1)) for n in names],
+                "sizes": [int(self._size_of(n)) for n in names],
+                "offs": [int(self._off.get(n, 0)) for n in names],
+            })
+            with open(base + ".meta.json", "w", encoding="utf-8") as f:
+                json.dump(meta_out, f)
+        except Exception as e:
+            if self.verbose:
+                print(f"[GPU] Q8 cache save failed: {e}")
+
     def _upload_all(self):
         c = self.cfg; g = self.gpu
+        f32_chunk = int(os.environ.get("ADAM_F32_MAP_SCATTER_CHUNK", str(4 * 1024 * 1024)))
+        q4_chunk = int(os.environ.get("ADAM_Q4_MAP_SCATTER_CHUNK", str(4 * 1024 * 1024)))
+        if f32_chunk <= 0:
+            f32_chunk = 4 * 1024 * 1024
+        if q4_chunk <= 0:
+            q4_chunk = 4 * 1024 * 1024
+
+        def _scatter_f32_contiguous(map_id, start, arr, chunk_elems):
+            total = int(arr.size)
+            for rel in range(0, total, int(chunk_elems)):
+                sub = np.ascontiguousarray(arr[rel:rel + int(chunk_elems)], dtype=np.float32)
+                sub_start = int(start + rel)
+                if getattr(g, "_has_map_scatter_contiguous", False):
+                    g.scatter_contiguous(map_id, sub_start, sub)
+                else:
+                    locs = np.arange(sub_start, sub_start + int(sub.size), dtype=np.uint32)
+                    g.scatter(map_id, locs, sub)
+
         g.set_dtype(self.A.DTYPE_F32)
         g.map_create(0, 1, self._ws_total_elems)
         self.ws_map_id = 0
@@ -556,47 +963,121 @@ class ADAMEngine:
             for name in sorted(self._f32_wt_tensors):
                 off = self._off[name]
                 for elem_off, take, _, data in self._iter_tensor_chunks(name, include_f32=True):
-                    locs = np.arange(off + elem_off, off + elem_off + take, dtype=np.uint32)
-                    g.scatter(self.wt_map_id, locs, data)
+                    start = int(off + elem_off)
+                    _scatter_f32_contiguous(
+                        self.wt_map_id, start,
+                        np.ascontiguousarray(data, dtype=np.float32), f32_chunk
+                    )
             if self.verbose:
                 print(f"[GPU] F32 weight upload: {len(self._f32_wt_tensors)} tensors in "
                       f"{time.perf_counter()-t0:.1f}s")
         else:
-            g.map_create_typed(1, self.A.DTYPE_Q4, 1, self._q4_total_elems, self.Q4_GROUP_SIZE)
-            if self.verbose:
-                print(f"[GPU] Q4 weight map 1: {self._q4_total_elems:,} elems "
-                      f"({self._q4_total_elems * 0.5 / 1e6:.0f} MB)")
             t0 = time.perf_counter()
-            n_groups = (self._q4_total_elems + self.Q4_GROUP_SIZE - 1) // self.Q4_GROUP_SIZE
-            all_scales = np.ones(n_groups, dtype=np.float32)
-            all_zeros = np.zeros(n_groups, dtype=np.float32)
-            _GGML_Q4K = 12; n_direct = 0
-            for name in sorted(self._q4_tensors):
-                off = self._off[name]
-                if self.tensor_types.get(name) == _GGML_Q4K and (
-                        name in self.raw_blocks or self._tensor_loader is not None):
-                    # Q4_K: extract original sub-block scales/zeros directly from raw bytes.
-                    # Q4_K decode: val = sc*nibble - mn  →  ADAMAH: scale=sc, zero=-mn
-                    # Scatter with these exact qparams recovers original nibbles bit-exactly.
-                    for elem_off, take, raw, _ in self._iter_tensor_chunks(
-                            name, include_raw=True, include_f32=False):
-                        n_blk = take // 256
-                        blks = np.frombuffer(raw, dtype=np.uint8)[:n_blk * 144].reshape(n_blk, 144)
-                        d = np.ascontiguousarray(blks[:, 0:2]).view(np.float16).reshape(n_blk).astype(np.float32)
-                        dm = np.ascontiguousarray(blks[:, 2:4]).view(np.float16).reshape(n_blk).astype(np.float32)
-                        rs = blks[:, 4:16].astype(np.int32)
-                        s2 = np.empty((n_blk, 8), np.float32)
-                        m2 = np.empty((n_blk, 8), np.float32)
-                        s2[:, 0:4] = rs[:, 0:4] & 0x3F;  m2[:, 0:4] = rs[:, 4:8] & 0x3F
-                        s2[:, 4:8] = (rs[:, 8:12] & 0x0F) | ((rs[:, 0:4] >> 6) << 4)
-                        m2[:, 4:8] = (rs[:, 8:12] >> 4)   | ((rs[:, 4:8] >> 6) << 4)
-                        sc = d[:, None] * s2; mn = dm[:, None] * m2
-                        gi = (off + elem_off) // self.Q4_GROUP_SIZE
-                        all_scales[gi:gi + n_blk * 8] = np.where(sc.reshape(-1) > 0, sc.reshape(-1), 1.0)
-                        all_zeros[gi:gi + n_blk * 8] = (-mn).reshape(-1)
-                    n_direct += 1
-                else:
-                    for elem_off, take, _, data in self._iter_tensor_chunks(name, include_f32=True):
+            if self._q4_map_try_load_cache():
+                if self.verbose:
+                    print(f"[GPU] Q4 upload: {len(self._q4_tensors)} tensors in "
+                          f"{time.perf_counter()-t0:.1f}s (cache)")
+            else:
+                g.map_create_typed(1, self.A.DTYPE_Q4, 1, self._q4_total_elems, self.Q4_GROUP_SIZE)
+                if self.verbose:
+                    print(f"[GPU] Q4 weight map 1: {self._q4_total_elems:,} elems "
+                          f"({self._q4_total_elems * 0.5 / 1e6:.0f} MB)")
+                n_groups = (self._q4_total_elems + self.Q4_GROUP_SIZE - 1) // self.Q4_GROUP_SIZE
+                all_scales = np.ones(n_groups, dtype=np.float32)
+                all_zeros = np.zeros(n_groups, dtype=np.float32)
+                q4_cache_build = self._q4_map_cache_enabled()
+                q4_u8 = (np.zeros((self._q4_total_elems + 1) // 2, dtype=np.uint8)
+                         if q4_cache_build else None)
+    
+                def _q4_cache_pack_from_f32(start_elem, arr_f32):
+                    if q4_u8 is None:
+                        return
+                    vals = np.ascontiguousarray(arr_f32, dtype=np.float32).reshape(-1)
+                    if vals.size == 0:
+                        return
+                    logical = np.arange(start_elem, start_elem + vals.size, dtype=np.uint32)
+                    gi = (logical // self.Q4_GROUP_SIZE).astype(np.int64)
+                    scale = all_scales[gi]
+                    zp = all_zeros[gi]
+                    q = np.rint((vals - zp) / np.maximum(scale, 1e-10)).clip(0, 15).astype(np.uint8)
+                    bidx = (logical >> 1).astype(np.int64)
+                    even = (logical & 1) == 0
+                    if np.any(even):
+                        be = bidx[even]
+                        q4_u8[be] = (q4_u8[be] & 0xF0) | q[even]
+                    odd = ~even
+                    if np.any(odd):
+                        bo = bidx[odd]
+                        q4_u8[bo] = (q4_u8[bo] & 0x0F) | (q[odd] << 4)
+    
+                _GGML_Q4K = 12; n_direct = 0
+                q4_packed_env = str(os.environ.get("ADAM_Q4K_PACKED_UPLOAD", "0")).strip().lower()
+                can_q4_packed = (
+                    bool(getattr(g, "_has_map_scatter_q4_packed_contiguous", False))
+                    and q4_packed_env not in ("0", "false", "no", "off")
+                )
+                q4_packed_uploaded = set()
+                for name in sorted(self._q4_tensors):
+                    off = self._off[name]
+                    if self.tensor_types.get(name) == _GGML_Q4K and (
+                            name in self.raw_blocks or self._tensor_loader is not None):
+                        # Q4_K: extract original sub-block scales/zeros directly from raw bytes.
+                        # Q4_K decode: val = sc*nibble - mn  →  ADAMAH: scale=sc, zero=-mn
+                        # Scatter with these exact qparams recovers original nibbles bit-exactly.
+                        packed_ok = can_q4_packed
+                        for elem_off, take, raw, _ in self._iter_tensor_chunks(
+                                name, include_raw=True, include_f32=False):
+                            n_blk = take // 256
+                            blks = np.frombuffer(raw, dtype=np.uint8)[:n_blk * 144].reshape(n_blk, 144)
+                            d = np.ascontiguousarray(blks[:, 0:2]).view(np.float16).reshape(n_blk).astype(np.float32)
+                            dm = np.ascontiguousarray(blks[:, 2:4]).view(np.float16).reshape(n_blk).astype(np.float32)
+                            rs = blks[:, 4:16].astype(np.int32)
+                            s2 = np.empty((n_blk, 8), np.float32)
+                            m2 = np.empty((n_blk, 8), np.float32)
+                            s2[:, 0:4] = rs[:, 0:4] & 0x3F;  m2[:, 0:4] = rs[:, 4:8] & 0x3F
+                            s2[:, 4:8] = (rs[:, 8:12] & 0x0F) | ((rs[:, 0:4] >> 6) << 4)
+                            m2[:, 4:8] = (rs[:, 8:12] >> 4)   | ((rs[:, 4:8] >> 6) << 4)
+                            sc = d[:, None] * s2; mn = dm[:, None] * m2
+                            gi = (off + elem_off) // self.Q4_GROUP_SIZE
+                            all_scales[gi:gi + n_blk * 8] = np.where(sc.reshape(-1) > 0, sc.reshape(-1), 1.0)
+                            all_zeros[gi:gi + n_blk * 8] = (-mn).reshape(-1)
+                            if packed_ok:
+                                start = int(off + elem_off)
+                                if (start & 1) != 0 or (int(take) & 1) != 0:
+                                    packed_ok = False
+                                else:
+                                    q = blks[:, 16:144].reshape(n_blk, 4, 32).astype(np.uint8)
+                                    lo = q & 0x0F
+                                    hi = (q >> 4) & 0x0F
+                                    seq = np.concatenate((lo, hi), axis=2)
+                                    qbytes = np.ascontiguousarray(
+                                        (seq[:, :, 0::2] | (seq[:, :, 1::2] << 4)).reshape(-1),
+                                        dtype=np.uint8,
+                                    )
+                                    g.scatter_q4_packed_contiguous(
+                                        self.wt_map_id, start, qbytes, n_locs=int(take)
+                                    )
+                                    if q4_u8 is not None:
+                                        b0 = start // 2
+                                        q4_u8[b0:b0 + qbytes.size] = qbytes
+                        n_direct += 1
+                        if packed_ok:
+                            q4_packed_uploaded.add(name)
+                    else:
+                        for elem_off, take, _, data in self._iter_tensor_chunks(name, include_f32=True):
+                            for gi_e in range(0, take, self.Q4_GROUP_SIZE):
+                                chunk = data[gi_e:gi_e + self.Q4_GROUP_SIZE]
+                                vmin, vmax = float(chunk.min()), float(chunk.max())
+                                scale = (vmax - vmin) / 15.0 if vmax > vmin else 1.0
+                                group_idx = (off + elem_off + gi_e) // self.Q4_GROUP_SIZE
+                                all_scales[group_idx] = scale
+                                all_zeros[group_idx] = vmin
+                if self.verbose and n_direct:
+                    print(f"[GPU] Q4_K direct qparams: {n_direct}/{len(self._q4_tensors)} tensors")
+                if self._lm_q4_approx_off is not None and self._lm_q4_approx_name is not None:
+                    off = self._lm_q4_approx_off
+                    for elem_off, take, _, data in self._iter_tensor_chunks(
+                            self._lm_q4_approx_name, include_f32=True):
                         for gi_e in range(0, take, self.Q4_GROUP_SIZE):
                             chunk = data[gi_e:gi_e + self.Q4_GROUP_SIZE]
                             vmin, vmax = float(chunk.min()), float(chunk.max())
@@ -604,91 +1085,117 @@ class ADAMEngine:
                             group_idx = (off + elem_off + gi_e) // self.Q4_GROUP_SIZE
                             all_scales[group_idx] = scale
                             all_zeros[group_idx] = vmin
-            if self.verbose and n_direct:
-                print(f"[GPU] Q4_K direct qparams: {n_direct}/{len(self._q4_tensors)} tensors")
-            if self._lm_q4_approx_off is not None and self._lm_q4_approx_name is not None:
-                off = self._lm_q4_approx_off
-                for elem_off, take, _, data in self._iter_tensor_chunks(
-                        self._lm_q4_approx_name, include_f32=True):
-                    for gi_e in range(0, take, self.Q4_GROUP_SIZE):
-                        chunk = data[gi_e:gi_e + self.Q4_GROUP_SIZE]
-                        vmin, vmax = float(chunk.min()), float(chunk.max())
-                        scale = (vmax - vmin) / 15.0 if vmax > vmin else 1.0
-                        group_idx = (off + elem_off + gi_e) // self.Q4_GROUP_SIZE
-                        all_scales[group_idx] = scale
-                        all_zeros[group_idx] = vmin
-            g.set_qparams(self.wt_map_id, all_scales, all_zeros)
-            for name in sorted(self._q4_tensors):
-                off = self._off[name]
-                for elem_off, take, _, data in self._iter_tensor_chunks(name, include_f32=True):
-                    locs = np.arange(off + elem_off, off + elem_off + take, dtype=np.uint32)
-                    g.scatter(self.wt_map_id, locs, data)
-            if self._lm_q4_approx_off is not None and self._lm_q4_approx_name is not None:
-                off = self._lm_q4_approx_off
-                for elem_off, take, _, data in self._iter_tensor_chunks(
-                        self._lm_q4_approx_name, include_f32=True):
-                    locs = np.arange(off + elem_off, off + elem_off + take, dtype=np.uint32)
-                    g.scatter(self.wt_map_id, locs, data)
-            if self.verbose:
-                print(f"[GPU] Q4 upload: {len(self._q4_tensors)} tensors in "
-                      f"{time.perf_counter()-t0:.1f}s")
+                g.set_qparams(self.wt_map_id, all_scales, all_zeros)
+                for name in sorted(self._q4_tensors):
+                    if name in q4_packed_uploaded:
+                        continue
+                    off = self._off[name]
+                    for elem_off, take, _, data in self._iter_tensor_chunks(name, include_f32=True):
+                        start = int(off + elem_off)
+                        _q4_cache_pack_from_f32(start, data)
+                        _scatter_f32_contiguous(
+                            self.wt_map_id, start,
+                            np.ascontiguousarray(data, dtype=np.float32), q4_chunk
+                        )
+                if self._lm_q4_approx_off is not None and self._lm_q4_approx_name is not None:
+                    off = self._lm_q4_approx_off
+                    for elem_off, take, _, data in self._iter_tensor_chunks(
+                            self._lm_q4_approx_name, include_f32=True):
+                        start = int(off + elem_off)
+                        _q4_cache_pack_from_f32(start, data)
+                        _scatter_f32_contiguous(
+                            self.wt_map_id, start,
+                            np.ascontiguousarray(data, dtype=np.float32), q4_chunk
+                        )
+                if q4_u8 is not None:
+                    self._q4_map_save_cache(q4_u8, all_scales, all_zeros)
+                if self.verbose:
+                    if q4_packed_uploaded:
+                        print(f"[GPU] Q4_K packed upload: {len(q4_packed_uploaded)}/{len(self._q4_tensors)} tensors")
+                    print(f"[GPU] Q4 upload: {len(self._q4_tensors)} tensors in "
+                          f"{time.perf_counter()-t0:.1f}s")
 
             # ---- Q8 weight map (map 2): Q8_0 and Q5_0 stored as int8 ----
             self.q8_map_id = 2
             if self._q8_tensors:
-                g.map_create_typed(2, self.A.DTYPE_Q8, 1, self._q8_total_elems, self.Q8_GROUP_SIZE)
                 if self.verbose:
                     print(f"[GPU] Q8 weight map 2: {self._q8_total_elems:,} elems "
                           f"({self._q8_total_elems / 1e6:.0f} MB)")
                 t0 = time.perf_counter()
-                n8g = (self._q8_total_elems + self.Q8_GROUP_SIZE - 1) // self.Q8_GROUP_SIZE
-                q8_scales = np.ones(n8g, dtype=np.float32)
                 _GGML_Q8_0 = 8; _GGML_Q5_0 = 6
-                # Q8 scatter (word_size=1) DMA-copies raw bytes — must pre-quantize to uint8.
-                # Encoding: uint8_val = int8_val + 128 (so 128 → 0, 0 → -128*scale, 255 → 127*scale).
-                # xq8 shader reads unsigned: val = float(u8) * scale + zero, with zero = -128 * scale.
-                for name in sorted(self._q8_tensors):
-                    off = self._off[name]
-                    t_type = self.tensor_types.get(name)
-                    for elem_off, take, raw, data_f32 in self._iter_tensor_chunks(
-                            name,
-                            include_raw=(t_type in (_GGML_Q8_0, _GGML_Q5_0)),
-                            include_f32=(t_type != _GGML_Q8_0)):
-                        n_blk = take // 32
-                        gi = (off + elem_off) // self.Q8_GROUP_SIZE
-                        if raw is not None and t_type == _GGML_Q8_0:
-                            blks = np.frombuffer(raw, dtype=np.uint8)[:n_blk * 34].reshape(n_blk, 34)
-                            d = np.ascontiguousarray(blks[:, 0:2]).view(np.float16).reshape(n_blk).astype(np.float32)
-                            q8_scales[gi:gi + n_blk] = np.where(d > 0, d, 1.0)
-                            int8_raw = blks[:, 2:34].reshape(-1)
-                            uint8_vals = (int8_raw.view(np.int8).astype(np.int16) + 128).astype(np.uint8)
-                        elif raw is not None and t_type == _GGML_Q5_0:
-                            blks = np.frombuffer(raw, dtype=np.uint8)[:n_blk * 22].reshape(n_blk, 22)
-                            d = np.ascontiguousarray(blks[:, 0:2]).view(np.float16).reshape(n_blk).astype(np.float32)
-                            d_abs = np.abs(d)
-                            d_safe = np.where(d_abs > 0, d_abs, 1.0)
-                            q8_scales[gi:gi + n_blk] = d_safe
-                            int8_per_group = np.round(
-                                data_f32.reshape(n_blk, 32) / d_safe[:, None]
-                            ).astype(np.int16).clip(-16, 15)
-                            uint8_vals = (int8_per_group + 128).astype(np.uint8).reshape(-1)
-                        else:
-                            uint8_vals = np.empty(take, dtype=np.uint8)
-                            for bi in range(0, take, self.Q8_GROUP_SIZE):
-                                chunk = data_f32[bi:bi + self.Q8_GROUP_SIZE]
-                                vmax = float(np.abs(chunk).max())
-                                sc = vmax / 127.0 if vmax > 0 else 1.0
-                                q8_scales[(off + elem_off + bi) // self.Q8_GROUP_SIZE] = sc
-                                q8_int8 = np.round(chunk / sc).astype(np.int16).clip(-127, 127)
-                                uint8_vals[bi:bi + len(chunk)] = (q8_int8 + 128).astype(np.uint8)
-                        locs = np.arange(off + elem_off, off + elem_off + take, dtype=np.uint32)
-                        g.scatter(self.q8_map_id, locs, uint8_vals)
-                # xq8 shader: val = float(u8) * scale + zero; with zero = -128*scale → u8=128 ↦ 0
-                q8_zeros = (-128.0 * q8_scales).astype(np.float32)
-                g.set_qparams(self.q8_map_id, q8_scales, q8_zeros)
-                if self.verbose:
-                    print(f"[GPU] Q8 upload: {len(self._q8_tensors)} tensors in "
-                          f"{time.perf_counter()-t0:.1f}s")
+                use_q5_raw_decode = bool(getattr(self, "_is_broadcom", False))
+
+                if self._q8_map_try_load_cache(use_q5_raw_decode):
+                    if self.verbose:
+                        print(f"[GPU] Q8 upload: {len(self._q8_tensors)} tensors in "
+                              f"{time.perf_counter()-t0:.1f}s (cache)")
+                else:
+                    g.map_create_typed(2, self.A.DTYPE_Q8, 1, self._q8_total_elems, self.Q8_GROUP_SIZE)
+                    n8g = (self._q8_total_elems + self.Q8_GROUP_SIZE - 1) // self.Q8_GROUP_SIZE
+                    q8_scales = np.ones(n8g, dtype=np.float32)
+                    q8_u8 = np.empty(self._q8_total_elems, dtype=np.uint8)
+
+                    # Q8 scatter uses raw bytes; pre-quantize to uint8 with signed offset (+128).
+                    for name in sorted(self._q8_tensors):
+                        off = self._off[name]
+                        t_type = self.tensor_types.get(name)
+                        for elem_off, take, raw, data_f32 in self._iter_tensor_chunks(
+                                name,
+                                include_raw=(t_type in (_GGML_Q8_0, _GGML_Q5_0)),
+                                include_f32=(t_type != _GGML_Q8_0 and
+                                             not (use_q5_raw_decode and t_type == _GGML_Q5_0))):
+                            n_blk = take // 32
+                            gi = (off + elem_off) // self.Q8_GROUP_SIZE
+                            if raw is not None and t_type == _GGML_Q8_0:
+                                blks = np.frombuffer(raw, dtype=np.uint8)[:n_blk * 34].reshape(n_blk, 34)
+                                d = np.ascontiguousarray(blks[:, 0:2]).view(np.float16).reshape(n_blk).astype(np.float32)
+                                q8_scales[gi:gi + n_blk] = np.where(d > 0, d, 1.0)
+                                int8_raw = blks[:, 2:34].reshape(-1)
+                                uint8_vals = (int8_raw.view(np.int8).astype(np.int16) + 128).astype(np.uint8)
+                            elif raw is not None and t_type == _GGML_Q5_0 and use_q5_raw_decode:
+                                blks = np.frombuffer(raw, dtype=np.uint8)[:n_blk * 22].reshape(n_blk, 22)
+                                d = np.ascontiguousarray(blks[:, 0:2]).view(np.float16).reshape(n_blk).astype(np.float32)
+                                d_abs = np.abs(d)
+                                d_safe = np.where(d_abs > 0, d_abs, 1.0)
+                                q8_scales[gi:gi + n_blk] = d_safe
+                                qh = blks[:, 2:6]
+                                ql = blks[:, 6:22]
+                                lo = np.concatenate((ql & 0x0F, (ql >> 4) & 0x0F), axis=1).astype(np.int16)
+                                bit_idx = np.arange(32, dtype=np.uint8)
+                                hi = ((qh[:, bit_idx >> 3] >> (bit_idx & 7)) & 1).astype(np.int16)
+                                q_signed = (lo | (hi << 4)) - 16
+                                sign = np.where(d < 0.0, -1, 1).astype(np.int16)[:, None]
+                                int8_per_group = q_signed * sign
+                                uint8_vals = (int8_per_group + 128).astype(np.uint8).reshape(-1)
+                            elif raw is not None and t_type == _GGML_Q5_0:
+                                blks = np.frombuffer(raw, dtype=np.uint8)[:n_blk * 22].reshape(n_blk, 22)
+                                d = np.ascontiguousarray(blks[:, 0:2]).view(np.float16).reshape(n_blk).astype(np.float32)
+                                d_abs = np.abs(d)
+                                d_safe = np.where(d_abs > 0, d_abs, 1.0)
+                                q8_scales[gi:gi + n_blk] = d_safe
+                                int8_per_group = np.round(
+                                    data_f32.reshape(n_blk, 32) / d_safe[:, None]
+                                ).astype(np.int16).clip(-16, 15)
+                                uint8_vals = (int8_per_group + 128).astype(np.uint8).reshape(-1)
+                            else:
+                                uint8_vals = np.empty(take, dtype=np.uint8)
+                                for bi in range(0, take, self.Q8_GROUP_SIZE):
+                                    chunk = data_f32[bi:bi + self.Q8_GROUP_SIZE]
+                                    vmax = float(np.abs(chunk).max())
+                                    sc = vmax / 127.0 if vmax > 0 else 1.0
+                                    q8_scales[(off + elem_off + bi) // self.Q8_GROUP_SIZE] = sc
+                                    q8_int8 = np.round(chunk / sc).astype(np.int16).clip(-127, 127)
+                                    uint8_vals[bi:bi + len(chunk)] = (q8_int8 + 128).astype(np.uint8)
+                            start_off = off + elem_off
+                            q8_u8[start_off:start_off + take] = uint8_vals
+
+                    self._q8_scatter_contiguous(self.q8_map_id, self._q8_total_elems, q8_u8)
+                    q8_zeros = (-128.0 * q8_scales).astype(np.float32)
+                    g.set_qparams(self.q8_map_id, q8_scales, q8_zeros)
+                    self._q8_map_save_cache(use_q5_raw_decode, q8_u8, q8_scales)
+                    if self.verbose:
+                        print(f"[GPU] Q8 upload: {len(self._q8_tensors)} tensors in "
+                              f"{time.perf_counter()-t0:.1f}s")
 
         # GGUF stores actual RMSNorm weights directly — no +1.0 offset needed.
         # (Older thinking assumed HuggingFace delta convention; GGUF converters
@@ -1184,11 +1691,18 @@ class ADAMEngine:
         self._emb_row_base = 0
         self._emb_dst_base = self._ws_slots['hidden'][2]
         self._pending_embed_tok = 0
+        is_broadcom = bool(
+            getattr(
+                self,
+                '_is_broadcom',
+                str(os.environ.get('ADAMAH_SHADER_PROFILE', os.environ.get('ADAM_RUNTIME_PROFILE', ''))).strip().lower().startswith('broadcom_v3dv'),
+            )
+        )
         if 'token_embd.weight' in self.tensor_map_id:
             name = 'token_embd.weight'
             sh = self._shape_of(name)
             off = np.uint32(self._off[name])
-            if (not self._trans[name]) and (name in self._q8_tensors):
+            if (not self._trans[name]) and (name in self._q8_tensors) and (not is_broadcom):
                 self._gpu_token_embd_name = name
                 self._gpu_token_embd_mode = 'row_xq8'
                 self._emb_row_base = int(off)
@@ -1211,8 +1725,10 @@ class ADAMEngine:
             print(f"[GPU] Uploaded {len(self._wh)} loc handles")
 
     def _cache_lm_weight(self):
-        """LM head now runs on GPU via Q4 map — no CPU cache needed."""
+        """Prepare LM head metadata for GPU paths and optional Broadcom CPU top1."""
         self._lm_name = None; self._lm_weight = None
+        self._cpu_top1_lm_name = None
+        self._cpu_top1_weight = None
         # Determine which tensor is the LM head weight.
         # output.weight is in the Q4 map; if absent, fall back to token_embd.weight
         # (weight-tied models).  token_embd.weight is still CPU-only, so in that
@@ -1224,11 +1740,45 @@ class ADAMEngine:
         elif 'token_embd.weight' in self._cpu_only:
             self._lm_wt_name = None   # weight-tied, use CPU fallback
             lm = self._load_tensor_f32('token_embd.weight', keep=True).astype(np.float32)
+            if lm.ndim == 1 and lm.size == (self.cfg.n_vocab * self.cfg.n_embd):
+                lm = lm.reshape(self.cfg.n_vocab, self.cfg.n_embd)
             self._lm_weight = lm
+            self._lm_name = 'token_embd.weight'
             if self.verbose:
                 print(f"[GPU] LM head: weight-tied, CPU fallback ({lm.nbytes/1e6:.0f} MB)")
         else:
             self._lm_wt_name = None
+
+        # Broadcom selective hybrid: pre-pack a CPU matrix only for greedy top1.
+        if self._cpu_top1_enabled:
+            lm_name = None
+            if 'output.weight' in self.tensor_shapes:
+                lm_name = 'output.weight'
+            elif 'token_embd.weight' in self.tensor_shapes:
+                lm_name = 'token_embd.weight'
+            if lm_name is not None:
+                lm = self._load_tensor_f32(lm_name, keep=True).astype(np.float32, copy=False)
+                if lm.ndim == 1 and lm.size == (self.cfg.n_vocab * self.cfg.n_embd):
+                    lm = lm.reshape(self.cfg.n_vocab, self.cfg.n_embd)
+                if lm.ndim == 2 and lm.shape[0] == self.cfg.n_vocab:
+                    packed = np.ascontiguousarray(lm, dtype=np.float32)
+                elif lm.ndim == 2 and lm.shape[1] == self.cfg.n_vocab:
+                    packed = np.ascontiguousarray(lm.T, dtype=np.float32)
+                else:
+                    packed = np.ascontiguousarray(
+                        lm.reshape(self.cfg.n_vocab, self.cfg.n_embd), dtype=np.float32
+                    )
+                self._cpu_top1_lm_name = lm_name
+                self._cpu_top1_weight = packed
+                self._cpu_top1_logits_buf = np.empty(self.cfg.n_vocab, dtype=np.float32)
+                if self.verbose:
+                    print(
+                        f"[GPU] Broadcom LM head mode={self._broadcom_lm_head_mode}: "
+                        f"CPU top1 matrix ready from '{lm_name}' ({packed.nbytes/1e6:.0f} MB, "
+                        f"threads={self._cpu_top1_threads}, block_rows={self._cpu_top1_block_rows}, "
+                        f"impl={self._cpu_top1_impl})"
+                    )
+
         self._lm_q4_approx_ready = (
             self._lm_wt_name is not None and
             self._lm_wt_name == self._lm_q4_approx_name and
@@ -1244,9 +1794,34 @@ class ADAMEngine:
         keep = set()
         if self._gpu_token_embd_name is None and 'token_embd.weight' in self.tensors:
             keep.add('token_embd.weight')
-        if self._lm_weight is not None and 'token_embd.weight' in self.tensors:
-            keep.add('token_embd.weight')
+        if self._lm_weight is not None and self._lm_name and self._lm_name in self.tensors:
+            keep.add(self._lm_name)
+        if (self._cpu_top1_weight is not None and self._cpu_top1_lm_name and
+                self._cpu_top1_lm_name in self.tensors):
+            keep.add(self._cpu_top1_lm_name)
         return keep
+
+    def _configure_cpu_top1_threads(self):
+        if not getattr(self, '_is_broadcom', False):
+            return
+        n = max(1, int(getattr(self, '_cpu_top1_threads', 4)))
+        for key in (
+            'OMP_NUM_THREADS',
+            'OPENBLAS_NUM_THREADS',
+            'MKL_NUM_THREADS',
+            'NUMEXPR_NUM_THREADS',
+            'VECLIB_MAXIMUM_THREADS',
+            'BLIS_NUM_THREADS',
+        ):
+            os.environ.setdefault(key, str(n))
+
+    def _cpu_top1_thread_ctx(self):
+        n = max(1, int(getattr(self, '_cpu_top1_threads', 4)))
+        try:
+            from threadpoolctl import threadpool_limits  # type: ignore
+            return threadpool_limits(limits=n)
+        except Exception:
+            return nullcontext()
 
     def release_host_state(self):
         if self._host_state_pruned:
@@ -1265,11 +1840,6 @@ class ADAMEngine:
             print(f"[GPU] Production mode: released host tensors/raw "
                   f"({tensor_bytes/1e6:.0f} MB tensors, {raw_bytes/1e6:.0f} MB raw; kept: {kept})")
 
-    def _can_gpu_argmax_sample(self, cfg) -> bool:
-        """Fast path: deterministic greedy sampling entirely on GPU."""
-        deterministic = (cfg.temperature <= 0.0) or (cfg.top_k == 1)
-        return deterministic and cfg.repeat_penalty == 1.0 and self._lm_wt_name is not None
-
     def _effective_sample_top_k(self, cfg) -> int:
         """Collapse deterministic decode to top-1 so LM head work matches the sampler."""
         if cfg.temperature <= 0.0:
@@ -1278,6 +1848,45 @@ class ADAMEngine:
         if top_k <= 0:
             return 0
         return min(top_k, self.SAMPLE_TOPK_MAX, self.cfg.n_vocab)
+
+    def _can_cpu_top1_sample(self, cfg) -> bool:
+        if not self._is_broadcom:
+            return False
+        if self._broadcom_lm_head_mode not in ('auto', 'cpu_top1'):
+            return False
+        if self._cpu_top1_weight is None:
+            return False
+        if self._effective_sample_top_k(cfg) != 1:
+            return False
+        if cfg.repeat_penalty != 1.0:
+            return False
+        return True
+
+    def _gpu_matvec_argmax_weight_kind(self) -> Optional[str]:
+        if not self._lm_wt_name or self._trans[self._lm_wt_name]:
+            return None
+        if (self._lm_wt_name in self._q8_tensors and
+                getattr(self.gpu, '_has_map_matvec_argmax_t_xq8_dev', False)):
+            return 'q8'
+        if (self._lm_wt_name in self._q4_tensors and
+                getattr(self.gpu, '_has_map_matvec_argmax_t_xq4_dev', False)):
+            return 'q4'
+        return None
+
+    def _can_gpu_matvec_argmax_sample(self, cfg) -> bool:
+        if self._effective_sample_top_k(cfg) != 1:
+            return False
+        if cfg.repeat_penalty != 1.0:
+            return False
+        return self._gpu_matvec_argmax_weight_kind() is not None
+
+    def _can_gpu_argmax_sample(self, cfg) -> bool:
+        """Fallback deterministic path: GPU logits + argmax reduction."""
+        return (
+            self._effective_sample_top_k(cfg) == 1 and
+            cfg.repeat_penalty == 1.0 and
+            self._lm_wt_name is not None
+        )
 
     def _can_gpu_topk_sample(self, cfg) -> bool:
         """Fast path: GPU shortlist + GPU top-p normalization over the best k candidates."""
@@ -1316,10 +1925,12 @@ class ADAMEngine:
                 getattr(getattr(self, 'gpu', None), '_is_integrated_gpu', False),
             )
         )
-        # On Broadcom, use even larger groups for greedy (top_k=1) to minimize
-        # dispatch count - the LM head dominates decode time on low-end GPUs.
-        if (is_broadcom or is_integrated) and base < 2048:
-            return max(base, 1024)
+        # Broadcom/V3D tuning: keep this bounded but allow a wide sweep range
+        # to empirically choose the best LM-head grouping per device.
+        if is_broadcom:
+            return max(32, min(base, 4096))
+        if is_integrated and base < 2048:
+            return max(base, 512)
         return base
 
     def _can_gpu_fused_topk_sample(self, cfg) -> bool:
@@ -1368,6 +1979,44 @@ class ADAMEngine:
     def _gpu_read_sample_token(self) -> int:
         tok = self.gpu.gather(self.ws_map_id, self._sample_locs).view(np.float32)
         return int(tok[0]) if tok.size else 0
+
+    def _sample_cpu_top1(self) -> int:
+        """Greedy CPU top1 over pre-packed LM head without materializing full logits."""
+        if self._cpu_top1_weight is None:
+            raise RuntimeError("CPU top1 requested but LM matrix is not initialized")
+        g = self.gpu
+        hid = g.gather(self.ws_map_id, self._normed_locs).view(np.float32)
+        if hid.dtype != np.float32 or not hid.flags.c_contiguous:
+            hid = np.ascontiguousarray(hid, dtype=np.float32)
+        wt = self._cpu_top1_weight
+        if self._cpu_top1_impl == 'full_gemv':
+            # Faster Pi path: one BLAS-backed GEMV + argmax.
+            buf = self._cpu_top1_logits_buf
+            if (buf is None) or (buf.shape[0] != self.cfg.n_vocab) or (buf.dtype != np.float32):
+                buf = np.empty(self.cfg.n_vocab, dtype=np.float32)
+                self._cpu_top1_logits_buf = buf
+            with self._cpu_top1_thread_ctx():
+                try:
+                    np.matmul(wt, hid, out=buf)
+                    vals = buf
+                except Exception:
+                    vals = wt @ hid
+            return int(np.argmax(vals))
+
+        block = max(256, int(self._cpu_top1_block_rows))
+        best_idx = 0
+        best_val = -np.inf
+        with self._cpu_top1_thread_ctx():
+            for start in range(0, self.cfg.n_vocab, block):
+                end = min(start + block, self.cfg.n_vocab)
+                vals = wt[start:end] @ hid
+                local = int(np.argmax(vals))
+                local_val = float(vals[local])
+                local_idx = start + local
+                if (local_val > best_val) or (local_val == best_val and local_idx < best_idx):
+                    best_val = local_val
+                    best_idx = local_idx
+        return int(best_idx)
 
     def _sample_gpu_argmax(self) -> int:
         """Sample next token by reducing the GPU logits buffer to one scalar index."""
@@ -1655,6 +2304,12 @@ class ADAMEngine:
 
     def _gpu_rmsnorm(self, src_h, wt_name, dst_h, n_rows, dim, eps):
         g = self.gpu; wt_mid = self.tensor_map_id[wt_name]; ws_id = self.ws_map_id
+        if bool(getattr(self, "_is_broadcom", False)):
+            # V3D: same-map map_rmsnorm can produce all-zero output; map_rmsnorm_x
+            # is stable even when act and wt are the same map.
+            g.map_rmsnorm_x_dev(ws_id, wt_mid, src_h, self._wh[wt_name], dst_h,
+                                n_rows, dim, eps)
+            return
         if wt_mid == ws_id:
             g.map_rmsnorm_dev(ws_id, src_h, self._wh[wt_name], dst_h, n_rows, dim, eps)
         else:
@@ -1797,8 +2452,165 @@ class ADAMEngine:
         'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'attn_output.weight',
         'ffn_gate.weight', 'ffn_up.weight', 'ffn_down.weight',
     ]
+    _B12_Q5_RAW_SUFFIXES = ['ffn_gate.weight', 'ffn_up.weight']
     _B12_Q8_MAP_ID = 3   # new GPU map for B12-only re-quantized Q4/Q6 tensors
     _B12_KV_MAP_ID = 4   # dedicated KV cache for B12 (exact size so C code derives kv_cap correctly)
+    _B12_Q5_RAW_MAP_ID = 5   # raw GGML Q5_0 blocks for B12 direct decode path
+    _B12_Q8_CACHE_VERSION = 1
+
+    def _b12_q8_cache_enabled(self):
+        v = str(os.environ.get("ADAM_B12_Q8_CACHE", "1")).strip().lower()
+        return v not in ("0", "false", "no", "off")
+
+    def _b12_q8_cache_base(self, non_q8):
+        if not self._b12_q8_cache_enabled():
+            return None, None
+
+        model_path = ""
+        model_size = 0
+        model_mtime_ns = 0
+        tl = getattr(self, "_tensor_loader", None)
+        if tl is not None and hasattr(tl, "path"):
+            try:
+                p = Path(str(tl.path)).expanduser().resolve()
+                st = p.stat()
+                model_path = str(p)
+                model_size = int(st.st_size)
+                model_mtime_ns = int(st.st_mtime_ns)
+            except Exception:
+                model_path = str(getattr(tl, "path", ""))
+
+        h = hashlib.sha1()
+        h.update(str(self._B12_Q8_CACHE_VERSION).encode("utf-8"))
+        h.update(str(self.Q8_GROUP_SIZE).encode("utf-8"))
+        h.update(str(model_path).encode("utf-8"))
+        h.update(str(model_size).encode("utf-8"))
+        h.update(str(model_mtime_ns).encode("utf-8"))
+        h.update(str(len(non_q8)).encode("utf-8"))
+        for name in non_q8:
+            h.update(name.encode("utf-8"))
+            h.update(str(self.tensor_types.get(name)).encode("utf-8"))
+            h.update(str(self._size_of(name)).encode("utf-8"))
+        sig = h.hexdigest()[:20]
+
+        tag = Path(model_path).stem if model_path else "model"
+        tag = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in tag)[:64]
+        if not tag:
+            tag = "model"
+
+        cache_dir = os.environ.get(
+            "ADAM_B12_Q8_CACHE_DIR",
+            os.path.join(os.path.expanduser("~"), ".cache", "adam", "b12_q8"),
+        )
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except Exception:
+            return None, None
+
+        base = os.path.join(cache_dir, f"{tag}_{sig}")
+        meta = {
+            "version": int(self._B12_Q8_CACHE_VERSION),
+            "group_size": int(self.Q8_GROUP_SIZE),
+            "model_path": model_path,
+            "model_size": int(model_size),
+            "model_mtime_ns": int(model_mtime_ns),
+        }
+        return base, meta
+
+    def _b12_q8_scatter_contiguous(self, total_elems, data_u8):
+        g = self.gpu
+        chunk = int(os.environ.get("ADAM_B12_Q8_SCATTER_CHUNK", str(4 * 1024 * 1024)))
+        if chunk <= 0:
+            chunk = 4 * 1024 * 1024
+        for start in range(0, total_elems, chunk):
+            end = min(total_elems, start + chunk)
+            vals = np.ascontiguousarray(data_u8[start:end], dtype=np.uint8)
+            if getattr(g, "_has_map_scatter_contiguous", False):
+                g.scatter_contiguous(self._B12_Q8_MAP_ID, start, vals)
+            else:
+                locs = np.arange(start, end, dtype=np.uint32)
+                g.scatter(self._B12_Q8_MAP_ID, locs, vals)
+
+    def _b12_q8_try_load_cache(self, cache_base, meta_expected, non_q8, total_elems, n_groups):
+        if not cache_base:
+            return False
+        meta_path = cache_base + ".meta.json"
+        u8_path = cache_base + ".u8.npy"
+        sc_path = cache_base + ".sc.npy"
+        zp_path = cache_base + ".zp.npy"
+        if not (os.path.exists(meta_path) and os.path.exists(u8_path) and
+                os.path.exists(sc_path) and os.path.exists(zp_path)):
+            return False
+
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if int(meta.get("version", -1)) != int(meta_expected["version"]):
+                return False
+            if int(meta.get("group_size", -1)) != int(meta_expected["group_size"]):
+                return False
+            if int(meta.get("total_elems", -1)) != int(total_elems):
+                return False
+            if int(meta.get("n_groups", -1)) != int(n_groups):
+                return False
+
+            names = list(meta.get("names", []))
+            offs = [int(x) for x in meta.get("offs", [])]
+            sizes = [int(x) for x in meta.get("sizes", [])]
+            if names != list(non_q8):
+                return False
+            if len(offs) != len(names) or len(sizes) != len(names):
+                return False
+            if [self._size_of(n) for n in non_q8] != sizes:
+                return False
+
+            u8 = np.load(u8_path, mmap_mode="r")
+            sc = np.load(sc_path, mmap_mode="r")
+            zp = np.load(zp_path, mmap_mode="r")
+            if u8.dtype != np.uint8 or int(u8.size) != int(total_elems):
+                return False
+            if sc.dtype != np.float32 or int(sc.size) != int(n_groups):
+                return False
+            if zp.dtype != np.float32 or int(zp.size) != int(n_groups):
+                return False
+
+            self._b12_q8_off = {n: int(o) for n, o in zip(names, offs)}
+            g = self.gpu
+            g.map_create_typed(
+                self._B12_Q8_MAP_ID, self.A.DTYPE_Q8, 1, total_elems, self.Q8_GROUP_SIZE
+            )
+            self._b12_q8_scatter_contiguous(total_elems, u8)
+            g.set_qparams(self._B12_Q8_MAP_ID, sc, zp)
+            self._b12_q8_map_created = True
+            if self.verbose:
+                print(f"[GPU] B12 Q8 cache hit: {len(non_q8)} tensors, "
+                      f"{total_elems/1e6:.0f}MB -> map {self._B12_Q8_MAP_ID}")
+            return True
+        except Exception as e:
+            if self.verbose:
+                print(f"[GPU] B12 Q8 cache load failed ({e}), rebuilding...")
+            return False
+
+    def _b12_q8_save_cache(self, cache_base, meta, names, offs, sizes, data_u8, scales, zeros):
+        if not cache_base:
+            return
+        try:
+            np.save(cache_base + ".u8.npy", np.ascontiguousarray(data_u8, dtype=np.uint8))
+            np.save(cache_base + ".sc.npy", np.ascontiguousarray(scales, dtype=np.float32))
+            np.save(cache_base + ".zp.npy", np.ascontiguousarray(zeros, dtype=np.float32))
+            meta_out = dict(meta)
+            meta_out.update({
+                "total_elems": int(data_u8.size),
+                "n_groups": int(scales.size),
+                "names": list(names),
+                "offs": [int(x) for x in offs],
+                "sizes": [int(x) for x in sizes],
+            })
+            with open(cache_base + ".meta.json", "w", encoding="utf-8") as f:
+                json.dump(meta_out, f)
+        except Exception as e:
+            if self.verbose:
+                print(f"[GPU] B12 Q8 cache save failed: {e}")
 
     def _ensure_b12_kv_map(self):
         """One-time: create a dedicated F32 KV-cache map (map 4) for B12 with EXACT size.
@@ -1818,6 +2630,75 @@ class ADAMEngine:
             print(f"[GPU] B12 KV map {self._B12_KV_MAP_ID}: {n_kv_elems:,} F32 elems "
                   f"({n_kv_elems * 4 / 1e6:.0f} MB, kv_cap={self._kv_cap})")
 
+    def _ensure_b12_q5_raw_map(self):
+        """One-time: create map 5 with raw GGML Q5_0 blocks for gate/up projections."""
+        if getattr(self, '_b12_q5_raw_map_created', False):
+            return
+        if not self._b12_q5_raw_enabled():
+            self._b12_q5_off = {}
+            self._b12_q5_raw_map_created = True
+            return
+
+        self._b12_q5_off = {}  # tensor-name -> raw-byte offset inside B12 Q5 raw map
+        q5_targets = []
+        seen = set()
+        for L in range(len(self._blk_names)):
+            for suffix in self._B12_Q5_RAW_SUFFIXES:
+                name = f'{self._blk_names[L]}.{suffix}'
+                if name in seen or name not in self._off:
+                    continue
+                if int(self.tensor_types.get(name, -1)) != 6:  # GGML_TYPE_Q5_0
+                    continue
+                q5_targets.append(name)
+                seen.add(name)
+
+        if not q5_targets:
+            self._b12_q5_raw_map_created = True
+            return
+
+        # GGML Q5_0 block: 22 bytes for 32 elements.
+        total_bytes = 0
+        for name in q5_targets:
+            total_bytes += (self._size_of(name) // 32) * 22
+        if total_bytes <= 0:
+            self._b12_q5_raw_map_created = True
+            return
+
+        g = self.gpu
+        g.map_create_typed(self._B12_Q5_RAW_MAP_ID, self.A.DTYPE_Q8, 1, total_bytes, self.Q8_GROUP_SIZE)
+        q5_raw_u8 = np.empty(total_bytes, dtype=np.uint8)
+
+        pos = 0
+        for name in q5_targets:
+            self._b12_q5_off[name] = pos
+            for elem_off, take, raw, _ in self._iter_tensor_chunks(
+                    name, include_raw=True, include_f32=False):
+                if raw is None:
+                    raise RuntimeError(f"B12 Q5 raw load failed for tensor '{name}'")
+                blk_off = int(elem_off) // 32
+                n_blk = int(take) // 32
+                byte_off = pos + blk_off * 22
+                byte_len = n_blk * 22
+                raw_u8 = np.frombuffer(raw, dtype=np.uint8, count=byte_len)
+                q5_raw_u8[byte_off:byte_off + byte_len] = raw_u8
+            pos += (self._size_of(name) // 32) * 22
+
+        self._q8_scatter_contiguous(self._B12_Q5_RAW_MAP_ID, total_bytes, q5_raw_u8)
+        self._b12_q5_raw_map_created = True
+        if self.verbose:
+            print(f"[GPU] B12 Q5 raw map: {len(q5_targets)} tensors, "
+                  f"{total_bytes/1e6:.0f}MB -> map {self._B12_Q5_RAW_MAP_ID}")
+
+    def _b12_q5_raw_enabled(self):
+        # Experimental path: keep disabled by default to avoid production regressions.
+        v = str(os.environ.get("ADAM_B12_Q5_RAW", "0")).strip().lower()
+        return self._is_broadcom and v not in ("0", "false", "no", "off")
+
+    def _b12_q4_direct_down_enabled(self):
+        """Opt-in: decode ffn_down directly from map 1 Q4_K in monolithic shader."""
+        v = str(os.environ.get("ADAM_B12_Q4_DIRECT_DOWN", "0")).strip().lower()
+        return self._is_broadcom and v not in ("0", "false", "no", "off")
+
     def _ensure_b12_q8_map(self):
         """One-time: create Q8 re-quant map (map 3) for projection tensors not already in Q8 map.
 
@@ -1831,11 +2712,21 @@ class ADAMEngine:
         # Collect all unique non-Q8 projection tensors across all model layers
         non_q8 = []
         seen = set()
+        q4_direct_down = self._b12_q4_direct_down_enabled()
+        q5_raw = self._b12_q5_raw_enabled()
+        skip_maps = (self.ws_map_id, self.q8_map_id)
         for L in range(len(self._blk_names)):
             for suffix in self._B12_PROJ_SUFFIXES:
                 name = f'{self._blk_names[L]}.{suffix}'
+                if q4_direct_down and suffix == 'ffn_down.weight':
+                    if (self.tensor_map_id.get(name) == self.wt_map_id and
+                            int(self.tensor_types.get(name, -1)) == 12):  # GGML_TYPE_Q4_K
+                        continue
+                if q5_raw and suffix in self._B12_Q5_RAW_SUFFIXES:
+                    if int(self.tensor_types.get(name, -1)) == 6:  # GGML_TYPE_Q5_0
+                        continue
                 if (name in self._off and name not in seen and
-                        self.tensor_map_id.get(name) not in (self.ws_map_id, self.q8_map_id)):
+                        self.tensor_map_id.get(name) not in skip_maps):
                     non_q8.append(name)
                     seen.add(name)
 
@@ -1846,12 +2737,18 @@ class ADAMEngine:
         # Total element count for the new map
         total_elems = sum(self._size_of(n) for n in non_q8)
         n_groups = (total_elems + self.Q8_GROUP_SIZE - 1) // self.Q8_GROUP_SIZE
+        sizes = [self._size_of(n) for n in non_q8]
+
+        cache_base, cache_meta = self._b12_q8_cache_base(non_q8)
+        if self._b12_q8_try_load_cache(cache_base, cache_meta, non_q8, total_elems, n_groups):
+            return
 
         g = self.gpu
         g.map_create_typed(self._B12_Q8_MAP_ID, self.A.DTYPE_Q8, 1, total_elems, self.Q8_GROUP_SIZE)
 
-        b12_scales = np.ones (n_groups, dtype=np.float32)
-        b12_zeros  = np.zeros(n_groups, dtype=np.float32)
+        b12_scales = np.ones(n_groups, dtype=np.float32)
+        b12_zeros = np.zeros(n_groups, dtype=np.float32)
+        b12_u8 = np.empty(total_elems, dtype=np.uint8)
 
         pos = 0
         for name in non_q8:
@@ -1867,63 +2764,132 @@ class ADAMEngine:
                     b12_zeros [gi] = -128.0 * sc
                     q8 = np.round(chunk / sc).astype(np.int16).clip(-127, 127)
                     uint8_vals[bi:bi + len(chunk)] = (q8 + 128).astype(np.uint8)
-                locs = np.arange(pos + elem_off, pos + elem_off + take, dtype=np.uint32)
-                g.scatter(self._B12_Q8_MAP_ID, locs, uint8_vals)
+                start = pos + elem_off
+                b12_u8[start:start + take] = uint8_vals
             pos += self._size_of(name)
 
+        self._b12_q8_scatter_contiguous(total_elems, b12_u8)
         g.set_qparams(self._B12_Q8_MAP_ID, b12_scales, b12_zeros)
+        offs = [self._b12_q8_off[n] for n in non_q8]
+        self._b12_q8_save_cache(
+            cache_base, cache_meta, non_q8, offs, sizes, b12_u8, b12_scales, b12_zeros
+        )
         self._b12_q8_map_created = True
         if self.verbose:
             print(f"[GPU] B12 Q8 remap: {len(non_q8)} tensors, "
-                  f"{total_elems/1e6:.0f}MB → map {self._B12_Q8_MAP_ID}")
+                  f"{total_elems/1e6:.0f}MB -> map {self._B12_Q8_MAP_ID}")
 
     def _register_full_decode(self):
         """Build FullDecodeWeightAddrs and register the monolithic decode shader (B12)."""
         A = self.A
-        if not (getattr(self.gpu, '_has_full_decode_step', False) and
-                getattr(self.gpu, '_has_map_device_address', False)):
+        has_full_decode_api = bool(getattr(self.gpu, '_has_full_decode_step', False))
+        has_map_bda = bool(getattr(self.gpu, '_has_map_device_address', False))
+        if not has_full_decode_api:
+            if self._require_b12_on_broadcom:
+                raise RuntimeError(
+                    "Broadcom requires monolithic decode, but full_decode_step API "
+                    "is unavailable."
+                )
+            return
+        if (not self._is_broadcom) and (not has_map_bda):
+            if self._require_b12_on_broadcom:
+                raise RuntimeError(
+                    "Broadcom requires monolithic decode, but map device-address "
+                    "support is unavailable."
+                )
             return
 
         c = self.cfg
         q_dim = c.n_head * c.head_dim
         k_dim = c.n_head_kv * c.head_dim_kv
+        q4_direct_down = self._b12_q4_direct_down_enabled()
+
+        # Optional B12 raw Q5 map for gate/up (direct decode path in monolithic shader).
+        if self._is_broadcom:
+            self._ensure_b12_q5_raw_map()
 
         # Ensure B12 Q8 re-quant map exists for any Q4/Q6 projection tensors
         self._ensure_b12_q8_map()
 
-        ws_base    = self.gpu.get_map_buffer_device_address(self.ws_map_id)
-        q8_base    = self.gpu.get_map_buffer_device_address(self.q8_map_id)
-        q8_qp_base = self.gpu.get_map_qparam_device_address(self.q8_map_id)
-        b12_base    = self.gpu.get_map_buffer_device_address(self._B12_Q8_MAP_ID) \
-                      if getattr(self, '_b12_q8_off', None) else 0
-        b12_qp_base = self.gpu.get_map_qparam_device_address(self._B12_Q8_MAP_ID) \
-                      if getattr(self, '_b12_q8_off', None) else 0
+        use_packed_addr = bool(self._is_broadcom)
+        if use_packed_addr:
+            ws_base = 0
+            q8_base = 0
+            q8_qp_base = 0
+            b12_base = 0
+            b12_qp_base = 0
+        else:
+            ws_base = self.gpu.get_map_buffer_device_address(self.ws_map_id)
+            q8_base = self.gpu.get_map_buffer_device_address(self.q8_map_id)
+            q8_qp_base = self.gpu.get_map_qparam_device_address(self.q8_map_id)
+            b12_base = self.gpu.get_map_buffer_device_address(self._B12_Q8_MAP_ID) \
+                if getattr(self, '_b12_q8_off', None) else 0
+            b12_qp_base = self.gpu.get_map_qparam_device_address(self._B12_Q8_MAP_ID) \
+                if getattr(self, '_b12_q8_off', None) else 0
 
         wa = A.FullDecodeWeightAddrs()
+
+        def _pack_addr(sel, off):
+            return ((int(sel) & 0xFFFFFFFF) << 32) | (int(off) & 0xFFFFFFFF)
+
+        def _use_q4_direct_down(name, mid):
+            return (
+                q4_direct_down and
+                name.endswith('ffn_down.weight') and
+                mid == self.wt_map_id and
+                int(self.tensor_types.get(name, -1)) == 12  # GGML_TYPE_Q4_K
+            )
 
         def _w_addr(name):
             """Byte-level VkDeviceAddress for a weight tensor."""
             mid = self.tensor_map_id.get(name)
             off = self._off.get(name, 0)
+            if use_packed_addr:
+                # Selector encoding used by monolithic packed-address shader path:
+                # 0=ws(f32), 1=q8 map2, 2=b12 q8 map3, 3=b12 raw q5 map5, 4=q4 map1.
+                if mid == self.ws_map_id:
+                    return _pack_addr(0, off)  # F32 in ws map (element offset)
+                q5_off = getattr(self, '_b12_q5_off', {}).get(name, None)
+                if q5_off is not None:
+                    return _pack_addr(3, q5_off)  # raw GGML Q5_0 block bytes in map 5
+                if _use_q4_direct_down(name, mid):
+                    return _pack_addr(4, off)  # Q4 map 1 (element offset, nibble-packed)
+                if mid == self.q8_map_id:
+                    return _pack_addr(1, off)  # Q8 in map 2 (byte offset)
+                # Q4/Q6 tensor remapped to B12 Q8 map (map 3)
+                b12_off = self._b12_q8_off.get(name, None)
+                return _pack_addr(2, b12_off) if b12_off is not None else 0
             if mid == self.ws_map_id:
                 return ws_base + off * 4   # F32 norm: 4 bytes/elem
-            elif mid == self.q8_map_id:
+            if mid == self.q8_map_id:
                 return q8_base + off       # native Q8: 1 byte/elem
-            else:
-                # Q4/Q6 tensor remapped to B12 Q8 map
-                b12_off = self._b12_q8_off.get(name, None)
-                return (b12_base + b12_off) if b12_off is not None else 0
+            # Q4/Q6 tensor remapped to B12 Q8 map
+            b12_off = self._b12_q8_off.get(name, None)
+            return (b12_base + b12_off) if b12_off is not None else 0
 
         def _qp_addr(name):
             """Byte-level VkDeviceAddress for a tensor's Q8 qparam block."""
             mid = self.tensor_map_id.get(name)
-            if mid == self.q8_map_id:
-                off = self._off.get(name, 0)
-                return q8_qp_base + (off // self.Q8_GROUP_SIZE) * 8
-            else:
-                # Q4/Q6 tensor: use B12 Q8 map qparams
+            off = self._off.get(name, 0)
+            if use_packed_addr:
+                q5_off = getattr(self, '_b12_q5_off', {}).get(name, None)
+                if q5_off is not None:
+                    return 0  # raw q5 path reads scale from block header, no qparam buffer
+                if _use_q4_direct_down(name, mid):
+                    qp_off = (off // self.Q4_GROUP_SIZE) * 2
+                    return _pack_addr(4, qp_off)  # float index in map 1 qparams
+                if mid == self.q8_map_id:
+                    qp_off = (off // self.Q8_GROUP_SIZE) * 2
+                    return _pack_addr(1, qp_off)  # float index in map 2 qparams
+                # Q4/Q6 tensor remapped to B12 Q8 map qparams (map 3)
                 b12_off = self._b12_q8_off.get(name, None)
-                return (b12_qp_base + (b12_off // self.Q8_GROUP_SIZE) * 8) if b12_off is not None else 0
+                qp_off = (b12_off // self.Q8_GROUP_SIZE) * 2 if b12_off is not None else None
+                return _pack_addr(2, qp_off) if qp_off is not None else 0
+            if mid == self.q8_map_id:
+                return q8_qp_base + (off // self.Q8_GROUP_SIZE) * 8
+            # Q4/Q6 tensor: use B12 Q8 map qparams
+            b12_off = self._b12_q8_off.get(name, None)
+            return (b12_qp_base + (b12_off // self.Q8_GROUP_SIZE) * 8) if b12_off is not None else 0
 
         # Per-layer weight BDAs (data + qparams)
         weight_fields = [
@@ -1985,11 +2951,17 @@ class ADAMEngine:
             self._full_decode_active = True
             self._full_decode_n_layer = c.n_layer
             if self.verbose:
-                print(f"[GPU] B12 full_decode_register: ws={ws_base:#x} q8={q8_base:#x}"
-                      f" q8_qp={q8_qp_base:#x} softcap={c.attn_softcap}"
-                      f" → _full_decode_active=True")
+                addr_mode = "packed32(sel:off)" if use_packed_addr else "bda64"
+                print(f"[GPU] B12 full_decode_register: mode={addr_mode} "
+                      f"ws={ws_base:#x} q8={q8_base:#x} q8_qp={q8_qp_base:#x} "
+                      f"softcap={c.attn_softcap} -> _full_decode_active=True")
         except Exception as e:
             self._full_decode_registered = False
+            self._full_decode_active = False
+            if self._require_b12_on_broadcom:
+                raise RuntimeError(
+                    f"Broadcom monolithic decode registration failed: {e}"
+                ) from e
             if self.verbose:
                 print(f"[GPU] B12 full_decode_register failed: {e}")
 
@@ -2049,8 +3021,23 @@ class ADAMEngine:
             self._enqueue_gpu_embed_token(hid_h)
 
         # B12: monolithic shader — primary path (B13 will make it fast via N_WG dispatch)
-        _b12 = (self._full_decode_active and not te
-                and c.n_layer == getattr(self, '_full_decode_n_layer', -1))
+        _full_decode_layers = getattr(self, '_full_decode_n_layer', -1)
+        _b12 = (
+            self._is_broadcom
+            and
+            self._full_decode_active
+            and (not self._broadcom_split_proj)
+            and c.n_layer == _full_decode_layers
+            and (not te or self._require_b12_on_broadcom)
+        )
+        _require_b12_this_step = (
+            self._require_b12_on_broadcom
+            and c.n_layer == _full_decode_layers
+        )
+        if _require_b12_this_step and not _b12:
+            raise RuntimeError(
+                "Broadcom monolithic decode is required but inactive for this step."
+            )
         if _b12:
             self.gpu.full_decode_step(hid_h, normed_h, pos, seq_len)
 
@@ -2072,52 +3059,37 @@ class ADAMEngine:
             v_name = f'{p}.attn_v.weight'
             direct_kv = self._direct_kv_cache_write and L in self._wh_v_heads
             direct_v_queued = False
-            if alias_fast and L in self._qkv_merged_layers and not direct_kv:
-                self._gpu_proj_merged(
-                    normed_h,
-                    self._wh_qkv_wt[L],
-                    self._qkv_map_id[L],
-                    self._weight_kind(q_name),
-                    self._trans[q_name],
-                    self._qkv_ws_out_h,
-                    1,
-                    c.n_embd,
-                    q_dim + k_dim + k_dim,
-                )
-            elif alias_fast and direct_kv and self._qk_ws_out_h is not None and L in self._qk_merged_layers:
-                self._gpu_proj_merged(
-                    normed_h,
-                    self._wh_qk_wt[L],
-                    self._qk_map_id[L],
-                    self._weight_kind(q_name),
-                    self._trans[q_name],
-                    self._qk_ws_out_h,
-                    1,
-                    c.n_embd,
-                    q_dim + k_dim,
-                )
-                self._prepare_direct_v_write(L, pos)
-                if self._fusion_scheduler_mode == 'alias_safe':
-                    self._gpu_proj_heads_direct(
-                        self._kv_proj_src_h,
-                        self._wh_v_heads[L],
-                        self._v_head_map_id[L],
-                        self._v_head_kind[L],
-                        self._kc_v_write_h[L],
+            qkv_ctx = g.fusion_disabled() if self._broadcom_split_proj else nullcontext()
+            if self._broadcom_split_proj:
+                # Broadcom split-proj mode: force explicit projection dispatches
+                # (no monolithic full-decode spin synchronization path).
+                g.fusion_flush()
+            with qkv_ctx:
+                if alias_fast and L in self._qkv_merged_layers and not direct_kv:
+                    self._gpu_proj_merged(
+                        normed_h,
+                        self._wh_qkv_wt[L],
+                        self._qkv_map_id[L],
+                        self._weight_kind(q_name),
+                        self._trans[q_name],
+                        self._qkv_ws_out_h,
+                        1,
                         c.n_embd,
-                        c.head_dim_kv,
-                        c.n_head_kv,
+                        q_dim + k_dim + k_dim,
                     )
-                    direct_v_queued = True
-            else:
-                self._gpu_proj(normed_h, q_name, q_h, 1, c.n_embd, q_dim)
-                self._gpu_proj(normed_h, k_name, k_h, 1, c.n_embd, k_dim)
-                if direct_kv:
+                elif alias_fast and direct_kv and self._qk_ws_out_h is not None and L in self._qk_merged_layers:
+                    self._gpu_proj_merged(
+                        normed_h,
+                        self._wh_qk_wt[L],
+                        self._qk_map_id[L],
+                        self._weight_kind(q_name),
+                        self._trans[q_name],
+                        self._qk_ws_out_h,
+                        1,
+                        c.n_embd,
+                        q_dim + k_dim,
+                    )
                     self._prepare_direct_v_write(L, pos)
-                    # In alias_safe we can keep this queued and let the
-                    # upcoming K row_copy flush materialize it. Level-batched
-                    # still cannot prove the normed_h alias, so execute it
-                    # after the row_copy boundary below.
                     if self._fusion_scheduler_mode == 'alias_safe':
                         self._gpu_proj_heads_direct(
                             self._kv_proj_src_h,
@@ -2131,7 +3103,30 @@ class ADAMEngine:
                         )
                         direct_v_queued = True
                 else:
-                    self._gpu_proj(normed_h, v_name, v_h, 1, c.n_embd, k_dim)
+                    self._gpu_proj(normed_h, q_name, q_h, 1, c.n_embd, q_dim)
+                    self._gpu_proj(normed_h, k_name, k_h, 1, c.n_embd, k_dim)
+                    if direct_kv:
+                        self._prepare_direct_v_write(L, pos)
+                        # In alias_safe we can keep this queued and let the
+                        # upcoming K row_copy flush materialize it. Level-batched
+                        # still cannot prove the normed_h alias, so execute it
+                        # after the row_copy boundary below.
+                        if self._fusion_scheduler_mode == 'alias_safe':
+                            self._gpu_proj_heads_direct(
+                                self._kv_proj_src_h,
+                                self._wh_v_heads[L],
+                                self._v_head_map_id[L],
+                                self._v_head_kind[L],
+                                self._kc_v_write_h[L],
+                                c.n_embd,
+                                c.head_dim_kv,
+                                c.n_head_kv,
+                            )
+                            direct_v_queued = True
+                    else:
+                        self._gpu_proj(normed_h, v_name, v_h, 1, c.n_embd, k_dim)
+            if self._broadcom_split_proj:
+                g.fusion_flush()
             if te: self.timing['qkv'] += time.perf_counter() - t0
 
             # ---- QK Norm (Gemma 3 only): out-of-place (in-place silently fails in batch) ----
@@ -2251,7 +3246,13 @@ class ADAMEngine:
             # ---- Output projection ----
             if te: t0 = time.perf_counter()
             o_in = c.n_head * c.head_dim_kv
-            self._gpu_proj(ao_h, f'{p}.attn_output.weight', op_h, 1, o_in, c.n_embd)
+            if self._broadcom_split_proj:
+                g.fusion_flush()
+                with g.fusion_disabled():
+                    self._gpu_proj(ao_h, f'{p}.attn_output.weight', op_h, 1, o_in, c.n_embd)
+                g.fusion_flush()
+            else:
+                self._gpu_proj(ao_h, f'{p}.attn_output.weight', op_h, 1, o_in, c.n_embd)
 
             pan = f'{p}.post_attention_norm.weight'
             if pan in self._wh:
@@ -2284,7 +3285,13 @@ class ADAMEngine:
                 self._gpu_proj(n2_h, up_name,   up_h,   1, c.n_embd, c.n_ff)
             fused_gate_op = self.A.OP_GEGLU if c.ffn_act == 'gelu' else self.A.OP_SWIGLU
             g.map_op2_dev(ws_id, fused_gate_op, gate_h, up_h, act_h, c.n_ff)
-            self._gpu_proj(act_h, f'{p}.ffn_down.weight', ffn_h, 1, c.n_ff, c.n_embd)
+            if self._broadcom_split_proj:
+                g.fusion_flush()
+                with g.fusion_disabled():
+                    self._gpu_proj(act_h, f'{p}.ffn_down.weight', ffn_h, 1, c.n_ff, c.n_embd)
+                g.fusion_flush()
+            else:
+                self._gpu_proj(act_h, f'{p}.ffn_down.weight', ffn_h, 1, c.n_ff, c.n_embd)
 
             pfn = f'{p}.post_ffw_norm.weight'
             if pfn in self._wh:
@@ -2314,7 +3321,14 @@ class ADAMEngine:
         approx_penalty_n = 0
         approx_partial_val_h = None
         if self._lm_wt_name:
-            if sample_mode == 'gpu_approx_rerank':
+            # Prefill fast-path: when no logits are requested and no sampler work is
+            # needed for this step, skip LM-head matvec entirely.
+            skip_lm_head = ((not return_logits) and sample_mode is None) or (
+                sample_mode == 'cpu_top1' and not return_logits
+            )
+            if skip_lm_head:
+                pass
+            elif sample_mode == 'gpu_approx_rerank':
                 approx_partial_k = min(self._gpu_approx_partial_k, self.cfg.n_vocab)
                 if sample_cfg.repeat_penalty != 1.0 and sample_prev:
                     approx_penalty_n = self._prepare_repeat_ids(sample_prev)
@@ -2340,6 +3354,52 @@ class ADAMEngine:
                     float(sample_cfg.repeat_penalty),
                     rows_per_group,
                 )
+            elif sample_mode == 'gpu_matvec_argmax':
+                partial_idx_h, _ = self._wsh('sample_fused_idx')
+                partial_val_h, _ = self._wsh('sample_fused_val')
+                tok_h, _ = self._wsh('sample_token')
+                rows_per_group = self._effective_gpu_fused_rows_per_group(sample_cfg)
+                sample_fused_groups = (c.n_vocab + rows_per_group - 1) // rows_per_group
+                cap = len(self._sample_fused_idx_locs)
+                if sample_fused_groups > cap:
+                    raise RuntimeError(
+                        f"gpu_matvec_argmax requires {sample_fused_groups} partial slots but only {cap} are allocated "
+                        f"(rows_per_group={rows_per_group}, n_vocab={c.n_vocab})"
+                    )
+                self._sample_fused_partial_n = sample_fused_groups
+                wt_mid = self.tensor_map_id[self._lm_wt_name]
+                wt_kind = self._gpu_matvec_argmax_weight_kind()
+                if wt_kind == 'q8':
+                    g.map_matvec_argmax_t_xq8_dev(
+                        ws_id,
+                        wt_mid,
+                        normed_final_h,
+                        self._wh[self._lm_wt_name],
+                        partial_idx_h,
+                        partial_val_h,
+                        tok_h,
+                        c.n_embd,
+                        c.n_vocab,
+                        rows_per_group,
+                    )
+                elif wt_kind == 'q4':
+                    g.map_matvec_argmax_t_xq4_dev(
+                        ws_id,
+                        wt_mid,
+                        normed_final_h,
+                        self._wh[self._lm_wt_name],
+                        partial_idx_h,
+                        partial_val_h,
+                        tok_h,
+                        c.n_embd,
+                        c.n_vocab,
+                        rows_per_group,
+                    )
+                else:
+                    raise RuntimeError(
+                        f"gpu_matvec_argmax unavailable for LM head '{self._lm_wt_name}'"
+                    )
+                self._sample_token_ready = True
             elif sample_mode == 'gpu_fused_topk':
                 top_k = self._effective_sample_top_k(sample_cfg)
                 n_penalty = 0
@@ -2626,13 +3686,14 @@ class ADAMEngine:
         if not self._lm_wt_name:
             # CPU fallback (weight-tied models): gather from 'normed' slot
             # (output_norm now writes there out-of-place)
-            hid_data = g.gather(ws_id, self._normed_locs).view(np.float32)
-            wt = self._lm_weight
-            logits_cpu = (wt @ hid_data) if wt.shape[0] == c.n_vocab else (wt.T @ hid_data)
-            if c.final_softcap > 0:
-                cap = np.float32(c.final_softcap)
-                logits_cpu = np.tanh(logits_cpu / cap) * cap
-            g.scatter(ws_id, self._lo_locs, logits_cpu)
+            if not (sample_mode == 'cpu_top1' and not return_logits):
+                hid_data = g.gather(ws_id, self._normed_locs).view(np.float32)
+                wt = self._lm_weight
+                logits_cpu = (wt @ hid_data) if wt.shape[0] == c.n_vocab else (wt.T @ hid_data)
+                if c.final_softcap > 0:
+                    cap = np.float32(c.final_softcap)
+                    logits_cpu = np.tanh(logits_cpu / cap) * cap
+                g.scatter(ws_id, self._lo_locs, logits_cpu)
 
         if not return_logits:
             if te and not trace_split:
@@ -2721,10 +3782,16 @@ class ADAMEngine:
 
     def _select_sampling_mode(self, config) -> str:
         effective_top_k = self._effective_sample_top_k(config)
+        cpu_top1 = self._can_cpu_top1_sample(config)
+        gpu_matvec_argmax = self._can_gpu_matvec_argmax_sample(config)
         gpu_fused_topk = self._can_gpu_fused_topk_sample(config)
         gpu_approx_rerank = (effective_top_k > 1) and self._can_gpu_approx_rerank_sample(config)
         gpu_argmax = self._can_gpu_argmax_sample(config)
         gpu_topk = self._can_gpu_topk_sample(config)
+        if cpu_top1:
+            return 'cpu_top1'
+        if effective_top_k == 1 and gpu_matvec_argmax:
+            return 'gpu_matvec_argmax'
         if effective_top_k == 1 and gpu_fused_topk:
             return 'gpu_fused_topk'
         if gpu_argmax:
@@ -2773,14 +3840,14 @@ class ADAMEngine:
             need_logits = (i == last_prompt_idx) and (sampling_mode == 'cpu')
             sample_mode = sampling_mode if (
                 i == last_prompt_idx and
-                sampling_mode in ('gpu_fused_topk', 'gpu_approx_rerank')) else None
-            repeat_prev = self._repeat_history(token_ids, out_tok, config) if sample_mode else None
+                sampling_mode in ('cpu_top1', 'gpu_fused_topk', 'gpu_approx_rerank', 'gpu_matvec_argmax')) else None
+            repeat_prev = self._repeat_history(token_ids, out_tok, config) if sample_mode in ('gpu_fused_topk', 'gpu_approx_rerank') else None
             logits = self._forward(t, i, return_logits=need_logits,
                                    sample_mode=sample_mode, sample_cfg=config,
                                    sample_prev=repeat_prev)
         t_pre = time.perf_counter() - tp
 
-        if trace_decode and hasattr(g, 'reset_native_stats'):
+        if hasattr(g, 'reset_native_stats'):
             g.reset_native_stats()
 
         td = time.perf_counter(); ttimes = []
@@ -2789,7 +3856,9 @@ class ADAMEngine:
         for step in range(config.max_tokens):
             t0 = time.perf_counter()
             t_sample0 = time.perf_counter()
-            if sampling_mode == 'gpu_approx_rerank':
+            if sampling_mode == 'cpu_top1':
+                nt = self._sample_cpu_top1()
+            elif sampling_mode == 'gpu_approx_rerank':
                 nt = self._sample_gpu_approx_rerank(config)
             elif sampling_mode == 'gpu_fused_topk':
                 nt = self._consume_gpu_fused_topk(config)
@@ -2808,7 +3877,7 @@ class ADAMEngine:
             sample_dt = time.perf_counter() - t_sample0
             if nt in config.eos_token_ids: break
             all_tok.append(nt); out_tok.append(nt)
-            sample_mode = sampling_mode if sampling_mode in ('gpu_fused_topk', 'gpu_approx_rerank', 'gpu_topk', 'gpu_argmax') else None
+            sample_mode = sampling_mode if sampling_mode in ('cpu_top1', 'gpu_fused_topk', 'gpu_approx_rerank', 'gpu_topk', 'gpu_argmax', 'gpu_matvec_argmax') else None
             repeat_prev = self._repeat_history(token_ids, out_tok, config) if sample_mode in ('gpu_fused_topk', 'gpu_approx_rerank', 'gpu_topk') else None
             timing_before = dict(self.timing) if trace_decode else None
             t_forward0 = time.perf_counter()
@@ -2842,12 +3911,12 @@ class ADAMEngine:
         np_ = len(token_ids); ng = len(out_tok)
         native_stats = (
             g.get_native_stats()
-            if trace_decode and hasattr(g, 'get_native_stats')
+            if hasattr(g, 'get_native_stats')
             else {}
         )
         active_rows = (
             self._effective_gpu_fused_rows_per_group(config)
-            if sampling_mode in ('gpu_fused_topk', 'gpu_approx_rerank')
+            if sampling_mode in ('gpu_fused_topk', 'gpu_approx_rerank', 'gpu_matvec_argmax')
             else None
         )
         return out_tok, {
@@ -2862,12 +3931,14 @@ class ADAMEngine:
             'decode_tps': ng/t_dec if t_dec > 0 else 0,
             'avg_ms': np.mean(ttimes)*1000 if ttimes else 0,
             'sampling_mode': sampling_mode,
+            'broadcom_lm_head_mode': self._broadcom_lm_head_mode if self._is_broadcom else 'gpu',
             'gpu_fused_rows_per_group_active': active_rows,
             'timing': dict(self.timing),
-            'native_stats': native_stats if trace_decode else {},
-            'trace_summary': (
-                self._summarize_decode_trace(trace_steps, native_stats=native_stats, n_tokens=ng)
-                if trace_decode else {}
+            'native_stats': native_stats,
+            'trace_summary': self._summarize_decode_trace(
+                trace_steps if trace_decode else [],
+                native_stats=native_stats,
+                n_tokens=ng,
             ),
             'trace_steps': trace_steps if trace_decode else [],
         }
@@ -2889,3 +3960,5 @@ class ADAMEngine:
             'embed', 'norm', 'qkv', 'qk_norm', 'rope', 'attn', 'attn_out',
             'ffn', 'lm_head', 'lm_head_shortlist', 'sample_resolve',
             'core_batch', 'lm_head_batch', 'rerank_batch']}
+
+

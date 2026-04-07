@@ -3,7 +3,7 @@
 ADAMAH Chat — Universal LLM Inference TUI
 Pure Vulkan, zero CUDA. Loads any GGUF model via ADAM.
 """
-import os, sys, time, glob, platform, shutil
+import os, sys, time, glob, platform
 from functools import lru_cache
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -12,7 +12,10 @@ if hasattr(sys.stdout, "reconfigure"):
 # ── Paths ──────────────────────────────────────────────────
 from adam.paths import ROOT, ADAMAH_DIR, setup; setup()
 
-from runtime_bootstrap import compiled_shader_profile, ensure_runtime
+from runtime_bootstrap import (
+    ensure_runtime,
+    shader_profile_mismatch,
+)
 
 # ── ANSI Colors ────────────────────────────────────────────
 BOLD = "\033[1m"
@@ -138,26 +141,13 @@ def _machine_is_arm_like() -> bool:
     return machine in ("aarch64", "arm64", "armv7l", "armv6l")
 
 
-def _ensure_base_shader_copies():
+def _ensure_essential_shaders_present(shader_path=None):
+    if shader_path:
+        if os.path.exists(os.path.join(shader_path, "map_op1.spv")):
+            return
     shader_root = os.path.join(ADAMAH_DIR, "adamah", "shaders")
-    f32_dir = os.path.join(shader_root, "f32")
-    if not os.path.isdir(f32_dir):
-        return
-    os.makedirs(shader_root, exist_ok=True)
-    for name in os.listdir(f32_dir):
-        if not name.endswith(".spv"):
-            continue
-        src = os.path.join(f32_dir, name)
-        dst = os.path.join(shader_root, name)
-        if not os.path.exists(dst):
-            shutil.copy2(src, dst)
-
-
-def _ensure_essential_shaders_present():
-    shader_root = os.path.join(ADAMAH_DIR, "adamah", "shaders")
-    root_op1 = os.path.join(shader_root, "map_op1.spv")
     f32_op1 = os.path.join(shader_root, "f32", "map_op1.spv")
-    if os.path.exists(root_op1) and os.path.exists(f32_op1):
+    if os.path.exists(f32_op1):
         return
     raise RuntimeError(
         "Essential ADAMAH shaders are missing. "
@@ -515,19 +505,22 @@ def _runtime_profile_overrides(profile_name, cfg, unified):
             "pool_hot_mb": 512,
             "pool_cold_mb": 1024,
         }
-    if name == "broadcom_v3dv":
+    if name in ("broadcom_v3dv", "broadcom_v3dv_narrow"):
         return {
-            "name": "broadcom_v3dv",
+            "name": name,
             "reserve_ratio": 0.15,
             "kv_cap_max": 256,
+            # Broadcom defaults to eager raw-block load:
+            # avoids per-tensor disk streaming without forcing 4GB f32 materialization.
             "stream_load": False,
-            "stream_chunk_mb": 256,
-            "gpu_approx_rerank": cfg.n_vocab >= 131072,
+            "stream_chunk_mb": 64,
+            # Exact fused top-k is more stable on V3D than approx rerank.
+            "gpu_approx_rerank": False,
             "gpu_approx_partial_k": 8,
             "gpu_fused_rows_per_group": 256,
             "trace_decode": False,
-            "pool_hot_mb_max": 64,
-            "pool_cold_mb_max": 32,
+            "pool_hot_mb_max": 256,
+            "pool_cold_mb_max": 128,
         }
     raise ValueError(f"Unsupported runtime profile: {profile_name!r}")
 
@@ -547,16 +540,18 @@ def _decode_path_overrides(profile_name):
             "experimental_merged_gateup": True,
             "experimental_fused_gateup_act": True,
         }
-    if name == "broadcom_v3dv":
+    if name in ("broadcom_v3dv", "broadcom_v3dv_narrow"):
         return {
             "decode_path": "broadcom_v3dv",
             "fusion_scheduler_mode": "level_batched",
             "direct_kv_cache_write": True,
-            "experimental_qk_norm_rope": True,
-            "experimental_merged_qkv": True,
-            "experimental_fused_qkv_qk_norm_rope": True,
-            "experimental_merged_gateup": True,
-            "experimental_fused_gateup_act": True,
+            # Keep Broadcom on the conservative decode path; fused desktop knobs
+            # can regress both correctness and latency on V3D.
+            "experimental_qk_norm_rope": False,
+            "experimental_merged_qkv": False,
+            "experimental_fused_qkv_qk_norm_rope": False,
+            "experimental_merged_gateup": False,
+            "experimental_fused_gateup_act": False,
         }
     raise ValueError(f"Unsupported decode path profile: {profile_name!r}")
 
@@ -592,7 +587,7 @@ def _resolve_runtime_profile_name(profile_name, unified, device=None):
         return "broadcom_v3dv" if unified else _auto_discrete_runtime_profile_name(device)
     if name == "trace":
         return "broadcom_v3dv" if unified else _auto_discrete_runtime_profile_name(device)
-    if name in ("desktop_discrete", "broadcom_v3dv"):
+    if name in ("desktop_discrete", "broadcom_v3dv", "broadcom_v3dv_narrow"):
         return name
     raise ValueError(f"Unsupported runtime profile: {profile_name!r}")
 
@@ -631,6 +626,10 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
     runtime_mode = (startup.get("runtime_mode") or os.environ.get("ADAM_RUNTIME_MODE") or "fast").strip().lower()
     requested_profile = startup.get("runtime_profile") or os.environ.get("ADAM_RUNTIME_PROFILE", "")
     profile_name = _resolve_runtime_profile_name(requested_profile, unified, device=device)
+    if arm_like and profile_name == "desktop_discrete":
+        if str(requested_profile or "").strip().lower() == "desktop_discrete":
+            print(f"{YELLOW}Runtime override:{RESET} desktop_discrete -> broadcom_v3dv on ARM device")
+        profile_name = "broadcom_v3dv"
     profile = _runtime_profile_overrides(profile_name, cfg, unified)
     decode_defaults = _decode_path_overrides(profile.get("name", profile_name))
     if "reserve_ratio" in profile and os.environ.get("ADAM_RUNTIME_RESERVE_RATIO") is None:
@@ -787,11 +786,12 @@ def build_runtime_plan(adamah_mod, loader, cfg, engine_cls, startup=None):
 
 def _build_engine_kwargs(runtime_plan, loader, adamah_mod, startup=None):
     startup = startup or {}
+    loader_for_engine = loader if (runtime_plan["stream_load"] or not bool(getattr(loader, "keep_tensors", False))) else None
     engine_kwargs = {
         "raw_blocks": loader.raw_blocks,
         "tensor_types": loader.tensor_types,
         "tensor_shapes": loader.tensor_shapes,
-        "tensor_loader": (loader if runtime_plan["stream_load"] else None),
+        "tensor_loader": loader_for_engine,
         "runtime_profile": runtime_plan["profile"],
         "stream_chunk_mb": runtime_plan["stream_chunk_mb"],
         "kv_cap": runtime_plan["kv_cap"],
@@ -919,13 +919,23 @@ def init_gpu_backend(adamah_mod, runtime_plan=None):
 def load_model(model_path, startup=None):
     """Load GGUF model with ADAMAH GPU backend via ADAM."""
     startup = startup or {}
-    _ensure_base_shader_copies()
     desired_profile = _desired_shader_profile(startup)
+    shader_root = os.path.join(ADAMAH_DIR, "adamah", "shaders")
+    shader_path = (
+        os.path.join(shader_root, "f32")
+        if desired_profile.startswith("broadcom_v3dv")
+        else shader_root
+    )
     os.environ["ADAM_RUNTIME_PROFILE"] = desired_profile
     os.environ["ADAMAH_SHADER_PROFILE"] = desired_profile
-    os.environ["ADAMAH_SHADER_PATH"] = os.path.join(ADAMAH_DIR, "adamah", "shaders")
-    ensure_runtime(rebuild_shaders=(compiled_shader_profile() != desired_profile))
-    _ensure_essential_shaders_present()
+    os.environ["ADAMAH_SHADER_PATH"] = shader_path
+    rebuild_shaders = bool(shader_profile_mismatch(desired_profile))
+    if os.environ.get("ADAMAH_FORCE_SHADER_REBUILD", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    ):
+        rebuild_shaders = True
+    ensure_runtime(rebuild_shaders=rebuild_shaders)
+    _ensure_essential_shaders_present(shader_path)
     from adam.loaders.gguf import GGUFLoader
     from adam.tokenizers.gguf_tok import GGUFTokenizer
     from adam.models.engine import ADAMEngine, ModelConfig, GenerationConfig
@@ -943,10 +953,16 @@ def load_model(model_path, startup=None):
     if runtime_plan["stream_load"]:
         print(f"{GREEN}GGUF mode:{RESET} streamed upload, chunk={runtime_plan['stream_chunk_mb']}MB")
     else:
-        loader.keep_tensors = True
+        profile_name = str(runtime_plan.get("profile") or "")
+        keep_tensors_default = not profile_name.startswith("broadcom_v3dv")
+        keep_tensors = _env_flag("ADAM_EAGER_KEEP_TENSORS", keep_tensors_default)
+        loader.keep_tensors = bool(keep_tensors)
         loader.keep_raw_blocks = True
         loader.materialize(verbose=True)
-        print(f"{GREEN}GGUF mode:{RESET} eager host load")
+        if loader.keep_tensors:
+            print(f"{GREEN}GGUF mode:{RESET} eager host load")
+        else:
+            print(f"{GREEN}GGUF mode:{RESET} eager raw-block load (F32 on demand)")
 
     # Tokenizer (architecture-agnostic, reads from GGUF vocab)
     tokenizer = GGUFTokenizer(

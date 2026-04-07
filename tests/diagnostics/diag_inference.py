@@ -16,7 +16,7 @@ Four-level sanity check for the ADAM/Gemma3 inference pipeline.
 Run from the ADAM project root:
     python tests/test_inference_debug.py [path/to/model.gguf]
 """
-import os, sys, glob, time
+import os, sys, glob, time, platform
 import numpy as np
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -33,17 +33,54 @@ import adamah as A
 PASS = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
 WARN = "\033[33mWARN\033[0m"
+SKIP = "\033[33mSKIP\033[0m"
 BOLD = "\033[1m"
 RST  = "\033[0m"
 
 
-def _is_broadcom_like_profile() -> bool:
+def _is_arm_like_host() -> bool:
+    try:
+        machine = os.uname().machine.lower()
+    except AttributeError:
+        machine = platform.machine().lower()
+    return machine in ("aarch64", "arm64", "armv7l", "armv6l")
+
+
+def _resolved_runtime_profile() -> str:
     profile = str(
         os.environ.get("ADAM_RUNTIME_PROFILE")
         or os.environ.get("ADAMAH_SHADER_PROFILE")
         or ""
     ).strip().lower()
-    return profile.startswith("broadcom_v3dv")
+    if not profile or profile in ("auto", "default", "fast", "trace"):
+        return "broadcom_v3dv" if _is_arm_like_host() else "desktop_discrete"
+    return profile
+
+
+def _is_broadcom_like_profile() -> bool:
+    return _resolved_runtime_profile().startswith("broadcom_v3dv")
+
+
+def _apply_fast_upload_defaults(runtime_profile: str) -> dict[str, str]:
+    profile = str(runtime_profile or "").strip().lower()
+    if not profile.startswith("broadcom_v3dv"):
+        return {}
+    defaults = {
+        "ADAM_STREAM_LOAD": "0",
+        "ADAM_Q4_MAP_CACHE": "1",
+        "ADAM_Q8_MAP_CACHE": "1",
+        "ADAM_B12_Q8_CACHE": "1",
+        "ADAM_F32_MAP_SCATTER_CHUNK": str(16 * 1024 * 1024),
+        "ADAM_Q4_MAP_SCATTER_CHUNK": str(16 * 1024 * 1024),
+        "ADAM_Q8_MAP_SCATTER_CHUNK": str(16 * 1024 * 1024),
+        "ADAM_B12_Q8_SCATTER_CHUNK": str(16 * 1024 * 1024),
+    }
+    applied: dict[str, str] = {}
+    for key, value in defaults.items():
+        if key not in os.environ:
+            os.environ[key] = value
+            applied[key] = value
+    return applied
 
 
 def _pool_attempts_for_device() -> list[tuple[int, int]]:
@@ -58,11 +95,17 @@ def _pool_attempts_for_device() -> list[tuple[int, int]]:
 
 
 def _should_stream_loader() -> bool:
+    stream_env = os.environ.get("ADAM_STREAM_LOAD")
+    if stream_env is not None:
+        return str(stream_env).strip().lower() in ("1", "true", "yes", "on")
+    if _is_broadcom_like_profile():
+        # Broadcom fast profile uses eager raw-block load + cache hits.
+        return False
     try:
         device = A.probe_device()
     except Exception:
         device = {}
-    return bool(device.get("is_unified_memory")) or _is_broadcom_like_profile()
+    return bool(device.get("is_unified_memory")) or _is_arm_like_host()
 
 
 def _token_vocab(tokenizer):
@@ -94,6 +137,57 @@ def _chat_eos_ids(tokenizer):
             eos_ids.add(int(tok_id))
     return eos_ids
 
+
+def _has_cpu_reference_tensors(engine) -> bool:
+    tensors = getattr(engine, "tensors", None)
+    if not isinstance(tensors, dict):
+        return False
+    required = (
+        "token_embd.weight",
+        "output_norm.weight",
+        "blk.0.attn_norm.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",
+        "blk.0.attn_output.weight",
+        "blk.0.ffn_norm.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_up.weight",
+        "blk.0.ffn_down.weight",
+    )
+    return all(name in tensors for name in required)
+
+
+def _skip_cpu_reference_check(engine, check_name: str) -> bool:
+    if _has_cpu_reference_tensors(engine):
+        return False
+    print(f"  {SKIP} {check_name} requires eager tensor load "
+          f"(missing 'token_embd.weight' in streamed mode).")
+    print(f"  {WARN} Re-run with eager loader/profile for full CPU reference coverage.")
+    return True
+
+
+def _token_emb_matrix(cfg, tensors, cache=None):
+    """Return token_embd.weight as [n_vocab, n_embd] float32."""
+    src = cache.get('token_embd.weight') if cache is not None else None
+    if src is None:
+        src = tensors['token_embd.weight']
+    emb = np.asarray(src, dtype=np.float32)
+    n_vocab = int(cfg.n_vocab)
+    n_embd = int(cfg.n_embd)
+
+    if emb.ndim == 1:
+        need = n_vocab * n_embd
+        if emb.size != need:
+            raise ValueError(f"token_embd.weight flat size mismatch: got {emb.size}, expected {need}")
+        return emb.reshape(n_vocab, n_embd)
+    if emb.ndim == 2:
+        if emb.shape[0] == n_vocab:
+            return emb
+        if emb.shape[1] == n_vocab:
+            return emb.T
+    raise ValueError(f"Unsupported token_embd.weight shape: {emb.shape}")
+
 # ── Model path ───────────────────────────────────────────────────────────────
 def find_model(argv):
     if len(argv) > 1 and argv[1].endswith('.gguf'):
@@ -109,6 +203,11 @@ def find_model(argv):
 # ── Load ─────────────────────────────────────────────────────────────────────
 def load_everything(model_path):
     print(f"\n{BOLD}Loading {os.path.basename(model_path)}...{RST}")
+    runtime_profile = _resolved_runtime_profile()
+    applied_env = _apply_fast_upload_defaults(runtime_profile)
+    if applied_env:
+        pairs = " ".join(f"{k}={v}" for k, v in sorted(applied_env.items()))
+        print(f"  [Fast-upload defaults: {pairs}]")
     stream_loader = _should_stream_loader()
     loader = GGUFLoader(
         model_path,
@@ -174,19 +273,22 @@ def load_everything(model_path):
         "tensor_types": loader.tensor_types,
         "adamah_mod": A,
         "verbose": False,
+        "runtime_profile": runtime_profile,
     }
+    if runtime_profile.startswith("broadcom_v3dv"):
+        engine_kwargs.setdefault("kv_cap", 256)
+        engine_kwargs.setdefault("gpu_fused_rows_per_group", 256)
+        engine_kwargs.setdefault("fusion_scheduler_mode", "level_batched")
+        engine_kwargs.setdefault("direct_kv_cache_write", True)
     if stream_loader:
         engine_kwargs.update({
             "tensor_shapes": loader.tensor_shapes,
             "tensor_loader": loader,
-            "runtime_profile": "broadcom_v3dv",
             "stream_chunk_mb": 8,
-            "kv_cap": 256,
-            "gpu_fused_rows_per_group": 256,
-            "fusion_scheduler_mode": "level_batched",
-            "direct_kv_cache_write": True,
         })
-        print("  [Loader mode: streamed tensors, broadcom-safe engine config]")
+        print(f"  [Loader mode: streamed tensors, runtime_profile={runtime_profile}]")
+    else:
+        print(f"  [Loader mode: eager tensors/raw blocks, runtime_profile={runtime_profile}]")
     engine = ADAMEngine(gpu, cfg, loader.tensors, **engine_kwargs)
     return engine, tokenizer, cfg, gpu
 
@@ -454,6 +556,8 @@ def check_cpu_reference(engine, tokenizer, cfg):
     5c. Final logits: GPU vs CPU numpy for n_layers=1.
     """
     print(f"\n{BOLD}=== Check 5: CPU reference (n_layers=1, pos=0) ==={RST}")
+    if _skip_cpu_reference_check(engine, "Check 5"):
+        return True
 
     c = cfg
     tensors = engine.tensors   # float32 dequantised by GGUF loader
@@ -477,10 +581,19 @@ def check_cpu_reference(engine, tokenizer, cfg):
 
     # ---- Run GPU forward with n_layers=1, pos=0 ----
     true_n_layer = engine.cfg.n_layer
+    true_require_b12 = bool(getattr(engine, "_require_b12_on_broadcom", False))
     engine.cfg.n_layer = 1
-    engine.reset()
-    gpu_logits = engine._forward(tokenizer.bos_id, 0)
-    engine.cfg.n_layer = true_n_layer
+    # Check 5 intentionally validates a 1-layer CPU reference path; on Broadcom
+    # we temporarily relax strict-B12 gating for this diagnostic sub-test only.
+    if true_require_b12:
+        engine._require_b12_on_broadcom = False
+    try:
+        engine.reset()
+        gpu_logits = engine._forward(tokenizer.bos_id, 0)
+    finally:
+        engine.cfg.n_layer = true_n_layer
+        if true_require_b12:
+            engine._require_b12_on_broadcom = true_require_b12
 
     g = engine.gpu
     ws_id = engine.ws_map_id
@@ -527,9 +640,8 @@ def check_cpu_reference(engine, tokenizer, cfg):
             print(f"      head {h}: ao={ao_h[:4]}  v={v_h[:4]}  diff={diff_h:.3e}")
 
     # ---- CPU reference computation (1 layer, pos=0) ----
-    emb_t = tensors['token_embd.weight'].astype(np.float32)  # [n_vocab, n_embd]
-    hidden = (emb_t[tokenizer.bos_id].copy() if emb_t.shape[0] == c.n_vocab
-              else emb_t[:, tokenizer.bos_id].copy())
+    emb_t = _token_emb_matrix(c, tensors)  # [n_vocab, n_embd]
+    hidden = emb_t[tokenizer.bos_id].copy()
     if c.emb_scale != 1.0:
         hidden = hidden * np.float32(c.emb_scale)
 
@@ -609,9 +721,8 @@ def check_cpu_reference(engine, tokenizer, cfg):
         W_lm = tensors['output.weight'].astype(np.float32)
         cpu_logits = normed_final @ W_lm.T
     else:
-        W_lm = tensors['token_embd.weight'].astype(np.float32)  # [n_vocab, n_embd]
-        cpu_logits = (W_lm @ normed_final if W_lm.shape[0] == c.n_vocab
-                      else W_lm.T @ normed_final)
+        W_lm = _token_emb_matrix(c, tensors)  # [n_vocab, n_embd]
+        cpu_logits = W_lm @ normed_final
 
     if c.final_softcap > 0:
         cap = np.float32(c.final_softcap)
@@ -657,6 +768,8 @@ def check_multilayer_cpu(engine, tokenizer, cfg):
      - the norm explosion is a GPU computation bug → GPU diverges from CPU
     """
     print(f"\n{BOLD}=== Check 6: Multi-layer CPU vs GPU norms (BOS@pos=0) ==={RST}")
+    if _skip_cpu_reference_check(engine, "Check 6"):
+        return True
 
     c = cfg
     tensors = engine.tensors
@@ -678,9 +791,8 @@ def check_multilayer_cpu(engine, tokenizer, cfg):
     def silu(x):
         return x * (np.float32(1.0) / (np.float32(1.0) + np.exp(-x.clip(-80, 80))))
 
-    emb_t = tensors['token_embd.weight'].astype(np.float32)
-    emb0 = (emb_t[tokenizer.bos_id].copy() if emb_t.shape[0] == c.n_vocab
-            else emb_t[:, tokenizer.bos_id].copy())
+    emb_t = _token_emb_matrix(c, tensors)
+    emb0 = emb_t[tokenizer.bos_id].copy()
     if c.emb_scale != 1.0:
         emb0 = emb0 * np.float32(c.emb_scale)
 
@@ -754,9 +866,8 @@ def check_multilayer_cpu(engine, tokenizer, cfg):
             W_lm = tensors['output.weight'].astype(np.float32)
             cpu_logits = cpu_normed @ W_lm.T
         else:
-            W_lm = tensors['token_embd.weight'].astype(np.float32)
-            cpu_logits = (W_lm @ cpu_normed if W_lm.shape[0] == c.n_vocab
-                          else W_lm.T @ cpu_normed)
+            W_lm = _token_emb_matrix(c, tensors)
+            cpu_logits = W_lm @ cpu_normed
         if c.final_softcap > 0:
             cap = np.float32(c.final_softcap)
             cpu_logits = np.tanh(cpu_logits / cap) * cap
@@ -812,6 +923,8 @@ def check_cpu_generation(engine, tokenizer, cfg, n_tokens=8):
     double Q4 quantisation (GGUF Q4_K → f32 → engine Q4 re-quantisation).
     """
     print(f"\n{BOLD}=== Check 7: CPU F32 autoregressive generation ==={RST}")
+    if _skip_cpu_reference_check(engine, "Check 7"):
+        return True
     import time as _time
 
     c = cfg; tensors = engine.tensors
@@ -859,9 +972,8 @@ def check_cpu_generation(engine, tokenizer, cfg, n_tokens=8):
 
     def forward_cpu(tok_id, pos):
         seq_len = pos + 1
-        emb_t = W.get('token_embd.weight', tensors['token_embd.weight'].astype(np.float32))
-        hidden = (emb_t[tok_id].copy() if emb_t.shape[0] == c.n_vocab
-                  else emb_t[:, tok_id].copy())
+        emb_t = _token_emb_matrix(c, tensors, cache=W)
+        hidden = emb_t[tok_id].copy()
         if c.emb_scale != 1.0: hidden *= np.float32(c.emb_scale)
 
         for L in range(c.n_layer):
@@ -917,8 +1029,8 @@ def check_cpu_generation(engine, tokenizer, cfg, n_tokens=8):
         if 'output.weight' in W:
             logits = normed_final @ W['output.weight'].T
         else:
-            lm = W.get('token_embd.weight', tensors['token_embd.weight'].astype(np.float32))
-            logits = (lm @ normed_final if lm.shape[0] == c.n_vocab else lm.T @ normed_final)
+            lm = _token_emb_matrix(c, tensors, cache=W)
+            logits = lm @ normed_final
         if c.final_softcap > 0:
             cap = np.float32(c.final_softcap)
             logits = np.tanh(logits / cap) * cap

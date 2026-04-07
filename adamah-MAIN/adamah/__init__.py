@@ -576,6 +576,28 @@ class Adamah:
             ctypes.c_uint32
         ]
         self._lib.map_scatter.restype = ctypes.c_uint64
+        try:
+            self._lib.map_scatter_contiguous.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            ]
+            self._lib.map_scatter_contiguous.restype = ctypes.c_uint64
+            self._has_map_scatter_contiguous = True
+        except AttributeError:
+            self._has_map_scatter_contiguous = False
+        try:
+            self._lib.map_scatter_q4_packed_contiguous.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            ]
+            self._lib.map_scatter_q4_packed_contiguous.restype = ctypes.c_uint64
+            self._has_map_scatter_q4_packed_contiguous = True
+        except AttributeError:
+            self._has_map_scatter_q4_packed_contiguous = False
 
         self._lib.map_gather.argtypes = [
             ctypes.c_uint32,
@@ -696,6 +718,28 @@ class Adamah:
             self._has_map_repeat_penalty_dev = True
         except AttributeError:
             self._has_map_repeat_penalty_dev = False
+        try:
+            self._lib.map_matvec_argmax_t_xq4_dev.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ]
+            self._lib.map_matvec_argmax_t_xq4_dev.restype = ctypes.c_int
+            self._has_map_matvec_argmax_t_xq4_dev = True
+        except AttributeError:
+            self._has_map_matvec_argmax_t_xq4_dev = False
+        try:
+            self._lib.map_matvec_argmax_t_xq8_dev.argtypes = [
+                ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ]
+            self._lib.map_matvec_argmax_t_xq8_dev.restype = ctypes.c_int
+            self._has_map_matvec_argmax_t_xq8_dev = True
+        except AttributeError:
+            self._has_map_matvec_argmax_t_xq8_dev = False
         try:
             self._lib.map_matvec_topk_t_xq4_dev.argtypes = [
                 ctypes.c_uint32, ctypes.c_uint32,
@@ -1251,6 +1295,54 @@ class Adamah:
         return int(ticket)
 
     map_scatter = scatter
+
+    def scatter_contiguous(self, map_id: int, start_pack: int, data: np.ndarray,
+                           n_locs: Optional[int] = None) -> int:
+        """Write a contiguous run of packs to map starting at `start_pack`."""
+        arr = np.ascontiguousarray(data)
+        if n_locs is None:
+            n_locs = int(arr.size)
+        self._metrics['scatter_calls'] += 1
+        self._metrics['total_bytes_cpu_to_gpu'] += arr.nbytes
+        if getattr(self, "_has_map_scatter_contiguous", False):
+            ticket = self._lib.map_scatter_contiguous(
+                ctypes.c_uint32(map_id),
+                ctypes.c_uint32(start_pack),
+                arr.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_uint32(n_locs),
+            )
+            return int(ticket)
+        locs = np.arange(start_pack, start_pack + int(n_locs), dtype=np.uint32)
+        ticket = self._lib.map_scatter(
+            ctypes.c_uint32(map_id),
+            locs.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+            arr.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_uint32(len(locs)),
+        )
+        return int(ticket)
+
+    map_scatter_contiguous = scatter_contiguous
+
+    def scatter_q4_packed_contiguous(self, map_id: int, start_pack: int,
+                                     packed_u8: np.ndarray,
+                                     n_locs: Optional[int] = None) -> int:
+        """Write contiguous Q4 packed nibbles directly (2 elems per byte)."""
+        if not getattr(self, "_has_map_scatter_q4_packed_contiguous", False):
+            raise RuntimeError("map_scatter_q4_packed_contiguous not available in backend")
+        arr = np.ascontiguousarray(packed_u8, dtype=np.uint8)
+        if n_locs is None:
+            n_locs = int(arr.size) * 2
+        self._metrics['scatter_calls'] += 1
+        self._metrics['total_bytes_cpu_to_gpu'] += arr.nbytes
+        ticket = self._lib.map_scatter_q4_packed_contiguous(
+            ctypes.c_uint32(map_id),
+            ctypes.c_uint32(start_pack),
+            arr.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_uint32(n_locs),
+        )
+        return int(ticket)
+
+    map_scatter_q4_packed_contiguous = scatter_q4_packed_contiguous
 
     def gather(self, map_id: int, locs: np.ndarray, n_packs: Optional[int] = None, n_locs: Optional[int] = None) -> np.ndarray:
         """Read data from map. Returns raw bytes matching active dtype packing."""
@@ -2068,6 +2160,54 @@ class Adamah:
         )
         if ret != 0:
             raise RuntimeError(f"map_argmax_dev failed with code {ret}")
+
+    def map_matvec_argmax_t_xq4_dev(self, map_act: int, map_wt: int,
+                                    locs_a_handle: int, locs_b_handle: int,
+                                    locs_idx_tmp_handle: int, locs_val_tmp_handle: int,
+                                    locs_dst_handle: int,
+                                    K: int, N: int, rows_per_group: int):
+        """Greedy argmax from a F32 activation vector times a Q4 weight matrix."""
+        if not getattr(self, '_has_map_matvec_argmax_t_xq4_dev', False):
+            raise NotImplementedError("map_matvec_argmax_t_xq4_dev is not available in the loaded backend")
+        self._metrics['op_calls'] += 1
+        ret = self._lib.map_matvec_argmax_t_xq4_dev(
+            ctypes.c_uint32(map_act),
+            ctypes.c_uint32(map_wt),
+            ctypes.c_uint32(locs_a_handle),
+            ctypes.c_uint32(locs_b_handle),
+            ctypes.c_uint32(locs_idx_tmp_handle),
+            ctypes.c_uint32(locs_val_tmp_handle),
+            ctypes.c_uint32(locs_dst_handle),
+            ctypes.c_uint32(K),
+            ctypes.c_uint32(N),
+            ctypes.c_uint32(rows_per_group),
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_matvec_argmax_t_xq4_dev failed with code {ret}")
+
+    def map_matvec_argmax_t_xq8_dev(self, map_act: int, map_wt: int,
+                                    locs_a_handle: int, locs_b_handle: int,
+                                    locs_idx_tmp_handle: int, locs_val_tmp_handle: int,
+                                    locs_dst_handle: int,
+                                    K: int, N: int, rows_per_group: int):
+        """Greedy argmax from a F32 activation vector times a Q8 weight matrix."""
+        if not getattr(self, '_has_map_matvec_argmax_t_xq8_dev', False):
+            raise NotImplementedError("map_matvec_argmax_t_xq8_dev is not available in the loaded backend")
+        self._metrics['op_calls'] += 1
+        ret = self._lib.map_matvec_argmax_t_xq8_dev(
+            ctypes.c_uint32(map_act),
+            ctypes.c_uint32(map_wt),
+            ctypes.c_uint32(locs_a_handle),
+            ctypes.c_uint32(locs_b_handle),
+            ctypes.c_uint32(locs_idx_tmp_handle),
+            ctypes.c_uint32(locs_val_tmp_handle),
+            ctypes.c_uint32(locs_dst_handle),
+            ctypes.c_uint32(K),
+            ctypes.c_uint32(N),
+            ctypes.c_uint32(rows_per_group),
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_matvec_argmax_t_xq8_dev failed with code {ret}")
 
     def map_repeat_penalty_dev(self, map_id: int, locs_src_handle: int,
                                token_ids_handle: int, n_ids: int, penalty: float):

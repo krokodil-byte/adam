@@ -172,3 +172,11 @@ The native library can be built during install or first-run bootstrap.
 CC-BY-NC 4.0 — Samuele Scuglia
 
 **ADAMAH** — *The Ground for computation.*
+
+## Authorship and AI Assistance
+
+- Concept, architecture, and product direction: **Samuele Scuglia**.
+- Implementation support used during development: **Claude**, **Gemini**,
+  and **Codex**.
+- These tools are used as engineering assistants only. They are **not
+  co-authors** of the project.

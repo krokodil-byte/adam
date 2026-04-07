@@ -41,11 +41,33 @@ def _shader_profile() -> str:
             or "").strip().lower()
 
 
+def _normalized_shader_profile(profile: str | None = None) -> str:
+    name = (profile or "").strip().lower()
+    if not name:
+        return ""
+    if name == "broadcom_v3dv_narrow":
+        return "broadcom_v3dv_narrow"
+    if name.startswith("broadcom_v3dv"):
+        # broadcom_v3dv, broadcom_v3dv_exact/approx/trace all compile
+        # with the same "balanced" shader macro set.
+        return "broadcom_v3dv"
+    return name
+
+
 def compiled_shader_profile() -> str:
     try:
-        return SHADER_PROFILE_STAMP.read_text(encoding="utf-8").strip().lower()
+        raw = SHADER_PROFILE_STAMP.read_text(encoding="utf-8").strip().lower()
+        return _normalized_shader_profile(raw)
     except OSError:
         return ""
+
+
+def shader_profile_mismatch(profile: str | None = None) -> bool:
+    target = _normalized_shader_profile(profile or _shader_profile())
+    if not target:
+        return False
+    compiled = compiled_shader_profile()
+    return compiled != target
 
 
 def _shader_compile_args() -> list[str]:
@@ -79,7 +101,14 @@ def _compile_shaders(pkg_dir: Path) -> None:
     if not src_dir.is_dir():
         return
     glslang = shutil.which("glslangValidator")
+    profile = _shader_profile() or "default"
+    profile_key = _normalized_shader_profile(profile) or profile
     if not glslang:
+        if profile.startswith("broadcom_v3dv"):
+            raise RuntimeError(
+                "glslangValidator is required for broadcom_v3dv because shaders "
+                "are rebuilt on every startup."
+            )
         if not _has_essential_shaders(pkg_dir):
             raise RuntimeError(
                 "glslangValidator not found and essential precompiled shaders are missing. "
@@ -88,7 +117,6 @@ def _compile_shaders(pkg_dir: Path) -> None:
         return
     compile_args = _shader_compile_args()
     target_args = _shader_target_args()
-    profile = _shader_profile() or "default"
     print(f"ADAMAH: Compiling shaders for profile '{profile}'")
     for dtype_dir in sorted(src_dir.iterdir()):
         if not dtype_dir.is_dir():
@@ -98,24 +126,18 @@ def _compile_shaders(pkg_dir: Path) -> None:
         for comp_file in sorted(dtype_dir.glob("*.comp")):
             dst = out_dir / (comp_file.stem + ".spv")
             _run([glslang, "-V", *target_args, *compile_args, str(comp_file), "-o", str(dst)], cwd=ROOT)
-    f32_dir = pkg_dir / "shaders" / "f32"
-    root_dir = pkg_dir / "shaders"
-    if f32_dir.is_dir():
-        for spv in f32_dir.glob("*.spv"):
-            shutil.copy2(spv, root_dir / spv.name)
     if not _has_essential_shaders(pkg_dir):
         raise RuntimeError(
-            "Shader compilation finished without producing essential SPIR-V files. "
-            "Expected adamah-MAIN/adamah/shaders/map_op1.spv and shaders/f32/map_op1.spv."
+            "Shader compilation finished without producing essential SPIR-V files "
+            "(expected adamah-MAIN/adamah/shaders/f32/map_op1.spv)."
         )
     SHADER_PROFILE_STAMP.parent.mkdir(parents=True, exist_ok=True)
-    SHADER_PROFILE_STAMP.write_text(profile, encoding="utf-8")
+    SHADER_PROFILE_STAMP.write_text(profile_key, encoding="utf-8")
 
 
 def _has_essential_shaders(pkg_dir: Path) -> bool:
-    root_op1 = pkg_dir / "shaders" / "map_op1.spv"
     f32_op1 = pkg_dir / "shaders" / "f32" / "map_op1.spv"
-    return root_op1.exists() and f32_op1.exists()
+    return f32_op1.exists()
 
 
 def _shader_outputs_stale(pkg_dir: Path) -> bool:
@@ -136,18 +158,6 @@ def _shader_outputs_stale(pkg_dir: Path) -> bool:
             except OSError:
                 return True
     return False
-
-
-def _sync_root_shader_copies(pkg_dir: Path) -> None:
-    f32_dir = pkg_dir / "shaders" / "f32"
-    root_dir = pkg_dir / "shaders"
-    if not f32_dir.is_dir():
-        return
-    root_dir.mkdir(parents=True, exist_ok=True)
-    for spv in f32_dir.glob("*.spv"):
-        dst = root_dir / spv.name
-        if not dst.exists():
-            shutil.copy2(spv, dst)
 
 
 def _write_shader_header(pkg_dir: Path) -> Path:
@@ -256,14 +266,20 @@ def _build_windows_gnu(pkg_dir: Path, force_rebuild: bool = False) -> Path:
 def ensure_native_adamah(force_rebuild: bool = False, rebuild_shaders: bool = False) -> Path:
     pkg_dir = ADAMAH_PKG
     candidates = ["adamah_opt.dll", "adamah_new.dll", "adamah.dll"] if os.name == "nt" else ["adamah.so"]
-    _sync_root_shader_copies(pkg_dir)
+    profile = _shader_profile()
+    force_shader_rebuild = os.environ.get("ADAMAH_FORCE_SHADER_REBUILD", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if force_shader_rebuild:
+        rebuild_shaders = True
+    if shader_profile_mismatch(profile):
+        rebuild_shaders = True
     if not _has_essential_shaders(pkg_dir):
         rebuild_shaders = True
     if _shader_outputs_stale(pkg_dir):
         rebuild_shaders = True
     if rebuild_shaders:
         _compile_shaders(pkg_dir)
-        _sync_root_shader_copies(pkg_dir)
     if not force_rebuild:
         for name in candidates:
             path = pkg_dir / name
@@ -276,7 +292,6 @@ def ensure_native_adamah(force_rebuild: bool = False, rebuild_shaders: bool = Fa
                     )
                 return path
     _compile_shaders(pkg_dir)
-    _sync_root_shader_copies(pkg_dir)
     if os.name == "nt":
         built = _build_windows_msvc(pkg_dir, force_rebuild=force_rebuild)
         if built is not None:

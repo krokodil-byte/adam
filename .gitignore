@@ -15,3 +15,12 @@ adamah-MAIN/adamah/*.so
 
 # Stale release snapshots
 releases/
+
+# Local machine / Codex ephemeral artifacts
+.askpass_*.bat
+.codex_raspi*
+.tmp_*
+*.log
+
+# Local diagnostic outputs
+reports/

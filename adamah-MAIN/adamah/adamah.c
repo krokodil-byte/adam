@@ -125,6 +125,25 @@
 #define FUSE_OP_FUSED_GATEUP_ACT_T_XQ8 24
 
 #define ADAMAH_FULL_DECODE_MAX_LAYERS 26
+#define ADAMAH_FULL_DECODE_SYNC_UINTS 512u
+#define ADAMAH_FULL_DECODE_MAX_WG 256u
+#define ADAMAH_FULL_DECODE_BARRIER_BIDS 8u
+#define ADAMAH_FULL_DECODE_SPIN_SUM_BASE 64u
+#define ADAMAH_FULL_DECODE_SPIN_MAX_BASE 96u
+#define ADAMAH_FULL_DECODE_DIAG_FLAG_IDX 32u
+
+#define ADAMAH_FD_BACKEND_AUTO 0u
+#define ADAMAH_FD_BACKEND_LEGACY_MONOLITHIC 1u
+#define ADAMAH_FD_BACKEND_V3DV_LEVELS 2u
+
+#define ADAMAH_FD_STAGE_QKV_ATTN_POST 0u
+#define ADAMAH_FD_STAGE_FFN 1u
+#define ADAMAH_FD_STAGE_FINAL 2u
+#define ADAMAH_FD_STAGE_COUNT 3u
+
+#define ADAMAH_FD_MASK_QKV_ATTN_POST (0x01u | 0x02u | 0x04u)
+#define ADAMAH_FD_MASK_FFN (0x08u | 0x10u)
+#define ADAMAH_FD_MASK_FINAL 0x20u
 
 #define LOC_ALIAS_NONE 0
 #define LOC_ALIAS_CONTIG 1
@@ -447,6 +466,14 @@ typedef struct {
   uint32_t map_ws_id;
   uint32_t map_kvcache_id;
   uint32_t n_layer;
+  uint32_t n_wg;
+  uint32_t backend;
+  uint32_t wg_qkv;
+  uint32_t wg_attn;
+  uint32_t wg_ffn;
+  uint32_t scratch_elems;
+  uint64_t stage_runs;
+  double stage_ms_accum[ADAMAH_FD_STAGE_COUNT];
   FullDecodeWeightAddrs wa;
 } FullDecodeState;
 
@@ -563,6 +590,7 @@ static struct {
   Pipeline qk_norm_rope_x_pipe;
 
   // Cross-map F32×Q4 pipelines
+  Pipeline matvec_argmax_t_xq4_pipe;
   Pipeline matvec_topk_t_xq4_pipe;
   Pipeline matvec_t_xq4_pipe;
   Pipeline matmul_t_xq4_pipe;
@@ -575,12 +603,14 @@ static struct {
   Pipeline full_decode_step_pipe;
 
   // Cross-map F32×Q8 pipelines
+  Pipeline matvec_argmax_t_xq8_pipe;
   Pipeline matvec_topk_t_xq8_pipe;
   Pipeline matvec_rerank_t_xq8_pipe;
   Pipeline matvec_t_xq8_pipe;
   Pipeline matmul_t_xq8_pipe;
   Pipeline matmul_xq8_pipe;
   Pipeline row_gather_xq8_pipe;
+  Pipeline argmax_pairs_pipe;
 
   // Per-dtype pipeline sets (bf16, q8)
   // Index: 0=f32 (uses the pipes above), 1=bf16, 2=q8
@@ -605,6 +635,11 @@ static struct {
 
   VkBuffer full_decode_wa_buf;
   VkDeviceMemory full_decode_wa_mem;
+  VkBuffer full_decode_sync_buf;
+  VkDeviceMemory full_decode_sync_mem;
+  VkBuffer full_decode_scratch_buf;
+  VkDeviceMemory full_decode_scratch_mem;
+  VkDeviceSize full_decode_scratch_bytes;
   FullDecodeState full_decode_state;
 } ctx = {0};
 
@@ -1662,6 +1697,7 @@ void batch_end(void) {
   reset_pipeline_desc_pool(&ctx.matmul_t_x_pipe);
   reset_pipeline_desc_pool(&ctx.rmsnorm_x_pipe);
   reset_pipeline_desc_pool(&ctx.qk_norm_rope_x_pipe);
+  reset_pipeline_desc_pool(&ctx.matvec_argmax_t_xq4_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq4_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_t_xq4_pipe);
   reset_pipeline_desc_pool(&ctx.matmul_t_xq4_pipe);
@@ -1672,12 +1708,14 @@ void batch_end(void) {
   reset_pipeline_desc_pool(&ctx.fused_gateup_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.fused_gateup_act_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.full_decode_step_pipe);
+  reset_pipeline_desc_pool(&ctx.matvec_argmax_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_rerank_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matmul_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matmul_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.row_gather_xq8_pipe);
+  reset_pipeline_desc_pool(&ctx.argmax_pairs_pipe);
 
   batch_op_counter = 0; // Reset counter
 }
@@ -1755,6 +1793,7 @@ void batch_wait(void) {
   reset_pipeline_desc_pool(&ctx.matmul_t_x_pipe);
   reset_pipeline_desc_pool(&ctx.rmsnorm_x_pipe);
   reset_pipeline_desc_pool(&ctx.qk_norm_rope_x_pipe);
+  reset_pipeline_desc_pool(&ctx.matvec_argmax_t_xq4_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq4_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_t_xq4_pipe);
   reset_pipeline_desc_pool(&ctx.matmul_t_xq4_pipe);
@@ -1765,12 +1804,14 @@ void batch_wait(void) {
   reset_pipeline_desc_pool(&ctx.fused_gateup_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.fused_gateup_act_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.full_decode_step_pipe);
+  reset_pipeline_desc_pool(&ctx.matvec_argmax_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_rerank_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matvec_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matmul_t_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.matmul_xq8_pipe);
   reset_pipeline_desc_pool(&ctx.row_gather_xq8_pipe);
+  reset_pipeline_desc_pool(&ctx.argmax_pairs_pipe);
 
   batch_op_counter = 0;
 }
@@ -1809,11 +1850,14 @@ void adamah_sync(void) {
     reset_pipeline_desc_pool(&ctx.topp_pipe);
     reset_pipeline_desc_pool(&ctx.resolve_idx_pipe);
     reset_pipeline_desc_pool(&ctx.sample_categorical_pipe);
+    reset_pipeline_desc_pool(&ctx.matvec_argmax_t_xq4_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq4_pipe);
+    reset_pipeline_desc_pool(&ctx.matvec_argmax_t_xq8_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq8_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_rerank_t_xq8_pipe);
     reset_pipeline_desc_pool(&ctx.full_decode_step_pipe);
     reset_pipeline_desc_pool(&ctx.row_gather_xq8_pipe);
+    reset_pipeline_desc_pool(&ctx.argmax_pairs_pipe);
     ctx.pending_desc_reset = 0;
   }
   vkDeviceWaitIdle(ctx.device);
@@ -1856,10 +1900,13 @@ void adamah_synchronize(uint64_t ticket) {
     reset_pipeline_desc_pool(&ctx.topp_pipe);
     reset_pipeline_desc_pool(&ctx.resolve_idx_pipe);
     reset_pipeline_desc_pool(&ctx.sample_categorical_pipe);
+    reset_pipeline_desc_pool(&ctx.matvec_argmax_t_xq4_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq4_pipe);
+    reset_pipeline_desc_pool(&ctx.matvec_argmax_t_xq8_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq8_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_rerank_t_xq8_pipe);
     reset_pipeline_desc_pool(&ctx.row_gather_xq8_pipe);
+    reset_pipeline_desc_pool(&ctx.argmax_pairs_pipe);
     ctx.pending_desc_reset = 0;
   }
 }
@@ -1900,10 +1947,13 @@ void adamah_synchronize_all(void) {
     reset_pipeline_desc_pool(&ctx.topp_pipe);
     reset_pipeline_desc_pool(&ctx.resolve_idx_pipe);
     reset_pipeline_desc_pool(&ctx.sample_categorical_pipe);
+    reset_pipeline_desc_pool(&ctx.matvec_argmax_t_xq4_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq4_pipe);
+    reset_pipeline_desc_pool(&ctx.matvec_argmax_t_xq8_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_topk_t_xq8_pipe);
     reset_pipeline_desc_pool(&ctx.matvec_rerank_t_xq8_pipe);
     reset_pipeline_desc_pool(&ctx.row_gather_xq8_pipe);
+    reset_pipeline_desc_pool(&ctx.argmax_pairs_pipe);
     ctx.pending_desc_reset = 0;
   }
 }
@@ -2570,6 +2620,23 @@ void adamah_shutdown(void) {
     vkFreeMemory(ctx.device, ctx.full_decode_wa_mem, NULL);
     ctx.full_decode_wa_mem = VK_NULL_HANDLE;
   }
+  if (ctx.full_decode_sync_buf) {
+    vkDestroyBuffer(ctx.device, ctx.full_decode_sync_buf, NULL);
+    ctx.full_decode_sync_buf = VK_NULL_HANDLE;
+  }
+  if (ctx.full_decode_sync_mem) {
+    vkFreeMemory(ctx.device, ctx.full_decode_sync_mem, NULL);
+    ctx.full_decode_sync_mem = VK_NULL_HANDLE;
+  }
+  if (ctx.full_decode_scratch_buf) {
+    vkDestroyBuffer(ctx.device, ctx.full_decode_scratch_buf, NULL);
+    ctx.full_decode_scratch_buf = VK_NULL_HANDLE;
+  }
+  if (ctx.full_decode_scratch_mem) {
+    vkFreeMemory(ctx.device, ctx.full_decode_scratch_mem, NULL);
+    ctx.full_decode_scratch_mem = VK_NULL_HANDLE;
+  }
+  ctx.full_decode_scratch_bytes = 0;
 
   // Destroy maps
   for (int i = 0; i < MAX_MAPS; i++) {
@@ -2820,6 +2887,199 @@ static GpuBuf *get_or_create_buf_ex(const char *base_name, uint32_t n_elems,
 static GpuBuf *get_or_create_buf(const char *base_name, uint32_t n_elems,
                                  uint32_t elem_size);
 static int init_pipelines(void);
+int map_scatter_contiguous(uint32_t map_id, uint32_t start_pack,
+                           const void *data, uint32_t n_locs);
+int map_scatter_q4_packed_contiguous(uint32_t map_id, uint32_t start_pack,
+                                     const void *packed_u8,
+                                     uint32_t n_locs);
+
+int map_scatter_contiguous(uint32_t map_id, uint32_t start_pack,
+                           const void *data, uint32_t n_locs) {
+  // Auto-flush pending fusion ops before writing new data
+  if (fusion.enabled && fusion.n_ops > 0) {
+    adamah_fusion_flush();
+  }
+
+  if (map_id >= MAX_MAPS || !ctx.maps[map_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (n_locs == 0)
+    return ADAMAH_OK;
+
+  Map *m = &ctx.maps[map_id];
+  if (start_pack >= m->n_packs)
+    return ADAMAH_ERR_INVALID;
+  if ((uint64_t)start_pack + (uint64_t)n_locs > (uint64_t)m->n_packs)
+    return ADAMAH_ERR_INVALID;
+
+  // Q4/Q6 contiguous path: upload only source F32 values and derive indices
+  // from start_pack in shader (avoids per-chunk locs uploads).
+  if (m->dtype == DTYPE_Q4 || m->dtype == DTYPE_Q6) {
+    if (!ctx.unary_pipe.pipeline)
+      init_pipelines();
+    if (!ctx.dtype_pipes_loaded[m->dtype])
+      init_dtype_pipelines(m->dtype);
+    Pipeline *qpipe = &ctx.dtype_scatter_pipe[m->dtype];
+    if (!qpipe->pipeline || !m->qparam_buf)
+      return ADAMAH_ERR_INVALID;
+
+    VkBufferUsageFlags dev_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    const char *src_name =
+        (m->dtype == DTYPE_Q4) ? "_q4_src" : "_q6_src";
+    const char *locs_dummy_name =
+        (m->dtype == DTYPE_Q4) ? "_q4_locs_dummy" : "_q6_locs_dummy";
+    GpuBuf *src_buf = get_or_create_buf_ex(src_name, n_locs, 4, 1, dev_usage);
+    GpuBuf *locs_dummy = get_or_create_buf_ex(locs_dummy_name, 1, 4, 1, dev_usage);
+    if (!src_buf || !locs_dummy)
+      return ADAMAH_ERR_MEMORY;
+
+    VkDeviceSize f32_bytes = (VkDeviceSize)n_locs * sizeof(float);
+    GpuBuf *stage = get_or_create_buf_ex(
+        "_stage_upload", (uint32_t)f32_bytes, 1, 0,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    if (!stage || !stage->ptr)
+      return ADAMAH_ERR_MEMORY;
+
+    memcpy(stage->ptr, data, (size_t)f32_bytes);
+    flush_mapped_gpu_buf(stage, f32_bytes);
+
+    VkDescriptorBufferInfo infos[4] = {
+        {.buffer = m->buf, .range = VK_WHOLE_SIZE},
+        {.buffer = src_buf->buf, .range = VK_WHOLE_SIZE},
+        {.buffer = locs_dummy->buf, .range = VK_WHOLE_SIZE},
+        {.buffer = m->qparam_buf, .range = VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet writes[4];
+    VkDescriptorSet ds = alloc_desc_set(qpipe);
+    if (!ds)
+      return ADAMAH_ERR_MEMORY;
+    for (int i = 0; i < 4; i++) {
+      writes[i] = (VkWriteDescriptorSet){
+          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+          .dstSet = ds,
+          .dstBinding = (uint32_t)i,
+          .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &infos[i]};
+    }
+    vkUpdateDescriptorSets(ctx.device, 4, writes, 0, NULL);
+
+    uint32_t push[4] = {n_locs, m->pack_size, m->group_size, start_pack};
+    uint32_t total_threads = n_locs * m->pack_size;
+
+    cmd_begin();
+    VkBufferCopy copy = {.srcOffset = 0, .dstOffset = 0, .size = f32_bytes};
+    vkCmdCopyBuffer(ctx.cmd, stage->buf, src_buf->buf, 1, &copy);
+    VkBuffer trans_bufs[1] = {src_buf->buf};
+    cmd_buffer_barrier(
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, trans_bufs, 1);
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, qpipe->pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            qpipe->pipe_layout, 0, 1, &ds, 0, NULL);
+    vkCmdPushConstants(ctx.cmd, qpipe->pipe_layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, push);
+    vkCmdDispatch(ctx.cmd, (total_threads + 255) / 256, 1, 1);
+    cmd_submit();
+    return ADAMAH_OK;
+  }
+
+  uint32_t pack_bytes = m->word_size * m->pack_size;
+  size_t off = (size_t)start_pack * pack_bytes;
+  size_t size = (size_t)n_locs * pack_bytes;
+
+#ifdef ADAMAH_PROFILE
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+#endif
+
+  // Chunk through the shared staging pool (handles maps larger than pool).
+  size_t done = 0;
+  while (done < size) {
+    size_t chunk = (size - done < (size_t)ctx.pool_size)
+                       ? (size - done)
+                       : (size_t)ctx.pool_size;
+    memcpy(ctx.pool_ptr, (const char *)data + done, chunk);
+    flush_mapped_pool(chunk);
+    cmd_begin();
+    VkBufferCopy copy = {.srcOffset = 0, .dstOffset = off + done, .size = chunk};
+    vkCmdCopyBuffer(ctx.cmd, ctx.pool_buf, m->buf, 1, &copy);
+    VkBuffer copied_bufs[1] = {m->buf};
+    cmd_buffer_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_ACCESS_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_ACCESS_SHADER_READ_BIT |
+                           VK_ACCESS_SHADER_WRITE_BIT |
+                           VK_ACCESS_TRANSFER_READ_BIT,
+                       copied_bufs, 1);
+    cmd_submit();
+    done += chunk;
+  }
+
+#ifdef ADAMAH_PROFILE
+  struct timespec t1;
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  double total_ms =
+      (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+  double bandwidth_gbs = (size / 1e9) / (total_ms / 1000.0);
+  fprintf(stderr,
+          "[SCATTER] size=%zu bytes (%.2f MB), total=%.3fms, BW=%.2f GB/s\n",
+          size, size / 1e6, total_ms, bandwidth_gbs);
+#endif
+
+  return ADAMAH_OK;
+}
+
+int map_scatter_q4_packed_contiguous(uint32_t map_id, uint32_t start_pack,
+                                     const void *packed_u8,
+                                     uint32_t n_locs) {
+  if (fusion.enabled && fusion.n_ops > 0) {
+    adamah_fusion_flush();
+  }
+
+  if (map_id >= MAX_MAPS || !ctx.maps[map_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (!packed_u8 || n_locs == 0)
+    return ADAMAH_OK;
+
+  Map *m = &ctx.maps[map_id];
+  if (m->dtype != DTYPE_Q4 || m->pack_size != 1)
+    return ADAMAH_ERR_INVALID;
+  if (start_pack >= m->n_packs)
+    return ADAMAH_ERR_INVALID;
+  if ((uint64_t)start_pack + (uint64_t)n_locs > (uint64_t)m->n_packs)
+    return ADAMAH_ERR_INVALID;
+  if ((start_pack & 1u) != 0u || (n_locs & 1u) != 0u)
+    return ADAMAH_ERR_INVALID;
+
+  size_t off = (size_t)start_pack / 2u;
+  size_t size = (size_t)n_locs / 2u;
+  size_t done = 0;
+  while (done < size) {
+    size_t chunk = (size - done < (size_t)ctx.pool_size)
+                       ? (size - done)
+                       : (size_t)ctx.pool_size;
+    memcpy(ctx.pool_ptr, (const char *)packed_u8 + done, chunk);
+    flush_mapped_pool(chunk);
+    cmd_begin();
+    VkBufferCopy copy = {.srcOffset = 0, .dstOffset = off + done, .size = chunk};
+    vkCmdCopyBuffer(ctx.cmd, ctx.pool_buf, m->buf, 1, &copy);
+    VkBuffer copied_bufs[1] = {m->buf};
+    cmd_buffer_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_ACCESS_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_ACCESS_SHADER_READ_BIT |
+                           VK_ACCESS_SHADER_WRITE_BIT |
+                           VK_ACCESS_TRANSFER_READ_BIT,
+                       copied_bufs, 1);
+    cmd_submit();
+    done += chunk;
+  }
+  return ADAMAH_OK;
+}
 
 // Scatter: write data to map at locations
 // locs: array of pack indices (uint32)
@@ -2845,6 +3105,10 @@ int map_scatter(uint32_t map_id, const uint32_t *locs, const void *data,
   // would overflow the buffer. These dtypes must always go through the GPU
   // quantization scatter shader which takes F32 input and packs nibbles.
   if (m->dtype == DTYPE_Q4 || m->dtype == DTYPE_Q6) {
+    uint32_t start = 0;
+    if (locs_contiguous_in_range(locs, n_locs, m->n_packs, &start)) {
+      return map_scatter_contiguous(map_id, start, data, n_locs);
+    }
     if (!ctx.unary_pipe.pipeline)
       init_pipelines();
     if (!ctx.dtype_pipes_loaded[m->dtype])
@@ -2897,7 +3161,7 @@ int map_scatter(uint32_t map_id, const uint32_t *locs, const void *data,
     }
     vkUpdateDescriptorSets(ctx.device, 4, writes, 0, NULL);
 
-    uint32_t push[3]      = {n_locs, m->pack_size, m->group_size};
+    uint32_t push[4]      = {n_locs, m->pack_size, m->group_size, 0xFFFFFFFFu};
     uint32_t total_threads = n_locs * m->pack_size;
 
     cmd_begin();
@@ -2916,7 +3180,7 @@ int map_scatter(uint32_t map_id, const uint32_t *locs, const void *data,
     vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             qpipe->pipe_layout, 0, 1, &ds, 0, NULL);
     vkCmdPushConstants(ctx.cmd, qpipe->pipe_layout,
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, push);
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, push);
     vkCmdDispatch(ctx.cmd, (total_threads + 255) / 256, 1, 1);
     cmd_submit();
     return ADAMAH_OK;
@@ -3936,23 +4200,42 @@ static int init_pipelines(void) {
       "/usr/share/adamah/shaders",
       NULL};
 
+  int prefer_f32_first = is_broadcom_v3d ? 1 : 0;
   for (int i = 0; paths[i] != NULL; i++) {
     if (!paths[i][0])
       continue;
     char test[600];
-    snprintf(test, sizeof(test), "%s/map_op1.spv", paths[i]);
-    FILE *f = fopen(test, "rb");
-    if (f) {
-      fclose(f);
-      strncpy(ctx.shader_path, paths[i], 511);
-      break;
-    }
-    snprintf(test, sizeof(test), "%s/f32/map_op1.spv", paths[i]);
-    f = fopen(test, "rb");
-    if (f) {
-      fclose(f);
-      snprintf(ctx.shader_path, sizeof(ctx.shader_path), "%s/f32", paths[i]);
-      break;
+    FILE *f = NULL;
+    if (prefer_f32_first) {
+      snprintf(test, sizeof(test), "%s/f32/map_op1.spv", paths[i]);
+      f = fopen(test, "rb");
+      if (f) {
+        fclose(f);
+        snprintf(ctx.shader_path, sizeof(ctx.shader_path), "%s/f32", paths[i]);
+        break;
+      }
+      snprintf(test, sizeof(test), "%s/map_op1.spv", paths[i]);
+      f = fopen(test, "rb");
+      if (f) {
+        fclose(f);
+        strncpy(ctx.shader_path, paths[i], 511);
+        break;
+      }
+    } else {
+      snprintf(test, sizeof(test), "%s/map_op1.spv", paths[i]);
+      f = fopen(test, "rb");
+      if (f) {
+        fclose(f);
+        strncpy(ctx.shader_path, paths[i], 511);
+        break;
+      }
+      snprintf(test, sizeof(test), "%s/f32/map_op1.spv", paths[i]);
+      f = fopen(test, "rb");
+      if (f) {
+        fclose(f);
+        snprintf(ctx.shader_path, sizeof(ctx.shader_path), "%s/f32", paths[i]);
+        break;
+      }
     }
   }
 
@@ -4047,7 +4330,9 @@ static int init_pipelines(void) {
 
   // Unified FFN: BT, D, D4, apply_residual, phase = 20 bytes, 7 bindings
   if (create_pipeline(&ctx.unified_pipe, "unified.spv", 7, 20) != 0) {
-    fprintf(stderr, "ADAMAH: Warning - unified shader not found\n");
+    if (!is_broadcom_v3d) {
+      fprintf(stderr, "ADAMAH: Warning - unified shader not found\n");
+    }
   }
 
   // Scatter: n_locs, pack_size = 8 bytes, 3 bindings (map, src, locs)
@@ -4105,6 +4390,9 @@ static int init_pipelines(void) {
   if (create_pipeline(&ctx.matvec_t_xq4_pipe, "map_matvec_t_xq4.spv", 6, 16) != 0) {
     fprintf(stderr, "ADAMAH: Warning - matvec_t_xq4 shader not found\n");
   }
+  if (create_pipeline(&ctx.matvec_argmax_t_xq4_pipe, "map_matvec_argmax_t_xq4.spv", 7, 16) != 0) {
+    fprintf(stderr, "ADAMAH: Warning - matvec_argmax_t_xq4 shader not found\n");
+  }
   if (create_pipeline(&ctx.matvec_topk_t_xq4_pipe, "map_matvec_topk_t_xq4.spv", 8, 28) != 0) {
     fprintf(stderr, "ADAMAH: Warning - matvec_topk_t_xq4 shader not found\n");
   }
@@ -4133,12 +4421,15 @@ static int init_pipelines(void) {
     fprintf(stderr,
             "ADAMAH: Warning - fused_gateup_act_t_xq8 shader not found\n");
   }
-  if (create_pipeline(&ctx.full_decode_step_pipe, "map_full_decode_step.spv", 5,
-                      16) != 0) {
+  if (create_pipeline(&ctx.full_decode_step_pipe, "map_full_decode_step.spv", 14,
+                      24) != 0) {
     fprintf(stderr, "ADAMAH: Warning - full_decode_step shader not found\n");
   }
   if (create_pipeline(&ctx.matvec_t_xq8_pipe, "map_matvec_t_xq8.spv", 6, 16) != 0) {
     fprintf(stderr, "ADAMAH: Warning - matvec_t_xq8 shader not found\n");
+  }
+  if (create_pipeline(&ctx.matvec_argmax_t_xq8_pipe, "map_matvec_argmax_t_xq8.spv", 7, 16) != 0) {
+    fprintf(stderr, "ADAMAH: Warning - matvec_argmax_t_xq8 shader not found\n");
   }
   if (create_pipeline(&ctx.matvec_topk_t_xq8_pipe, "map_matvec_topk_t_xq8.spv", 8, 28) != 0) {
     fprintf(stderr, "ADAMAH: Warning - matvec_topk_t_xq8 shader not found\n");
@@ -4154,6 +4445,9 @@ static int init_pipelines(void) {
   }
   if (create_pipeline(&ctx.row_gather_xq8_pipe, "map_row_gather_xq8.spv", 3, 24) != 0) {
     fprintf(stderr, "ADAMAH: Warning - row_gather_xq8 shader not found\n");
+  }
+  if (create_pipeline(&ctx.argmax_pairs_pipe, "map_argmax_pairs.spv", 4, 4) != 0) {
+    fprintf(stderr, "ADAMAH: Warning - argmax_pairs shader not found\n");
   }
 
   return ADAMAH_OK;
@@ -4252,9 +4546,10 @@ static int init_dtype_pipelines(uint32_t dtype) {
     ok &= (create_pipeline(&ctx.dtype_matmul_pipe[dtype], "map_matmul.spv", 5,
                            20) == 0);
   } else if (dtype == DTYPE_Q4) {
-    // q4 scatter: push = 12 bytes (n_locs, pack_size, group_size), 4 bindings (map, src, locs, qparams)
+    // q4 scatter: push = 16 bytes (n_locs, pack_size, group_size, base_pack),
+    // 4 bindings (map, src, locs, qparams)
     ok &= (create_pipeline(&ctx.dtype_scatter_pipe[dtype], "map_scatter.spv", 4,
-                           12) == 0);
+                           16) == 0);
     // q4 gather: push = 12 bytes (n_locs, pack_size, group_size), 4 bindings
     ok &= (create_pipeline(&ctx.dtype_gather_pipe[dtype], "map_gather.spv", 4,
                            12) == 0);
@@ -4262,9 +4557,9 @@ static int init_dtype_pipelines(uint32_t dtype) {
     ok &= (create_pipeline(&ctx.dtype_matmul_pipe[dtype], "map_matmul.spv", 6,
                            16) == 0);
   } else if (dtype == DTYPE_Q6) {
-    // q6 scatter: push = 12 bytes (n_locs, pack_size, group_size), 4 bindings
+    // q6 scatter: push = 16 bytes (n_locs, pack_size, group_size, base_pack)
     ok &= (create_pipeline(&ctx.dtype_scatter_pipe[dtype], "map_scatter.spv", 4,
-                           12) == 0);
+                           16) == 0);
     // q6 gather: push = 12 bytes (n_locs, pack_size, group_size), 4 bindings
     ok &= (create_pipeline(&ctx.dtype_gather_pipe[dtype], "map_gather.spv", 4,
                            12) == 0);
@@ -9260,6 +9555,171 @@ int map_matmul_xq4_dev(uint32_t map_act_id, uint32_t map_wt_id,
   return ADAMAH_OK;
 }
 
+static int exec_matvec_argmax_t_xq_internal(
+    Pipeline *pass1_pipe, uint32_t map_act_id, uint32_t map_wt_id,
+    uint32_t locs_a_handle, uint32_t locs_b_handle,
+    uint32_t locs_idx_tmp_handle, uint32_t locs_val_tmp_handle,
+    uint32_t locs_dst_handle, uint32_t K, uint32_t N,
+    uint32_t rows_per_group) {
+  int fret = fusion_flush_pending_for_immediate();
+  if (fret != ADAMAH_OK)
+    return fret;
+  if (map_act_id >= MAX_MAPS || !ctx.maps[map_act_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (map_wt_id >= MAX_MAPS || !ctx.maps[map_wt_id].active)
+    return ADAMAH_ERR_INVALID;
+  if (N == 0)
+    return ADAMAH_OK;
+  if (rows_per_group == 0u)
+    return ADAMAH_ERR_INVALID;
+  if (!pass1_pipe->pipeline && init_pipelines() != 0)
+    return ADAMAH_ERR_VULKAN;
+  if (!pass1_pipe->pipeline || !ctx.argmax_pairs_pipe.pipeline)
+    return ADAMAH_ERR_INVALID;
+
+  Map *m_act = &ctx.maps[map_act_id];
+  Map *m_wt = &ctx.maps[map_wt_id];
+  if (m_act->dtype != DTYPE_F32)
+    return ADAMAH_ERR_INVALID;
+  if (m_wt->qparam_buf == VK_NULL_HANDLE)
+    return ADAMAH_ERR_INVALID;
+
+  ResEntry *a_res = res_get(locs_a_handle);
+  ResEntry *b_res = res_get(locs_b_handle);
+  ResEntry *i_res = res_get(locs_idx_tmp_handle);
+  ResEntry *v_res = res_get(locs_val_tmp_handle);
+  ResEntry *d_res = res_get(locs_dst_handle);
+  if (!a_res || !b_res || !i_res || !v_res || !d_res)
+    return ADAMAH_ERR_INVALID;
+
+  uint32_t n_groups = (N + rows_per_group - 1u) / rows_per_group;
+  if (n_groups == 0u)
+    return ADAMAH_OK;
+  if ((VkDeviceSize)n_groups * sizeof(uint32_t) > i_res->size_bytes ||
+      (VkDeviceSize)n_groups * sizeof(uint32_t) > v_res->size_bytes ||
+      sizeof(uint32_t) > d_res->size_bytes) {
+    return ADAMAH_ERR_INVALID;
+  }
+
+  res_pin(locs_a_handle);
+  res_pin(locs_b_handle);
+  res_pin(locs_idx_tmp_handle);
+  res_pin(locs_val_tmp_handle);
+  res_pin(locs_dst_handle);
+
+  VkDeviceSize a_off = 0, b_off = 0, i_off = 0, v_off = 0, d_off = 0;
+  if (res_require_hot(locs_a_handle, &a_off) != 0 ||
+      res_require_hot(locs_b_handle, &b_off) != 0 ||
+      res_require_hot(locs_idx_tmp_handle, &i_off) != 0 ||
+      res_require_hot(locs_val_tmp_handle, &v_off) != 0 ||
+      res_require_hot(locs_dst_handle, &d_off) != 0) {
+    res_unpin(locs_a_handle);
+    res_unpin(locs_b_handle);
+    res_unpin(locs_idx_tmp_handle);
+    res_unpin(locs_val_tmp_handle);
+    res_unpin(locs_dst_handle);
+    return ADAMAH_ERR_INVALID;
+  }
+
+  VkDescriptorBufferInfo pass1_infos[7] = {
+      {.buffer = m_act->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = m_wt->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = ctx.hot_pool->buf, .offset = a_off, .range = a_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = b_off, .range = b_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = i_off, .range = i_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = v_off, .range = v_res->size_bytes},
+      {.buffer = m_wt->qparam_buf, .range = VK_WHOLE_SIZE},
+  };
+  VkDescriptorSet ds_pass1 =
+      prepare_cached_desc_set(pass1_pipe, pass1_infos, 7);
+  if (ds_pass1 == VK_NULL_HANDLE) {
+    res_unpin(locs_a_handle);
+    res_unpin(locs_b_handle);
+    res_unpin(locs_idx_tmp_handle);
+    res_unpin(locs_val_tmp_handle);
+    res_unpin(locs_dst_handle);
+    return ADAMAH_ERR_VULKAN;
+  }
+
+  VkDescriptorBufferInfo pass2_infos[4] = {
+      {.buffer = m_act->buf, .range = VK_WHOLE_SIZE},
+      {.buffer = ctx.hot_pool->buf, .offset = i_off, .range = i_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = v_off, .range = v_res->size_bytes},
+      {.buffer = ctx.hot_pool->buf, .offset = d_off, .range = d_res->size_bytes},
+  };
+  VkDescriptorSet ds_pass2 =
+      prepare_cached_desc_set(&ctx.argmax_pairs_pipe, pass2_infos, 4);
+  if (ds_pass2 == VK_NULL_HANDLE) {
+    res_unpin(locs_a_handle);
+    res_unpin(locs_b_handle);
+    res_unpin(locs_idx_tmp_handle);
+    res_unpin(locs_val_tmp_handle);
+    res_unpin(locs_dst_handle);
+    return ADAMAH_ERR_VULKAN;
+  }
+
+  typedef struct {
+    uint32_t K;
+    uint32_t N;
+    uint32_t group_size;
+    uint32_t rows_per_group;
+  } MatvecArgmaxPush;
+  MatvecArgmaxPush push1 = {K, N, m_wt->group_size, rows_per_group};
+  uint32_t push2 = n_groups;
+
+  cmd_begin();
+  vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    pass1_pipe->pipeline);
+  vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          pass1_pipe->pipe_layout, 0, 1, &ds_pass1, 0, NULL);
+  vkCmdPushConstants(ctx.cmd, pass1_pipe->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                     0, sizeof(push1), &push1);
+  vkCmdDispatch(ctx.cmd, n_groups, 1, 1);
+  cmd_barrier_after_dispatch();
+
+  vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    ctx.argmax_pairs_pipe.pipeline);
+  vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ctx.argmax_pairs_pipe.pipe_layout, 0, 1, &ds_pass2, 0,
+                          NULL);
+  vkCmdPushConstants(ctx.cmd, ctx.argmax_pairs_pipe.pipe_layout,
+                     VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push2), &push2);
+  vkCmdDispatch(ctx.cmd, 1, 1, 1);
+  cmd_barrier_after_dispatch();
+  cmd_submit();
+
+  res_unpin(locs_a_handle);
+  res_unpin(locs_b_handle);
+  res_unpin(locs_idx_tmp_handle);
+  res_unpin(locs_val_tmp_handle);
+  res_unpin(locs_dst_handle);
+  return ADAMAH_OK;
+}
+
+int map_matvec_argmax_t_xq4_dev(uint32_t map_act_id, uint32_t map_wt_id,
+                                uint32_t locs_a_handle, uint32_t locs_b_handle,
+                                uint32_t locs_idx_tmp_handle,
+                                uint32_t locs_val_tmp_handle,
+                                uint32_t locs_dst_handle, uint32_t K,
+                                uint32_t N, uint32_t rows_per_group) {
+  return exec_matvec_argmax_t_xq_internal(
+      &ctx.matvec_argmax_t_xq4_pipe, map_act_id, map_wt_id, locs_a_handle,
+      locs_b_handle, locs_idx_tmp_handle, locs_val_tmp_handle, locs_dst_handle,
+      K, N, rows_per_group);
+}
+
+int map_matvec_argmax_t_xq8_dev(uint32_t map_act_id, uint32_t map_wt_id,
+                                uint32_t locs_a_handle, uint32_t locs_b_handle,
+                                uint32_t locs_idx_tmp_handle,
+                                uint32_t locs_val_tmp_handle,
+                                uint32_t locs_dst_handle, uint32_t K,
+                                uint32_t N, uint32_t rows_per_group) {
+  return exec_matvec_argmax_t_xq_internal(
+      &ctx.matvec_argmax_t_xq8_pipe, map_act_id, map_wt_id, locs_a_handle,
+      locs_b_handle, locs_idx_tmp_handle, locs_val_tmp_handle, locs_dst_handle,
+      K, N, rows_per_group);
+}
+
 // ============================================
 // Cross-map MatVec+TopK F32xQ4: partial top-k directly from A @ B^T
 // A from map_act (single row), B from map_wt (Q4), output partial idx/val to map_act.
@@ -9953,6 +10413,203 @@ static int ensure_full_decode_weight_buffer(void) {
   return ADAMAH_OK;
 }
 
+static uint32_t full_decode_calc_scratch_elems(const FullDecodeWeightAddrs *wa) {
+  if (!wa)
+    return 0;
+  uint64_t need = 0;
+  need += 4ull * (uint64_t)wa->N_embd; // hidden, normed, proj_out, ffn_normed
+  need += 2ull * (uint64_t)wa->N_q;    // q, attn_out
+  need += (uint64_t)wa->N_k;           // k
+  need += (uint64_t)wa->N_v;           // v
+  need += 3ull * (uint64_t)wa->N_ff;   // gate, up, ffn_out
+  if (need == 0 || need > 0xFFFFFFFFull)
+    return 0;
+  return (uint32_t)need;
+}
+
+static uint32_t full_decode_pick_n_wg(const FullDecodeWeightAddrs *wa) {
+  const char *env_nwg = getenv("ADAMAH_FULL_DECODE_N_WG");
+
+  uint32_t candidate = gpu_caps.max_compute_units / 4u;
+  if (is_broadcom_v3d) {
+    // Safe default on V3D; cooperative multi-WG is opt-in via env while tuning.
+    candidate = 1u;
+  }
+  if (candidate == 0u)
+    candidate = 1u;
+  if (gpu_caps.max_workgroups > 0u && candidate > gpu_caps.max_workgroups)
+    candidate = gpu_caps.max_workgroups;
+  uint32_t parallel_rows = wa ? wa->N_ff : 0u;
+  if (parallel_rows == 0u && wa)
+    parallel_rows = wa->N_q;
+  if (parallel_rows == 0u && wa)
+    parallel_rows = wa->N_embd;
+  if (parallel_rows == 0u)
+    parallel_rows = 1u;
+  uint32_t max_wg = ADAMAH_FULL_DECODE_MAX_WG;
+  if (parallel_rows < max_wg)
+    max_wg = parallel_rows;
+  if (is_broadcom_v3d && max_wg > 64u)
+    max_wg = 64u;
+  if (candidate > max_wg)
+    candidate = max_wg;
+  if (candidate == 0u)
+    candidate = 1u;
+
+  if (env_nwg && env_nwg[0]) {
+    long forced = strtol(env_nwg, NULL, 10);
+    if (forced > 0) {
+      uint32_t forced_u = (uint32_t)forced;
+      if (gpu_caps.max_workgroups > 0u && forced_u > gpu_caps.max_workgroups)
+        forced_u = gpu_caps.max_workgroups;
+      if (forced_u > max_wg)
+        forced_u = max_wg;
+      if (forced_u > 0u)
+        candidate = forced_u;
+    }
+  }
+  return candidate;
+}
+
+static uint32_t full_decode_parse_backend(void) {
+  const char *env = getenv("ADAMAH_BROADCOM_DECODE_BACKEND");
+  if (!env || !env[0] || strcmp(env, "auto") == 0)
+    return ADAMAH_FD_BACKEND_AUTO;
+  if (strcmp(env, "legacy_monolithic") == 0)
+    return ADAMAH_FD_BACKEND_LEGACY_MONOLITHIC;
+  if (strcmp(env, "v3dv_levels") == 0)
+    return ADAMAH_FD_BACKEND_V3DV_LEVELS;
+  return ADAMAH_FD_BACKEND_AUTO;
+}
+
+static uint32_t full_decode_resolve_backend(uint32_t parsed) {
+  if (parsed == ADAMAH_FD_BACKEND_LEGACY_MONOLITHIC ||
+      parsed == ADAMAH_FD_BACKEND_V3DV_LEVELS) {
+    return parsed;
+  }
+  // Safety default: on Broadcom keep legacy monolithic unless explicitly
+  // forced to v3dv_levels. Current staged path is experimental and can
+  // regress throughput on v3dv due high vkCmdDispatch recording cost.
+  if (is_broadcom_v3d)
+    return ADAMAH_FD_BACKEND_LEGACY_MONOLITHIC;
+  return ADAMAH_FD_BACKEND_LEGACY_MONOLITHIC;
+}
+
+static uint32_t full_decode_pick_stage_wg(const char *env_name,
+                                          uint32_t fallback,
+                                          uint32_t row_cap) {
+  uint32_t candidate = fallback;
+  if (candidate == 0u)
+    candidate = 1u;
+  if (row_cap > 0u && candidate > row_cap)
+    candidate = row_cap;
+  uint32_t hw_cap = ADAMAH_FULL_DECODE_MAX_WG;
+  if (gpu_caps.max_workgroups > 0u && hw_cap > gpu_caps.max_workgroups)
+    hw_cap = gpu_caps.max_workgroups;
+  if (is_broadcom_v3d && hw_cap > 64u)
+    hw_cap = 64u;
+  if (candidate > hw_cap)
+    candidate = hw_cap;
+  if (candidate == 0u)
+    candidate = 1u;
+
+  const char *env = getenv(env_name);
+  if (env && env[0]) {
+    long forced = strtol(env, NULL, 10);
+    if (forced > 0) {
+      uint32_t forced_u = (uint32_t)forced;
+      if (row_cap > 0u && forced_u > row_cap)
+        forced_u = row_cap;
+      if (forced_u > hw_cap)
+        forced_u = hw_cap;
+      if (forced_u > 0u)
+        candidate = forced_u;
+    }
+  }
+  return candidate;
+}
+
+static int full_decode_stage_timing_enabled(void) {
+  static int cached = -1;
+  if (cached >= 0)
+    return cached;
+  const char *env = getenv("ADAMAH_BCM_STAGE_TIMING");
+  cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+  return cached;
+}
+
+static double full_decode_now_ms(void) {
+  struct timespec ts;
+  timespec_get(&ts, TIME_UTC);
+  return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
+static int full_decode_spin_diag_enabled(void) {
+  static int cached = -1;
+  if (cached >= 0)
+    return cached;
+  const char *env = getenv("ADAMAH_FULL_DECODE_SPIN_DIAG");
+  cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+  return cached;
+}
+
+static uint32_t full_decode_stage_mask(void) {
+  const char *env = getenv("ADAMAH_FULL_DECODE_STAGE_MASK");
+  if (!env || !env[0])
+    return 0xFFFFFFFFu;
+  char *end = NULL;
+  unsigned long v = strtoul(env, &end, 0);
+  if (end == env)
+    return 0xFFFFFFFFu;
+  return (uint32_t)v;
+}
+
+static int ensure_full_decode_aux_buffers(uint32_t scratch_elems) {
+  if (scratch_elems == 0u)
+    return ADAMAH_ERR_INVALID;
+
+  if (ctx.full_decode_sync_buf == VK_NULL_HANDLE ||
+      ctx.full_decode_sync_mem == VK_NULL_HANDLE) {
+    VkBufferUsageFlags sync_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (create_buffer(&ctx.full_decode_sync_buf, &ctx.full_decode_sync_mem,
+                      (VkDeviceSize)ADAMAH_FULL_DECODE_SYNC_UINTS *
+                          sizeof(uint32_t),
+                      sync_usage, 1) != 0) {
+      ctx.full_decode_sync_buf = VK_NULL_HANDLE;
+      ctx.full_decode_sync_mem = VK_NULL_HANDLE;
+      return ADAMAH_ERR_MEMORY;
+    }
+  }
+
+  VkDeviceSize scratch_bytes = (VkDeviceSize)scratch_elems * sizeof(float);
+  if (ctx.full_decode_scratch_buf != VK_NULL_HANDLE &&
+      ctx.full_decode_scratch_mem != VK_NULL_HANDLE &&
+      ctx.full_decode_scratch_bytes >= scratch_bytes) {
+    return ADAMAH_OK;
+  }
+
+  if (ctx.full_decode_scratch_buf) {
+    vkDestroyBuffer(ctx.device, ctx.full_decode_scratch_buf, NULL);
+    ctx.full_decode_scratch_buf = VK_NULL_HANDLE;
+  }
+  if (ctx.full_decode_scratch_mem) {
+    vkFreeMemory(ctx.device, ctx.full_decode_scratch_mem, NULL);
+    ctx.full_decode_scratch_mem = VK_NULL_HANDLE;
+  }
+  ctx.full_decode_scratch_bytes = 0;
+
+  if (create_buffer(&ctx.full_decode_scratch_buf, &ctx.full_decode_scratch_mem,
+                    scratch_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    1) != 0) {
+    ctx.full_decode_scratch_buf = VK_NULL_HANDLE;
+    ctx.full_decode_scratch_mem = VK_NULL_HANDLE;
+    return ADAMAH_ERR_MEMORY;
+  }
+  ctx.full_decode_scratch_bytes = scratch_bytes;
+  return ADAMAH_OK;
+}
+
 int adamah_has_full_decode_step(void) {
   if (!ctx.initialized)
     return 0;
@@ -9988,12 +10645,54 @@ int adamah_full_decode_register(uint32_t map_ws_id, uint32_t map_kvcache_id,
   int ret = ensure_full_decode_weight_buffer();
   if (ret != ADAMAH_OK)
     return ret;
+  uint32_t scratch_elems = full_decode_calc_scratch_elems(wa);
+  if (scratch_elems == 0u)
+    return ADAMAH_ERR_INVALID;
+  ret = ensure_full_decode_aux_buffers(scratch_elems);
+  if (ret != ADAMAH_OK)
+    return ret;
 
   memcpy(&ctx.full_decode_state.wa, wa, sizeof(FullDecodeWeightAddrs));
   ctx.full_decode_state.map_ws_id = map_ws_id;
   ctx.full_decode_state.map_kvcache_id = map_kvcache_id;
   ctx.full_decode_state.n_layer = n_layer;
+  uint32_t parsed_backend = full_decode_parse_backend();
+  ctx.full_decode_state.backend = full_decode_resolve_backend(parsed_backend);
+  ctx.full_decode_state.n_wg = full_decode_pick_n_wg(wa);
+  // Current map_full_decode_step shader supports correctness with single-WG stage
+  // stepping. Stage-specific multi-WG kernels will lift this cap later.
+  ctx.full_decode_state.wg_qkv = full_decode_pick_stage_wg(
+      "ADAMAH_BCM_WG_QKV", 1u, wa->N_q ? wa->N_q : wa->N_embd);
+  ctx.full_decode_state.wg_attn =
+      full_decode_pick_stage_wg("ADAMAH_BCM_WG_ATTN", 1u, wa->n_head);
+  ctx.full_decode_state.wg_ffn =
+      full_decode_pick_stage_wg("ADAMAH_BCM_WG_FFN", 1u, wa->N_ff);
+  if (ctx.full_decode_state.backend == ADAMAH_FD_BACKEND_V3DV_LEVELS) {
+    if (ctx.full_decode_state.wg_qkv > 1u || ctx.full_decode_state.wg_attn > 1u) {
+      fprintf(stderr,
+              "[ADAMAH] v3dv_levels clamps qkv/attn WG to 1 (ffn gate may scale)\n");
+    }
+    ctx.full_decode_state.wg_qkv = 1u;
+    ctx.full_decode_state.wg_attn = 1u;
+  }
+  ctx.full_decode_state.scratch_elems = scratch_elems;
+  ctx.full_decode_state.stage_runs = 0;
+  for (uint32_t i = 0; i < ADAMAH_FD_STAGE_COUNT; ++i) {
+    ctx.full_decode_state.stage_ms_accum[i] = 0.0;
+  }
   ctx.full_decode_state.registered = 1;
+  if (is_broadcom_v3d || parsed_backend != ADAMAH_FD_BACKEND_AUTO) {
+    const char *forced = getenv("ADAMAH_FULL_DECODE_N_WG");
+    const char *backend_name =
+        (ctx.full_decode_state.backend == ADAMAH_FD_BACKEND_V3DV_LEVELS)
+            ? "v3dv_levels"
+            : "legacy_monolithic";
+    fprintf(stderr,
+            "[ADAMAH] full_decode backend=%s N_WG=%u (legacy) stage_wg[qkv=%u,attn=%u,ffn=%u] (%s)\n",
+            backend_name, ctx.full_decode_state.n_wg, ctx.full_decode_state.wg_qkv,
+            ctx.full_decode_state.wg_attn, ctx.full_decode_state.wg_ffn,
+            (forced && forced[0]) ? "legacy env override" : "auto");
+  }
 
   memcpy(ctx.pool_ptr, wa, sizeof(FullDecodeWeightAddrs));
   flush_mapped_pool(sizeof(FullDecodeWeightAddrs));
@@ -10034,6 +10733,9 @@ int adamah_full_decode_step(uint32_t locs_emb_in_handle,
     return ADAMAH_ERR_INVALID;
   if (ctx.full_decode_wa_buf == VK_NULL_HANDLE)
     return ADAMAH_ERR_NOT_FOUND;
+  if (ctx.full_decode_sync_buf == VK_NULL_HANDLE ||
+      ctx.full_decode_scratch_buf == VK_NULL_HANDLE)
+    return ADAMAH_ERR_NOT_FOUND;
 
   ResEntry *emb_res = res_get(locs_emb_in_handle);
   ResEntry *out_res = res_get(locs_hidden_out_handle);
@@ -10062,6 +10764,20 @@ int adamah_full_decode_step(uint32_t locs_emb_in_handle,
     ret = ADAMAH_ERR_INVALID;
     goto cleanup_full_decode;
   }
+  Map *m_q8_main = (2u < MAX_MAPS && ctx.maps[2].active) ? &ctx.maps[2] : m_ws;
+  Map *m_q8_b12 = (3u < MAX_MAPS && ctx.maps[3].active) ? &ctx.maps[3] : m_q8_main;
+  Map *m_q4_main = (1u < MAX_MAPS && ctx.maps[1].active) ? &ctx.maps[1] : m_ws;
+  Map *m_q5_raw = (5u < MAX_MAPS && ctx.maps[5].active) ? &ctx.maps[5] : m_q8_main;
+  VkBuffer q8_main_buf = (m_q8_main->buf != VK_NULL_HANDLE) ? m_q8_main->buf : m_ws->buf;
+  VkBuffer q8_main_qp_buf =
+      (m_q8_main->qparam_buf != VK_NULL_HANDLE) ? m_q8_main->qparam_buf : q8_main_buf;
+  VkBuffer q8_b12_buf = (m_q8_b12->buf != VK_NULL_HANDLE) ? m_q8_b12->buf : q8_main_buf;
+  VkBuffer q8_b12_qp_buf =
+      (m_q8_b12->qparam_buf != VK_NULL_HANDLE) ? m_q8_b12->qparam_buf : q8_main_qp_buf;
+  VkBuffer q4_main_buf = (m_q4_main->buf != VK_NULL_HANDLE) ? m_q4_main->buf : m_ws->buf;
+  VkBuffer q4_main_qp_buf =
+      (m_q4_main->qparam_buf != VK_NULL_HANDLE) ? m_q4_main->qparam_buf : q8_main_qp_buf;
+  VkBuffer q5_raw_buf = (m_q5_raw->buf != VK_NULL_HANDLE) ? m_q5_raw->buf : q8_main_buf;
 
   const FullDecodeWeightAddrs *wa = &ctx.full_decode_state.wa;
   uint64_t denom = 2ull * (uint64_t)ctx.full_decode_state.n_layer *
@@ -10077,37 +10793,264 @@ int adamah_full_decode_step(uint32_t locs_emb_in_handle,
     goto cleanup_full_decode;
   }
 
-  VkDescriptorBufferInfo buf_infos[5] = {
+  VkDescriptorBufferInfo base_infos[14] = {
       {.buffer = m_ws->buf, .range = VK_WHOLE_SIZE},
       {.buffer = m_kvcache->buf, .range = VK_WHOLE_SIZE},
       {.buffer = ctx.full_decode_wa_buf, .range = sizeof(FullDecodeWeightAddrs)},
       {.buffer = ctx.hot_pool->buf, .offset = emb_off, .range = emb_res->size_bytes},
       {.buffer = ctx.hot_pool->buf, .offset = out_off, .range = out_res->size_bytes},
+      {.buffer = ctx.full_decode_sync_buf,
+       .range = (VkDeviceSize)ADAMAH_FULL_DECODE_SYNC_UINTS * sizeof(uint32_t)},
+      {.buffer = ctx.full_decode_scratch_buf, .range = ctx.full_decode_scratch_bytes},
+      {.buffer = q8_main_buf, .range = VK_WHOLE_SIZE},
+      {.buffer = q8_main_qp_buf, .range = VK_WHOLE_SIZE},
+      {.buffer = q8_b12_buf, .range = VK_WHOLE_SIZE},
+      {.buffer = q8_b12_qp_buf, .range = VK_WHOLE_SIZE},
+      {.buffer = q4_main_buf, .range = VK_WHOLE_SIZE},
+      {.buffer = q4_main_qp_buf, .range = VK_WHOLE_SIZE},
+      {.buffer = q5_raw_buf, .range = VK_WHOLE_SIZE},
   };
-  VkWriteDescriptorSet writes[5];
-  for (int i = 0; i < 5; i++) {
-    writes[i] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = ds,
-        .dstBinding = (uint32_t)i,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo = &buf_infos[i]};
-  }
-  vkUpdateDescriptorSets(ctx.device, 5, writes, 0, NULL);
 
-  uint32_t push[4] = {pos, seq_len, ctx.full_decode_state.n_layer, kv_cap};
+  uint32_t stage_mask_env = full_decode_stage_mask();
+  uint32_t dispatch_wg = ctx.full_decode_state.n_wg;
+  if (dispatch_wg == 0u)
+    dispatch_wg = 1u;
+  int spin_diag = full_decode_spin_diag_enabled();
+  VkDeviceSize spin_diag_bytes =
+      (VkDeviceSize)ADAMAH_FULL_DECODE_SYNC_UINTS * sizeof(uint32_t);
+  if (spin_diag && (!ctx.pool_buf || !ctx.pool_ptr || spin_diag_bytes > ctx.pool_size))
+    spin_diag = 0;
+  if (spin_diag && batch_mode) {
+    // Diagnostics need a completed command buffer to read back SyncBuf counters.
+    // Force a flush here; this mode is profiling-only.
+    batch_end();
+  }
+
   cmd_begin();
   vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                     ctx.full_decode_step_pipe.pipeline);
-  vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          ctx.full_decode_step_pipe.pipe_layout, 0, 1, &ds, 0,
-                          NULL);
-  vkCmdPushConstants(ctx.cmd, ctx.full_decode_step_pipe.pipe_layout,
-                     VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, push);
-  vkCmdDispatch(ctx.cmd, 1, 1, 1);
-  cmd_barrier_after_dispatch();
+
+  if (ctx.full_decode_state.backend == ADAMAH_FD_BACKEND_LEGACY_MONOLITHIC) {
+    VkDescriptorBufferInfo infos[14];
+    memcpy(infos, base_infos, sizeof(infos));
+    VkWriteDescriptorSet writes[14];
+    for (int i = 0; i < 14; i++) {
+      writes[i] = (VkWriteDescriptorSet){
+          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+          .dstSet = ds,
+          .dstBinding = (uint32_t)i,
+          .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &infos[i]};
+    }
+    vkUpdateDescriptorSets(ctx.device, 14, writes, 0, NULL);
+
+    vkCmdFillBuffer(ctx.cmd, ctx.full_decode_sync_buf, 0,
+                    (VkDeviceSize)ADAMAH_FULL_DECODE_SYNC_UINTS *
+                        sizeof(uint32_t),
+                    0u);
+    if (spin_diag) {
+      vkCmdFillBuffer(ctx.cmd, ctx.full_decode_sync_buf,
+                      (VkDeviceSize)ADAMAH_FULL_DECODE_DIAG_FLAG_IDX *
+                          sizeof(uint32_t),
+                      sizeof(uint32_t), 1u);
+    }
+    {
+      VkBuffer sync_bufs[1] = {ctx.full_decode_sync_buf};
+      cmd_buffer_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                         sync_bufs, 1);
+    }
+    uint32_t push[6] = {pos, seq_len, ctx.full_decode_state.n_layer, kv_cap,
+                        stage_mask_env, 0u};
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            ctx.full_decode_step_pipe.pipe_layout, 0, 1, &ds, 0,
+                            NULL);
+    vkCmdPushConstants(ctx.cmd, ctx.full_decode_step_pipe.pipe_layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+    vkCmdDispatch(ctx.cmd, dispatch_wg, 1, 1);
+    cmd_barrier_after_dispatch();
+    if (spin_diag) {
+      VkBufferCopy copy = {
+          .srcOffset = 0, .dstOffset = 0, .size = spin_diag_bytes};
+      vkCmdCopyBuffer(ctx.cmd, ctx.full_decode_sync_buf, ctx.pool_buf, 1, &copy);
+    }
+  } else {
+    // Broadcom V3DV levels path:
+    // dispatch per layer in stage blocks, then final norm.
+    // Keep descriptor-set updates minimal: bind static buffers once and only
+    // switch input locs binding when we transition L0(emb) -> L>0(out).
+    uint32_t mask_qkv_attn_post = ADAMAH_FD_MASK_QKV_ATTN_POST & stage_mask_env;
+    uint32_t mask_ffn_gate = 0x08u & stage_mask_env;
+    uint32_t mask_ffn_down = 0x10u & stage_mask_env;
+    uint32_t mask_final = ADAMAH_FD_MASK_FINAL & stage_mask_env;
+    int stage_timing = full_decode_stage_timing_enabled();
+    VkDescriptorBufferInfo infos[14];
+    memcpy(infos, base_infos, sizeof(infos));
+    infos[3].offset = out_off;
+    infos[3].range = out_res->size_bytes;
+    infos[4].offset = out_off;
+    infos[4].range = out_res->size_bytes;
+    VkWriteDescriptorSet writes[14];
+    for (int i = 0; i < 14; i++) {
+      writes[i] = (VkWriteDescriptorSet){
+          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+          .dstSet = ds,
+          .dstBinding = (uint32_t)i,
+          .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &infos[i]};
+    }
+    vkUpdateDescriptorSets(ctx.device, 14, writes, 0, NULL);
+    uint32_t locs_in_mode = 0u; // 0=out binding, 1=emb binding
+
+    for (uint32_t L = 0; L < ctx.full_decode_state.n_layer; ++L) {
+      if (mask_qkv_attn_post) {
+        uint32_t want_mode = (L == 0u) ? 1u : 0u;
+        if (want_mode != locs_in_mode) {
+          infos[3].offset = (want_mode == 1u) ? emb_off : out_off;
+          infos[3].range =
+              (want_mode == 1u) ? emb_res->size_bytes : out_res->size_bytes;
+          VkWriteDescriptorSet w = {
+              .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+              .dstSet = ds,
+              .dstBinding = 3u,
+              .descriptorCount = 1,
+              .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+              .pBufferInfo = &infos[3]};
+          vkUpdateDescriptorSets(ctx.device, 1, &w, 0, NULL);
+          locs_in_mode = want_mode;
+        }
+        uint32_t push[6] = {pos, seq_len, 1u, kv_cap, mask_qkv_attn_post, L};
+        double t0 = stage_timing ? full_decode_now_ms() : 0.0;
+        vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                ctx.full_decode_step_pipe.pipe_layout, 0, 1, &ds,
+                                0, NULL);
+        vkCmdPushConstants(ctx.cmd, ctx.full_decode_step_pipe.pipe_layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+        vkCmdDispatch(ctx.cmd, ctx.full_decode_state.wg_qkv, 1, 1);
+        cmd_barrier_after_dispatch();
+        if (stage_timing) {
+          ctx.full_decode_state.stage_ms_accum[ADAMAH_FD_STAGE_QKV_ATTN_POST] +=
+              (full_decode_now_ms() - t0);
+        }
+      }
+      if (mask_ffn_gate) {
+        if (locs_in_mode != 0u) {
+          infos[3].offset = out_off;
+          infos[3].range = out_res->size_bytes;
+          VkWriteDescriptorSet w = {
+              .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+              .dstSet = ds,
+              .dstBinding = 3u,
+              .descriptorCount = 1,
+              .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+              .pBufferInfo = &infos[3]};
+          vkUpdateDescriptorSets(ctx.device, 1, &w, 0, NULL);
+          locs_in_mode = 0u;
+        }
+        uint32_t push[6] = {pos, seq_len, 1u, kv_cap, mask_ffn_gate, L};
+        double t0 = stage_timing ? full_decode_now_ms() : 0.0;
+        vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                ctx.full_decode_step_pipe.pipe_layout, 0, 1, &ds,
+                                0, NULL);
+        vkCmdPushConstants(ctx.cmd, ctx.full_decode_step_pipe.pipe_layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+        vkCmdDispatch(ctx.cmd, ctx.full_decode_state.wg_ffn, 1, 1);
+        cmd_barrier_after_dispatch();
+        if (stage_timing) {
+          ctx.full_decode_state.stage_ms_accum[ADAMAH_FD_STAGE_FFN] +=
+              (full_decode_now_ms() - t0);
+        }
+      }
+      if (mask_ffn_down) {
+        if (locs_in_mode != 0u) {
+          infos[3].offset = out_off;
+          infos[3].range = out_res->size_bytes;
+          VkWriteDescriptorSet w = {
+              .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+              .dstSet = ds,
+              .dstBinding = 3u,
+              .descriptorCount = 1,
+              .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+              .pBufferInfo = &infos[3]};
+          vkUpdateDescriptorSets(ctx.device, 1, &w, 0, NULL);
+          locs_in_mode = 0u;
+        }
+        uint32_t push[6] = {pos, seq_len, 1u, kv_cap, mask_ffn_down, L};
+        double t0 = stage_timing ? full_decode_now_ms() : 0.0;
+        vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                ctx.full_decode_step_pipe.pipe_layout, 0, 1, &ds,
+                                0, NULL);
+        vkCmdPushConstants(ctx.cmd, ctx.full_decode_step_pipe.pipe_layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+        // Keep down+post-ffn norm pass single-WG for correctness (rms reduce scope).
+        vkCmdDispatch(ctx.cmd, 1u, 1, 1);
+        cmd_barrier_after_dispatch();
+        if (stage_timing) {
+          ctx.full_decode_state.stage_ms_accum[ADAMAH_FD_STAGE_FFN] +=
+              (full_decode_now_ms() - t0);
+        }
+      }
+    }
+
+    if (mask_final) {
+      if (locs_in_mode != 0u) {
+        infos[3].offset = out_off;
+        infos[3].range = out_res->size_bytes;
+        VkWriteDescriptorSet w = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = ds,
+            .dstBinding = 3u,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &infos[3]};
+        vkUpdateDescriptorSets(ctx.device, 1, &w, 0, NULL);
+        locs_in_mode = 0u;
+      }
+      uint32_t push[6] = {pos, seq_len, 1u, kv_cap, mask_final, 0u};
+      double t0 = stage_timing ? full_decode_now_ms() : 0.0;
+      vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              ctx.full_decode_step_pipe.pipe_layout, 0, 1, &ds, 0,
+                              NULL);
+      vkCmdPushConstants(ctx.cmd, ctx.full_decode_step_pipe.pipe_layout,
+                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+      vkCmdDispatch(ctx.cmd, ctx.full_decode_state.wg_attn, 1, 1);
+      cmd_barrier_after_dispatch();
+      if (stage_timing) {
+        ctx.full_decode_state.stage_ms_accum[ADAMAH_FD_STAGE_FINAL] +=
+            (full_decode_now_ms() - t0);
+      }
+    }
+
+    if (stage_timing) {
+      ctx.full_decode_state.stage_runs += 1u;
+      if ((ctx.full_decode_state.stage_runs & 0xFu) == 0u) {
+        double inv = 1.0 / (double)ctx.full_decode_state.stage_runs;
+        fprintf(stderr,
+                "[ADAMAH][B20] stage_ms avg: qkv_attn_post=%.3f ffn=%.3f final=%.3f runs=%llu\n",
+                ctx.full_decode_state.stage_ms_accum[ADAMAH_FD_STAGE_QKV_ATTN_POST] * inv,
+                ctx.full_decode_state.stage_ms_accum[ADAMAH_FD_STAGE_FFN] * inv,
+                ctx.full_decode_state.stage_ms_accum[ADAMAH_FD_STAGE_FINAL] * inv,
+                (unsigned long long)ctx.full_decode_state.stage_runs);
+      }
+    }
+  }
+
   cmd_submit();
+  if (spin_diag && ctx.full_decode_state.backend == ADAMAH_FD_BACKEND_LEGACY_MONOLITHIC) {
+    invalidate_mapped_pool(spin_diag_bytes);
+    uint32_t *diag = (uint32_t *)ctx.pool_ptr;
+    fprintf(stderr, "[B13_SPIN] pos=%u seq=%u", pos, seq_len);
+    for (uint32_t b = 0; b < ADAMAH_FULL_DECODE_BARRIER_BIDS; b++) {
+      uint32_t sum = diag[ADAMAH_FULL_DECODE_SPIN_SUM_BASE + b];
+      uint32_t mx = diag[ADAMAH_FULL_DECODE_SPIN_MAX_BASE + b];
+      fprintf(stderr, " b%u=%u/%u", b, sum, mx);
+    }
+    fprintf(stderr, "\n");
+  }
 
 cleanup_full_decode:
   res_unpin(locs_emb_in_handle);
