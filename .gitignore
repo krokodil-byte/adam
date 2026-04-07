@@ -24,3 +24,7 @@ releases/
 
 # Local diagnostic outputs
 reports/
+
+# Internal planning / agent prompts (not user-facing)
+AGENT_COLLAB.md
+CODEX_PROMPT_*.md

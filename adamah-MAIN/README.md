@@ -178,5 +178,3 @@ CC-BY-NC 4.0 — Samuele Scuglia
 - Concept, architecture, and product direction: **Samuele Scuglia**.
 - Implementation support used during development: **Claude**, **Gemini**,
   and **Codex**.
-- These tools are used as engineering assistants only. They are **not
-  co-authors** of the project.
